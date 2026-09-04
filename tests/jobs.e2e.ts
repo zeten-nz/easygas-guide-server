@@ -157,7 +157,7 @@ async function createFixtures(): Promise<Fixtures> {
 // ---------------------------------------------------------------------------
 
 async function run(): Promise<void> {
-  setSmsProviderForTesting({ name: 'test-capture', send: async () => {} });
+  setSmsProviderForTesting({ name: 'test-capture', send: async () => ({ providerMessageId: null, outcome: 'ACCEPTED' as const }) });
   await assertTestDatabase(db);
   await cleanup();
   const fx = await createFixtures();

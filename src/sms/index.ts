@@ -1,10 +1,11 @@
 import { env, isProduction } from '../config/env';
 import type { SmsProvider } from './sms.provider';
 import { ConsoleSmsProvider } from './console.provider';
+import { EskizSmsProvider } from './eskiz.provider';
 
 let provider: SmsProvider | null = null;
 
-/** Test-only injection point (used by tests/auth.e2e.ts to capture OTP codes). */
+/** Test-only injection point (tests capture OTP codes via a fake provider). */
 export function setSmsProviderForTesting(p: SmsProvider): void {
   if (isProduction) throw new Error('setSmsProviderForTesting is not available in production');
   provider = p;
@@ -23,10 +24,15 @@ export function getSmsProvider(): SmsProvider {
       }
       provider = new ConsoleSmsProvider();
       return provider;
+    case 'eskiz':
+      // Constructs successfully; send() fails fast until the official Eskiz
+      // spec is verified (see eskiz.provider.ts). Config is validated at boot.
+      provider = new EskizSmsProvider();
+      return provider;
     default:
       throw new Error(
         'No SMS provider configured. Set SMS_PROVIDER in the environment ' +
-          '(development supports "console"; production requires a real provider implementation).',
+          '(development supports "console"; production requires "eskiz" with credentials).',
       );
   }
 }

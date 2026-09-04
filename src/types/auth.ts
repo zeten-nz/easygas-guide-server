@@ -44,12 +44,23 @@ export interface SessionRow {
   user_id: number;
   token_hash: string;
   remember_me: number;
+  /** Absolute-lifetime cap (Phase 10C). Kept named expires_at for compatibility. */
   expires_at: Date;
   created_at: Date;
   last_used_at: Date;
   revoked_at: Date | null;
   ip: string | null;
   user_agent: string | null;
+  // --- Phase 10C session lifecycle ---
+  absolute_expires_at: Date;
+  /** All rotations of one login share a family id; replay revokes the family. */
+  family_id: string;
+  /** Successor session id once this token has been rotated out. */
+  rotated_to_id: string | null;
+  /** When this token was rotated out (start of the concurrency grace window). */
+  superseded_at: Date | null;
+  /** Monotonic per-family rotation counter — drives client CSRF ordering. */
+  rotation_seq: number;
 }
 
 export interface RegistrationRequestRow {

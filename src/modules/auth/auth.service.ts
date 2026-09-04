@@ -5,16 +5,14 @@ import { ApiError } from '../../utils/errors';
 import {
   generateOtp,
   generateResetToken,
-  generateSessionToken,
-  hashSessionToken,
   hmacSecret,
   timingSafeEqualHex,
 } from '../../utils/crypto';
 import { logAudit } from '../audit/audit.service';
-import { getSmsProvider } from '../../sms';
-import { logger } from '../../utils/logger';
+import { createSession, revokeByToken } from './session.service';
+import { enqueueOtpSms } from '../../sms/outbox.service';
 import { toAuthUser, type UserWithRole } from '../users/user.mapper';
-import type { AuthUser, PasswordResetRow, SessionRow } from '../../types/auth';
+import type { AuthUser, PasswordResetRow } from '../../types/auth';
 import type { LoginInput, RegisterInput } from './auth.validators';
 
 const GENERIC_LOGIN_ERROR = "Telefon raqam yoki parol noto'g'ri";
@@ -46,6 +44,7 @@ export interface LoginResult {
   token: string;
   expiresAt: Date;
   rememberMe: boolean;
+  rotationSeq: number;
 }
 
 export async function login(input: LoginInput, meta: RequestMeta): Promise<LoginResult> {
@@ -98,41 +97,28 @@ export async function login(input: LoginInput, meta: RequestMeta): Promise<Login
     throw ApiError.unauthorized(GENERIC_LOGIN_ERROR, 'INVALID_CREDENTIALS');
   }
 
-  const token = generateSessionToken();
-  const ttlMs = input.rememberMe
-    ? env.SESSION_REMEMBER_TTL_DAYS * 24 * 60 * 60 * 1000
-    : env.SESSION_TTL_HOURS * 60 * 60 * 1000;
-  const expiresAt = new Date(Date.now() + ttlMs);
-
-  await db('sessions').insert({
-    id: crypto.randomUUID(),
-    user_id: user.id,
-    token_hash: hashSessionToken(token),
-    remember_me: input.rememberMe,
-    expires_at: expiresAt,
-    ip: meta.ip,
-    user_agent: meta.userAgent,
-  });
+  // Phase 10C: creates a session FAMILY with absolute/idle caps; the token
+  // rotates on later requests. The cookie's absolute expiry is returned for the
+  // Set-Cookie maxAge.
+  const created = await createSession(user.id, input.rememberMe, meta);
 
   await db('users').where({ id: user.id }).update({ last_login_at: db.fn.now() });
 
   await logAudit({ userId: user.id, action: 'LOGIN', entityType: 'user', entityId: user.id, ...meta });
 
-  return { user: toAuthUser(user), token, expiresAt, rememberMe: input.rememberMe };
+  return {
+    user: toAuthUser(user),
+    token: created.token,
+    expiresAt: created.absoluteExpiresAt,
+    rememberMe: input.rememberMe,
+    rotationSeq: created.rotationSeq,
+  };
 }
 
-/** Revokes the session for the given raw cookie token. Safe to call with an invalid token. */
+/** Revokes the session (family) for the given raw cookie token. Safe with an invalid token. */
 export async function logout(rawToken: string | undefined, meta: RequestMeta): Promise<void> {
-  if (typeof rawToken !== 'string' || rawToken.length !== 64) return;
-
-  const session = (await db('sessions')
-    .where({ token_hash: hashSessionToken(rawToken) })
-    .whereNull('revoked_at')
-    .first()) as SessionRow | undefined;
-
+  const session = await revokeByToken(rawToken);
   if (!session) return;
-
-  await db('sessions').where({ id: session.id }).update({ revoked_at: db.fn.now() });
   await logAudit({
     userId: session.user_id,
     action: 'LOGOUT',
@@ -212,34 +198,37 @@ export async function requestPasswordReset(phone: string, meta: RequestMeta): Pr
 
   const otp = generateOtp();
 
-  // Any previous outstanding OTP for this user becomes invalid.
-  await db('password_resets').where({ user_id: user.id }).whereNull('consumed_at').update({ consumed_at: db.fn.now() });
+  // Phase 10C OTP lifecycle: the OTP is hashed at rest, and its validity window
+  // starts at CREATION (not at SMS acceptance) — a consistent, documented
+  // policy. Superseding + enqueuing happen in one transaction so concurrent
+  // resend requests cannot leave two verifiable OTPs, and no message is queued
+  // for an OTP that was not persisted. The queued SMS body is encrypted at rest
+  // (never plaintext) and is cancelled rather than delivered if it becomes older
+  // than SMS_MAX_AGE_SECONDS.
+  await db.transaction(async (trx) => {
+    // Invalidate previous outstanding OTPs AND cancel their still-pending SMS.
+    await trx('password_resets').where({ user_id: user.id }).whereNull('consumed_at').update({ consumed_at: trx.fn.now() });
 
-  await db('password_resets').insert({
-    user_id: user.id,
-    phone: user.phone,
-    otp_hash: hmacSecret(otp),
-    otp_expires_at: new Date(Date.now() + env.OTP_TTL_MINUTES * 60 * 1000),
-    request_ip: meta.ip,
-  });
+    await trx('password_resets').insert({
+      user_id: user.id,
+      phone: user.phone,
+      otp_hash: hmacSecret(otp),
+      otp_expires_at: new Date(Date.now() + env.OTP_TTL_MINUTES * 60 * 1000),
+      request_ip: meta.ip,
+    });
 
-  await logAudit({
-    userId: user.id,
-    action: 'PASSWORD_RESET_REQUESTED',
-    entityType: 'user',
-    entityId: user.id,
-    ...meta,
-  });
-
-  try {
-    await getSmsProvider().send(
-      user.phone,
-      `EASY GAS: parolni tiklash kodi: ${otp}. Kod ${env.OTP_TTL_MINUTES} daqiqa amal qiladi. Uni hech kimga bermang.`,
+    await logAudit(
+      { userId: user.id, action: 'PASSWORD_RESET_REQUESTED', entityType: 'user', entityId: user.id, ...meta },
+      trx,
     );
-  } catch (err) {
-    logger.error({ err }, 'SMS delivery failed for password reset');
-    // Still return the generic message — delivery failure must not reveal account existence.
-  }
+
+    // The OTP itself never appears in the audit or logs — only the enqueue does.
+    await enqueueOtpSms(trx, {
+      userId: user.id,
+      phone: user.phone,
+      message: `EASY GAS: parolni tiklash kodi: ${otp}. Kod ${env.OTP_TTL_MINUTES} daqiqa amal qiladi. Uni hech kimga bermang.`,
+    });
+  });
 
   return { message: GENERIC_OTP_SENT };
 }

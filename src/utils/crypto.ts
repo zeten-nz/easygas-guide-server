@@ -34,3 +34,27 @@ export function timingSafeEqualHex(a: string, b: string): boolean {
   if (bufA.length !== bufB.length) return false;
   return crypto.timingSafeEqual(bufA, bufB);
 }
+
+/**
+ * Authenticated symmetric encryption (AES-256-GCM) for short secrets that must
+ * survive at rest but never in plaintext — e.g. the rendered OTP SMS body queued
+ * in the durable outbox. The key is derived from APP_KEY, so a DB dump alone
+ * does not expose the plaintext. Output: `ivHex:tagHex:ciphertextHex`.
+ */
+const SECRET_KEY = crypto.createHash('sha256').update(`sms-outbox-v1:${env.APP_KEY}`).digest();
+
+export function encryptSecret(plaintext: string): string {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', SECRET_KEY, iv);
+  const ct = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `${iv.toString('hex')}:${tag.toString('hex')}:${ct.toString('hex')}`;
+}
+
+export function decryptSecret(payload: string): string {
+  const [ivHex, tagHex, ctHex] = payload.split(':');
+  if (!ivHex || !tagHex || !ctHex) throw new Error('Malformed encrypted payload');
+  const decipher = crypto.createDecipheriv('aes-256-gcm', SECRET_KEY, Buffer.from(ivHex, 'hex'));
+  decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+  return Buffer.concat([decipher.update(Buffer.from(ctHex, 'hex')), decipher.final()]).toString('utf8');
+}

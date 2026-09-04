@@ -14,9 +14,11 @@ import { assertTestDatabase } from './helpers/test-env'; // MUST be first: NODE_
 import assert from 'node:assert/strict';
 import bcrypt from 'bcrypt';
 import { db } from '../src/config/database';
+import { env } from '../src/config/env';
 import { createApp } from '../src/app';
 import { csrfTokenFor } from '../src/middleware/csrf.middleware';
 import { setSmsProviderForTesting } from '../src/sms';
+import { runOnce } from '../src/sms/sms.worker';
 import type { SmsProvider } from '../src/sms/sms.provider';
 
 // ---------------------------------------------------------------------------
@@ -41,10 +43,14 @@ const captureSms: SmsProvider = {
   name: 'test-capture',
   async send(phone, message) {
     smsInbox.push({ phone, message });
+    return { providerMessageId: `test-${smsInbox.length}`, outcome: 'ACCEPTED' as const };
   },
 };
 
-function lastOtpFor(phone: string): string {
+// Phase 10C: OTP SMS is delivered asynchronously via the durable outbox worker.
+// Flush the worker (deterministically, no sleeps) before reading the captured code.
+async function lastOtpFor(phone: string): Promise<string> {
+  await runOnce();
   const msg = [...smsInbox].reverse().find((m) => m.phone === phone);
   assert.ok(msg, `no SMS captured for ${phone}`);
   const otp = msg.message.match(/\b(\d{6})\b/)?.[1];
@@ -221,7 +227,7 @@ async function run(): Promise<void> {
   });
 
   // 6. Remember me → ~6 month session
-  await test('remember me creates a ~180-day persistent session', async () => {
+  await test('remember me creates a persistent session capped at the absolute lifetime (Phase 10C)', async () => {
     const res = await http('POST', '/api/v1/auth/login', {
       body: { phone: PHONES.usta, password: PASSWORD, rememberMe: true },
     });
@@ -237,8 +243,10 @@ async function run(): Promise<void> {
       .first();
     assert.ok(session, 'session row must exist');
     assert.equal(Boolean(session.remember_me), true);
-    const days = (new Date(session.expires_at).getTime() - Date.now()) / 86_400_000;
-    assert.ok(days > 170 && days <= 181, `expected ~180 days, got ${days.toFixed(1)}`);
+    // Phase 10C: the 180-day single TTL is replaced by an absolute cap
+    // (SESSION_ABSOLUTE_DAYS, default 30). The cookie/absolute expiry tracks it.
+    const days = (new Date(session.absolute_expires_at).getTime() - Date.now()) / 86_400_000;
+    assert.ok(days > env.SESSION_ABSOLUTE_DAYS - 1 && days <= env.SESSION_ABSOLUTE_DAYS + 1, `expected ~${env.SESSION_ABSOLUTE_DAYS} days, got ${days.toFixed(1)}`);
     ustaCookie = sessionCookie(res);
   });
 
@@ -390,7 +398,7 @@ async function run(): Promise<void> {
   await test('expired OTP is rejected', async () => {
     const forgot = await http('POST', '/api/v1/auth/forgot-password', { body: { phone: PHONES.usta2 } });
     assert.equal(forgot.status, 200);
-    const otp = lastOtpFor(PHONES.usta2);
+    const otp = await lastOtpFor(PHONES.usta2);
 
     await db('password_resets')
       .where({ phone: PHONES.usta2 })
@@ -406,7 +414,7 @@ async function run(): Promise<void> {
   await test('OTP is single-use; full reset changes password and revokes sessions', async () => {
     const forgot = await http('POST', '/api/v1/auth/forgot-password', { body: { phone: PHONES.usta } });
     assert.equal(forgot.status, 200);
-    const otp = lastOtpFor(PHONES.usta);
+    const otp = await lastOtpFor(PHONES.usta);
 
     const ok = await http('POST', '/api/v1/auth/verify-otp', { body: { phone: PHONES.usta, otp } });
     assert.equal(ok.status, 200);
@@ -455,7 +463,7 @@ async function run(): Promise<void> {
   await test('OTP verification attempts are limited per code', async () => {
     const forgot = await http('POST', '/api/v1/auth/forgot-password', { body: { phone: PHONES.usta2 } });
     assert.equal(forgot.status, 200);
-    const otp = lastOtpFor(PHONES.usta2);
+    const otp = await lastOtpFor(PHONES.usta2);
 
     for (let i = 0; i < 5; i += 1) {
       const res = await http('POST', '/api/v1/auth/verify-otp', {

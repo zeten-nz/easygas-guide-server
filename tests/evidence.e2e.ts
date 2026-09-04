@@ -166,7 +166,7 @@ async function cleanup(): Promise<void> {
 }
 
 async function run(): Promise<void> {
-  setSmsProviderForTesting({ name: 'test-capture', send: async () => {} });
+  setSmsProviderForTesting({ name: 'test-capture', send: async () => ({ providerMessageId: null, outcome: 'ACCEPTED' as const }) });
   storage = new MemoryStorageProvider();
   setStorageProviderForTesting(storage);
   await assertTestDatabase(db);
