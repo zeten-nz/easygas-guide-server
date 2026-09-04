@@ -29,13 +29,19 @@ async function resolveAuth(req: Request): Promise<ResolvedAuth | null> {
   }
 
   const user = (await db('users')
-    .select('users.*', 'roles.code as role_code')
+    .select('users.*', 'roles.code as role_code', 'branches.status as branch_status')
     .join('roles', 'roles.id', 'users.role_id')
+    .leftJoin('branches', 'branches.id', 'users.branch_id')
     .where('users.id', session.user_id)
     .whereNull('users.deleted_at')
-    .first()) as UserWithRole | undefined;
+    .first()) as (UserWithRole & { branch_status: string | null }) | undefined;
 
   if (!user || user.status !== 'ACTIVE') return null;
+  // Phase 10A branch policy: users assigned to a deactivated branch cannot
+  // authenticate — existing sessions die here immediately. Global roles
+  // (branch_id NULL: ADMIN/SIFAT) are unaffected and keep read access to the
+  // deactivated branch's historical data through their all-branch scope.
+  if (user.branch_id !== null && user.branch_status !== 'ACTIVE') return null;
 
   // Touch last_used_at at most once a minute to avoid a write per request.
   if (Date.now() - new Date(session.last_used_at).getTime() > 60_000) {

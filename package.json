@@ -21,7 +21,10 @@
     "test:stop": "tsx tests/stop.e2e.ts",
     "test:rework": "tsx tests/rework-photos.e2e.ts",
     "test:completion": "tsx tests/completion.e2e.ts",
-    "test:quality": "tsx tests/quality.e2e.ts"
+    "test:quality": "tsx tests/quality.e2e.ts",
+    "test:hardening": "tsx tests/hardening.e2e.ts",
+    "test:setup": "tsx tests/setup-test-db.ts",
+    "test:all": "npm run test:auth && npm run test:rbac && npm run test:demo-seed && npm run test:cv && npm run test:jobs && npm run test:checklist && npm run test:stop && npm run test:rework && npm run test:completion && npm run test:quality && npm run test:hardening"
   },
   "keywords": [],
   "author": "",

@@ -9,10 +9,12 @@
  * Fixtures live in the +99899000098xx phone range / "TEST RBAC" branch names
  * and are cleaned up before and after the run.
  */
+import { assertTestDatabase } from './helpers/test-env'; // MUST be first: NODE_ENV=test + *_test DB
 import assert from 'node:assert/strict';
 import bcrypt from 'bcrypt';
 import { db } from '../src/config/database';
 import { createApp } from '../src/app';
+import { csrfTokenFor } from '../src/middleware/csrf.middleware';
 import { setSmsProviderForTesting } from '../src/sms';
 
 const PHONES = {
@@ -45,7 +47,10 @@ interface HttpResult {
 async function http(method: string, path: string, opts: { body?: unknown; cookie?: string } = {}): Promise<HttpResult> {
   const res = await fetch(`${baseUrl}${path}`, {
     method,
-    headers: { 'content-type': 'application/json', ...(opts.cookie ? { cookie: opts.cookie } : {}) },
+    headers: {
+      'content-type': 'application/json',
+      ...(opts.cookie ? { cookie: opts.cookie, 'x-csrf-token': csrfTokenFor(opts.cookie.split('=')[1] ?? '') } : {}),
+    },
     ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
   });
   const text = await res.text();
@@ -152,6 +157,7 @@ async function createFixtures(): Promise<Fixtures> {
 
 async function run(): Promise<void> {
   setSmsProviderForTesting({ name: 'test-capture', send: async () => {} });
+  await assertTestDatabase(db);
   await cleanup();
   const fx = await createFixtures();
 

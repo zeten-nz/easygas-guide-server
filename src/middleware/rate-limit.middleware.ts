@@ -10,6 +10,10 @@ const common = {
   standardHeaders: true as const,
   legacyHeaders: false,
   message,
+  // Proxy trust is configured explicitly at the app level (TRUST_PROXY_HOPS,
+  // see src/app.ts). With hops=0 Express ignores X-Forwarded-For entirely, so
+  // the library's own header/proxy heuristics would only produce noise.
+  validate: { xForwardedForHeader: false, trustProxy: false },
 };
 
 /**

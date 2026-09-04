@@ -262,12 +262,19 @@ export async function assignChecklist(
   templateId: number,
   meta: RequestMeta,
 ): Promise<JobChecklistView> {
-  const job = await loadScopedJob(actor, jobId);
-  if (job.status !== 'DRAFT' && job.status !== 'IN_PROGRESS') {
-    throw ApiError.conflict("Bu holatdagi ishga checklist biriktirib bo'lmaydi", 'JOB_STATE_INVALID');
-  }
+  await loadScopedJob(actor, jobId); // visibility (404 out of scope)
 
   await db.transaction(async (trx) => {
+    // Phase 10A: the job is locked and its state RE-validated inside the
+    // transaction (standard lock order: job row → checklist header) — a
+    // concurrent cancel can no longer slip a checklist onto a cancelled job,
+    // and concurrent assigns serialize on this lock instead of racing the
+    // unique key into a 500.
+    const job = await trx('jobs').where({ id: jobId }).forUpdate().first();
+    if (!job || (job.status !== 'DRAFT' && job.status !== 'IN_PROGRESS')) {
+      throw ApiError.conflict("Bu holatdagi ishga checklist biriktirib bo'lmaydi", 'JOB_STATE_INVALID');
+    }
+
     const existing = await trx('job_checklists').where({ job_id: jobId }).forUpdate().first();
     if (existing) {
       throw ApiError.conflict('Bu ishga checklist allaqachon biriktirilgan', 'CHECKLIST_EXISTS');

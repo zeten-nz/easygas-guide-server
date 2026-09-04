@@ -69,17 +69,37 @@ async function resolveRoleAndBranch(
   return resolvedBranchId;
 }
 
-/** Guard: refuse an action that would leave the system without an ACTIVE admin. */
-async function assertNotLastActiveAdmin(targetUserId: number, trx: Knex.Transaction): Promise<void> {
-  const [{ count }] = (await trx('users')
-    .join('roles', 'roles.id', 'users.role_id')
-    .where('roles.code', 'ADMIN')
-    .where('users.status', 'ACTIVE')
-    .whereNull('users.deleted_at')
-    .whereNot('users.id', targetUserId)
-    .count({ count: '*' })) as [{ count: number | string }];
+/**
+ * Phase 10A: serializes every operation that can reduce the number of active
+ * ADMIN users and returns the CURRENT active-admin id set. It uses a LOCKING
+ * read (FOR UPDATE) over all active admin rows in a stable order (by id):
+ *
+ * - Two operations that both touch admins contend on this shared lock set, so
+ *   the second one blocks until the first commits.
+ * - When it unblocks, a locking read returns the LATEST COMMITTED rows — so
+ *   the returned set already reflects the first operation's change. (A plain
+ *   COUNT() would read the transaction's REPEATABLE-READ snapshot instead and
+ *   miss it — the original last-admin race.)
+ *
+ * DB row locks work across processes (PM2 instances) — no process-local mutex.
+ * The last-admin decision is then made from the returned set, not a separate
+ * query, so it is always consistent with what was locked.
+ */
+async function lockActiveAdminIds(trx: Knex.Transaction): Promise<number[]> {
+  const adminRole = await trx('roles').where({ code: 'ADMIN' }).first();
+  if (!adminRole) return [];
+  const rows = (await trx('users')
+    .where({ role_id: adminRole.id, status: 'ACTIVE' })
+    .whereNull('deleted_at')
+    .orderBy('id')
+    .forUpdate()
+    .select('id')) as { id: number }[];
+  return rows.map((r) => r.id);
+}
 
-  if (Number(count) === 0) {
+/** Guard: refuse an action that would remove the last ACTIVE admin. */
+function assertNotLastActiveAdmin(activeAdminIds: number[], targetUserId: number): void {
+  if (activeAdminIds.filter((id) => id !== targetUserId).length === 0) {
     throw ApiError.conflict(
       "Tizimda oxirgi faol administratorni o'chirib bo'lmaydi",
       'LAST_ADMIN_PROTECTED',
@@ -204,6 +224,13 @@ export async function updateUser(
   }
 
   await db.transaction(async (trx) => {
+    // Role changes may demote an admin — serialize on the admin set FIRST
+    // (consistent lock order: admin set → target row; see lockActiveAdminIds).
+    let activeAdminIds: number[] | null = null;
+    if (input.roleCode !== undefined) {
+      activeAdminIds = await lockActiveAdminIds(trx);
+    }
+
     const current = (await trx('users')
       .select('users.*', 'roles.code as role_code')
       .join('roles', 'roles.id', 'users.role_id')
@@ -220,7 +247,7 @@ export async function updateUser(
 
     if (input.roleCode !== undefined || input.branchId !== undefined) {
       if (current.role_code === 'ADMIN' && nextRole !== 'ADMIN') {
-        await assertNotLastActiveAdmin(id, trx);
+        assertNotLastActiveAdmin(activeAdminIds ?? (await lockActiveAdminIds(trx)), id);
       }
       await resolveRoleAndBranch(actor, nextRole, requestedBranch, trx);
     }
@@ -286,6 +313,10 @@ export async function blockUser(actor: AuthUser, id: number, meta: RequestMeta):
   }
 
   await db.transaction(async (trx) => {
+    // Blocking may remove an active admin — serialize on the admin set FIRST
+    // (consistent lock order: admin set → target row; see lockActiveAdminIds).
+    const activeAdminIds = await lockActiveAdminIds(trx);
+
     const current = (await trx('users')
       .select('users.*', 'roles.code as role_code')
       .join('roles', 'roles.id', 'users.role_id')
@@ -299,7 +330,7 @@ export async function blockUser(actor: AuthUser, id: number, meta: RequestMeta):
       throw ApiError.conflict('Foydalanuvchi allaqachon bloklangan', 'ALREADY_BLOCKED');
     }
     if (current.role_code === 'ADMIN') {
-      await assertNotLastActiveAdmin(id, trx);
+      assertNotLastActiveAdmin(activeAdminIds, id);
     }
 
     await trx('users').where({ id }).update({ status: 'BLOCKED', updated_at: trx.fn.now() });

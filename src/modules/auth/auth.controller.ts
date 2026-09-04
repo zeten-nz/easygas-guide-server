@@ -1,5 +1,6 @@
 import type { CookieOptions, Request, Response } from 'express';
 import { env, isProduction } from '../../config/env';
+import { csrfTokenFor } from '../../middleware/csrf.middleware';
 import { requestMeta } from '../audit/audit.service';
 import * as authService from './auth.service';
 
@@ -18,7 +19,8 @@ function sessionCookieOptions(rememberMe: boolean, expiresAt: Date): CookieOptio
 export async function login(req: Request, res: Response): Promise<void> {
   const result = await authService.login(req.body, requestMeta(req));
   res.cookie(env.SESSION_COOKIE_NAME, result.token, sessionCookieOptions(result.rememberMe, result.expiresAt));
-  res.json({ user: result.user });
+  // Session-bound CSRF token (see csrf.middleware.ts) — kept in client memory only.
+  res.json({ user: result.user, csrfToken: csrfTokenFor(result.token) });
 }
 
 export async function logout(req: Request, res: Response): Promise<void> {
@@ -28,7 +30,9 @@ export async function logout(req: Request, res: Response): Promise<void> {
 }
 
 export async function me(req: Request, res: Response): Promise<void> {
-  res.json({ user: req.user });
+  // Re-issue the CSRF token so a reloaded SPA can resume mutations.
+  const rawCookie = req.cookies?.[env.SESSION_COOKIE_NAME] as string;
+  res.json({ user: req.user, csrfToken: csrfTokenFor(rawCookie) });
 }
 
 export async function register(req: Request, res: Response): Promise<void> {

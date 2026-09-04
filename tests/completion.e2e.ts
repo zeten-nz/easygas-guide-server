@@ -9,6 +9,7 @@
  * Fixtures: users +99899000910x, "TEST CM ..." names, TCM* plates.
  * Cleaned up (DB + storage) before and after the run.
  */
+import { assertTestDatabase } from './helpers/test-env'; // MUST be first: NODE_ENV=test + *_test DB
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -16,6 +17,7 @@ import crypto from 'node:crypto';
 import bcrypt from 'bcrypt';
 import { db } from '../src/config/database';
 import { createApp } from '../src/app';
+import { csrfTokenFor } from '../src/middleware/csrf.middleware';
 import { setSmsProviderForTesting } from '../src/sms';
 
 const USERS = {
@@ -46,7 +48,10 @@ interface HttpResult {
 async function http(method: string, pathname: string, opts: { body?: unknown; cookie?: string } = {}): Promise<HttpResult> {
   const res = await fetch(`${baseUrl}${pathname}`, {
     method,
-    headers: { 'content-type': 'application/json', ...(opts.cookie ? { cookie: opts.cookie } : {}) },
+    headers: {
+      'content-type': 'application/json',
+      ...(opts.cookie ? { cookie: opts.cookie, 'x-csrf-token': csrfTokenFor(opts.cookie.split('=')[1] ?? '') } : {}),
+    },
     ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
   });
   const text = await res.text();
@@ -62,7 +67,7 @@ async function http(method: string, pathname: string, opts: { body?: unknown; co
 async function uploadFile(pathname: string, field: string, bytes: Buffer, cookie?: string): Promise<HttpResult> {
   const form = new FormData();
   form.append(field, new Blob([new Uint8Array(bytes)], { type: 'image/png' }), 'file.png');
-  const res = await fetch(`${baseUrl}${pathname}`, { method: 'POST', headers: cookie ? { cookie } : {}, body: form });
+  const res = await fetch(`${baseUrl}${pathname}`, { method: 'POST', headers: cookie ? { cookie, 'x-csrf-token': csrfTokenFor(cookie.split('=')[1] ?? '') } : {}, body: form });
   const text = await res.text();
   let body: any = null;
   try {
@@ -217,6 +222,7 @@ async function createFixtures() {
 
 async function run(): Promise<void> {
   setSmsProviderForTesting({ name: 'test-capture', send: async () => {} });
+  await assertTestDatabase(db);
   await cleanup();
   const fx = await createFixtures();
 

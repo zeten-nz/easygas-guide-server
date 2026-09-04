@@ -27,13 +27,14 @@ interface RequestMeta {
   userAgent: string | null;
 }
 
-async function findUserByPhone(phone: string): Promise<UserWithRole | undefined> {
+async function findUserByPhone(phone: string): Promise<(UserWithRole & { branch_status: string | null }) | undefined> {
   return (await db('users')
-    .select('users.*', 'roles.code as role_code')
+    .select('users.*', 'roles.code as role_code', 'branches.status as branch_status')
     .join('roles', 'roles.id', 'users.role_id')
+    .leftJoin('branches', 'branches.id', 'users.branch_id')
     .where('users.phone', phone)
     .whereNull('users.deleted_at')
-    .first()) as UserWithRole | undefined;
+    .first()) as (UserWithRole & { branch_status: string | null }) | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -78,6 +79,20 @@ export async function login(input: LoginInput, meta: RequestMeta): Promise<Login
       entityType: 'user',
       entityId: user.id,
       newValue: { reason: 'ACCOUNT_INACTIVE' },
+      ...meta,
+    });
+    throw ApiError.unauthorized(GENERIC_LOGIN_ERROR, 'INVALID_CREDENTIALS');
+  }
+
+  // Phase 10A branch policy: a deactivated branch means no new sessions for
+  // its users — same generic failure as above, real reason in the audit only.
+  if (user.branch_id !== null && user.branch_status !== 'ACTIVE') {
+    await logAudit({
+      userId: user.id,
+      action: 'LOGIN_FAILED',
+      entityType: 'user',
+      entityId: user.id,
+      newValue: { reason: 'BRANCH_INACTIVE', branchId: user.branch_id },
       ...meta,
     });
     throw ApiError.unauthorized(GENERIC_LOGIN_ERROR, 'INVALID_CREDENTIALS');
@@ -230,52 +245,84 @@ export async function requestPasswordReset(phone: string, meta: RequestMeta): Pr
 }
 
 export async function verifyOtp(phone: string, otp: string): Promise<{ resetToken: string }> {
-  const record = (await db('password_resets')
-    .where({ phone })
-    .whereNull('consumed_at')
-    .orderBy('id', 'desc')
-    .first()) as PasswordResetRow | undefined;
+  // Phase 10A: the whole check/increment/consume sequence runs atomically on a
+  // row-locked record — concurrent requests serialize, so the attempt limit
+  // cannot be overrun and a correct OTP is consumed exactly once. Crucially the
+  // transaction ALWAYS commits (the attempt increment must survive a wrong
+  // guess — a rolled-back increment would defeat brute-force protection), so
+  // the outcome is returned and any error is thrown AFTER the commit.
+  const outcome = await db.transaction(
+    async (trx): Promise<{ kind: 'ok'; resetToken: string } | { kind: 'invalid' } | { kind: 'too_many' }> => {
+      const record = (await trx('password_resets')
+        .where({ phone })
+        .whereNull('consumed_at')
+        .orderBy('id', 'desc')
+        .forUpdate()
+        .first()) as PasswordResetRow | undefined;
 
-  if (!record || new Date(record.otp_expires_at).getTime() <= Date.now()) {
-    throw ApiError.badRequest(GENERIC_OTP_ERROR, 'INVALID_OTP');
-  }
+      if (!record || new Date(record.otp_expires_at).getTime() <= Date.now()) {
+        return { kind: 'invalid' };
+      }
+      if (record.attempts >= env.OTP_MAX_ATTEMPTS) {
+        return { kind: 'too_many' };
+      }
 
-  if (record.attempts >= env.OTP_MAX_ATTEMPTS) {
+      // Increment first and let it COMMIT regardless of the match result.
+      await trx('password_resets').where({ id: record.id }).increment('attempts', 1);
+
+      if (!timingSafeEqualHex(record.otp_hash, hmacSecret(otp))) {
+        return { kind: 'invalid' };
+      }
+
+      // OTP is single-use: consume it and hand out a short-lived reset token.
+      const resetToken = generateResetToken();
+      await trx('password_resets')
+        .where({ id: record.id })
+        .update({
+          consumed_at: trx.fn.now(),
+          reset_token_hash: hmacSecret(resetToken),
+          reset_token_expires_at: new Date(Date.now() + env.RESET_TOKEN_TTL_MINUTES * 60 * 1000),
+        });
+
+      return { kind: 'ok', resetToken };
+    },
+  );
+
+  if (outcome.kind === 'too_many') {
     throw ApiError.tooMany("Urinishlar soni oshib ketdi. Yangi kod so'rang.", 'OTP_ATTEMPTS_EXCEEDED');
   }
-
-  await db('password_resets').where({ id: record.id }).increment('attempts', 1);
-
-  if (!timingSafeEqualHex(record.otp_hash, hmacSecret(otp))) {
+  if (outcome.kind === 'invalid') {
     throw ApiError.badRequest(GENERIC_OTP_ERROR, 'INVALID_OTP');
   }
-
-  // OTP is single-use: consume it and hand out a short-lived reset token.
-  const resetToken = generateResetToken();
-  await db('password_resets')
-    .where({ id: record.id })
-    .update({
-      consumed_at: db.fn.now(),
-      reset_token_hash: hmacSecret(resetToken),
-      reset_token_expires_at: new Date(Date.now() + env.RESET_TOKEN_TTL_MINUTES * 60 * 1000),
-    });
-
-  return { resetToken };
+  return { resetToken: outcome.resetToken };
 }
 
 export async function resetPassword(resetToken: string, newPassword: string, meta: RequestMeta): Promise<void> {
-  const record = (await db('password_resets')
-    .where({ reset_token_hash: hmacSecret(resetToken) })
-    .whereNull('reset_used_at')
-    .first()) as PasswordResetRow | undefined;
-
-  if (!record || !record.reset_token_expires_at || new Date(record.reset_token_expires_at).getTime() <= Date.now()) {
-    throw ApiError.badRequest("Havola eskirgan. Qaytadan urinib ko'ring.", 'INVALID_RESET_TOKEN');
-  }
-
+  // The hash is computed before the transaction so the row lock is held only
+  // for the short atomic section (bcrypt at cost 12 takes ~250ms).
   const passwordHash = await bcrypt.hash(newPassword, env.BCRYPT_ROUNDS);
 
+  // Phase 10A: single atomic boundary — the token row is locked and its
+  // single-use state re-validated INSIDE the transaction, so two concurrent
+  // requests with the same token can never both succeed: the loser blocks on
+  // the row lock, re-reads reset_used_at as set, and gets the generic error.
+  // Password update + token consumption + session revocation + audit commit
+  // together or not at all.
   await db.transaction(async (trx) => {
+    const record = (await trx('password_resets')
+      .where({ reset_token_hash: hmacSecret(resetToken) })
+      .forUpdate()
+      .first()) as PasswordResetRow | undefined;
+
+    if (
+      !record ||
+      record.reset_used_at !== null ||
+      !record.reset_token_expires_at ||
+      new Date(record.reset_token_expires_at).getTime() <= Date.now()
+    ) {
+      throw ApiError.badRequest("Havola eskirgan. Qaytadan urinib ko'ring.", 'INVALID_RESET_TOKEN');
+    }
+
     await trx('users').where({ id: record.user_id }).update({ password_hash: passwordHash });
     await trx('password_resets').where({ id: record.id }).update({ reset_used_at: trx.fn.now() });
     await trx('sessions').where({ user_id: record.user_id }).whereNull('revoked_at').update({ revoked_at: trx.fn.now() });
