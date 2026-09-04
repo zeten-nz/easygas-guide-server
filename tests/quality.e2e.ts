@@ -408,7 +408,11 @@ async function run(): Promise<void> {
     assert.equal((await uploadFile(photosPath(jobMain.jobId, jobMain.steps[1].id), 'photo', PNG_BYTES, sifatCookie)).status, 403);
     assert.equal((await http('POST', `/api/v1/jobs/${jobMain.jobId}/checklist/steps/${jobMain.steps[1].id}/redo`, { cookie: sifatCookie })).status, 403);
     assert.equal((await http('POST', `/api/v1/jobs/${jobMain.jobId}/stop/approve`, { cookie: sifatCookie })).status, 403);
-    assert.equal((await uploadFile(`/api/v1/jobs/${jobMain.jobId}/signature`, 'signature', PNG_BYTES, ustaACookie)).status, 409, 'signature stays immutable (SIGNATURE_EXISTS)');
+    // SIFAT lacks checklist.execute → cannot upload a signature either.
+    assert.equal((await uploadFile(`/api/v1/jobs/${jobMain.jobId}/signature`, 'signature', PNG_BYTES, sifatCookie)).status, 403);
+    // The original (cycle-1) signature remains untouched in history.
+    const origSig = await db('customer_signatures').where({ job_id: jobMain.jobId, cycle: 1 }).first();
+    assert.ok(origSig && origSig.superseded_at, 'the pre-reopen signature is preserved and marked superseded');
     assert.equal((await http('PATCH', `/api/v1/jobs/${jobMain.jobId}/checklist`, { cookie: sifatCookie, body: {} })).status, 404);
   });
 
@@ -468,6 +472,13 @@ async function run(): Promise<void> {
     assert.equal((await http('POST', `/api/v1/jobs/${jobMain.jobId}/complete`, { cookie: ustaACookie })).status, 403);
     assert.equal((await http('POST', `/api/v1/jobs/${jobMain.jobId}/complete`, { cookie: masterBCookie })).status, 404);
 
+    // Phase 10B: the corrected work must be re-signed (the pre-reopen signature
+    // was superseded when the cycle advanced) before the gate allows re-close.
+    const beforeSig = await http('POST', `/api/v1/jobs/${jobMain.jobId}/complete`, { cookie: masterACookie });
+    assert.equal(beforeSig.status, 422, 'a fresh signature is required after reopen');
+    assert.ok(beforeSig.body.error.details.some((d: any) => d.code === 'CUSTOMER_SIGNATURE_REQUIRED'));
+    assert.equal((await uploadFile(`/api/v1/jobs/${jobMain.jobId}/signature`, 'signature', PNG_BYTES, ustaACookie)).status, 201);
+
     const res = await http('POST', `/api/v1/jobs/${jobMain.jobId}/complete`, { cookie: masterACookie });
     assert.equal(res.status, 200, JSON.stringify(res.body));
     assert.equal(res.body.job.status, 'QUALITY_REVIEW');
@@ -500,7 +511,9 @@ async function run(): Promise<void> {
     const row = await db('jobs').where({ id: jobMain.jobId }).first();
     assert.equal(row.status, 'COMPLETED');
     assert.equal(row.closed_by, fx.ids.sifat, 'second completion recorded on the job row');
-    assert.ok(new Date(row.closed_at).getTime() > new Date(originalClosedAt).getTime());
+    // >= because MySQL TIMESTAMP is 1-second precision; the second completion is
+    // a strictly later operation but can land in the same wall-clock second.
+    assert.ok(new Date(row.closed_at).getTime() >= new Date(originalClosedAt).getTime());
 
     const closes = await db('audit_logs')
       .where({ action: 'JOB_CLOSED', entity_type: 'job', entity_id: String(jobMain.jobId) })
@@ -535,6 +548,8 @@ async function run(): Promise<void> {
       'approval returns to REOPENED (not IN_PROGRESS) inside a reopen cycle',
     );
 
+    // Re-sign the corrected work (Phase 10B) before re-close.
+    assert.equal((await uploadFile(`/api/v1/jobs/${job.jobId}/signature`, 'signature', PNG_BYTES, ustaACookie)).status, 201);
     assert.equal((await http('POST', `/api/v1/jobs/${job.jobId}/complete`, { cookie: masterACookie })).status, 200);
     assert.equal((await db('jobs').where({ id: job.jobId }).first()).status, 'QUALITY_REVIEW');
     assert.equal((await http('POST', `/api/v1/jobs/${job.jobId}/quality/confirm`, { cookie: sifat2Cookie })).status, 200);
@@ -560,7 +575,8 @@ async function run(): Promise<void> {
       .count({ c: '*' });
     assert.equal(Number((audits as any)[0].c), 1);
 
-    // reopen vs re-close race on the now-REOPENED job (everything still valid)
+    // Re-sign so the re-close gate is valid, then race reopen vs re-close.
+    assert.equal((await uploadFile(`/api/v1/jobs/${job.jobId}/signature`, 'signature', PNG_BYTES, ustaACookie)).status, 201);
     const [close, reopen] = await Promise.all([
       http('POST', `/api/v1/jobs/${job.jobId}/complete`, { cookie: masterACookie }),
       http('POST', `/api/v1/jobs/${job.jobId}/reopen`, { cookie: sifatCookie, body: { reason: 'poyga sinovi' } }),

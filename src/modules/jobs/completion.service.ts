@@ -4,8 +4,11 @@ import { db } from '../../config/database';
 import { ApiError } from '../../utils/errors';
 import { logAudit } from '../audit/audit.service';
 import { jobsBranchScope } from '../../rbac/permissions';
-import { detectImageType } from '../photos/photos.service';
+import { isWorkable } from './job-cycle';
 import { getStorageProvider } from '../../storage';
+import { StorageError } from '../../storage/storage.provider';
+import { inspectImage } from '../../utils/image';
+import { logger } from '../../utils/logger';
 import type { AuthUser } from '../../types/auth';
 
 interface RequestMeta {
@@ -125,11 +128,12 @@ export async function validateJobCompletion(jobId: number, trx?: Knex.Transactio
   }
   const relevantAttempt = (stepId: number) => latestAttempt.get(stepId) ?? 1;
 
-  // 2. §22 photo re-verification: real records of the relevant attempt only —
-  //    a rejected attempt's evidence never counts (Phase 7 semantics).
+  // 2. §22 photo re-verification: only READY evidence of the relevant attempt
+  //    counts (Phase 10B) — PENDING/FAILED rows never satisfy completion, and a
+  //    rejected attempt's evidence never counts (Phase 7 semantics).
   for (const s of steps.filter((x: any) => x.required_photos > 0)) {
     const [{ c }] = (await conn('job_photos')
-      .where({ job_step_id: s.id, attempt: relevantAttempt(s.id) })
+      .where({ job_step_id: s.id, attempt: relevantAttempt(s.id), status: 'READY' })
       .count({ c: '*' })) as [{ c: number | string }];
     if (Number(c) < s.required_photos) {
       conditions.photos = false;
@@ -178,8 +182,15 @@ export async function validateJobCompletion(jobId: number, trx?: Knex.Transactio
     }
   }
 
-  // 4. §22–23 customer confirmation: a real stored signature artifact.
-  const signature = await conn('customer_signatures').where({ job_id: jobId }).first();
+  // 4. §22–23 customer confirmation: a READY signature bound to the CURRENT
+  //    completion cycle (Phase 10B). After a reopen the job's cycle advances,
+  //    so a pre-reopen signature (older cycle) no longer authorizes the
+  //    corrected work — a fresh signature is required.
+  const jobForSig = await conn('jobs').where({ id: jobId }).first();
+  const currentCycle = jobForSig?.cycle ?? 1;
+  const signature = await conn('customer_signatures')
+    .where({ job_id: jobId, cycle: currentCycle, status: 'READY' })
+    .first();
   if (!signature) {
     conditions.signature = false;
     reasons.push({ code: 'CUSTOMER_SIGNATURE_REQUIRED', message: "Mijoz imzosi hali olinmagan" });
@@ -211,23 +222,40 @@ export interface SignatureDetail {
 }
 
 export async function getSignature(actor: AuthUser, jobId: number): Promise<SignatureDetail | null> {
-  await loadScopedJob(actor, jobId);
-  const row = await db('customer_signatures').where({ job_id: jobId }).first();
+  const job = await loadScopedJob(actor, jobId);
+  const row = await db('customer_signatures')
+    .where({ job_id: jobId, cycle: job.cycle, status: 'READY' })
+    .orderBy('id', 'desc')
+    .first();
   if (!row) return null;
   return { id: row.id, mimeType: row.mime_type, sizeBytes: row.size_bytes, createdAt: row.created_at };
 }
 
-export async function getSignatureFile(actor: AuthUser, jobId: number): Promise<{ buffer: Buffer; mimeType: string }> {
-  await loadScopedJob(actor, jobId);
-  const row = await db('customer_signatures').where({ job_id: jobId }).first();
+export async function getSignatureStream(
+  actor: AuthUser,
+  jobId: number,
+): Promise<{ stream: import('node:stream').Readable; mimeType: string; sizeBytes: number }> {
+  const job = await loadScopedJob(actor, jobId);
+  const row = await db('customer_signatures')
+    .where({ job_id: jobId, cycle: job.cycle, status: 'READY' })
+    .orderBy('id', 'desc')
+    .first();
   if (!row) throw ApiError.notFound('Imzo topilmadi');
-  return { buffer: await getStorageProvider().get(row.storage_key), mimeType: row.mime_type };
+  try {
+    const stream = await getStorageProvider().getStream(row.storage_key);
+    return { stream, mimeType: row.mime_type, sizeBytes: row.size_bytes };
+  } catch (err) {
+    if (err instanceof StorageError && err.kind === 'NOT_FOUND') throw ApiError.notFound('Imzo topilmadi');
+    throw err;
+  }
 }
 
 /**
- * §23: the customer signs at the end of the work — allowed only while the job
- * is IN_PROGRESS with a fully completed checklist, exactly once, immutable.
- * customer_id/created_at are server-derived; the client sends only the image.
+ * §23 + Phase 10B: the customer signs at the end of the work. Two-transaction
+ * safe upload (register PENDING → storage put+verify → finalize READY), bound
+ * to the job's CURRENT cycle so a reopened job requires a fresh signature.
+ * Allowed only while IN_PROGRESS with a completed checklist; one READY
+ * signature per cycle; customer_id/cycle/timestamps are server-derived.
  */
 export async function saveSignature(
   actor: AuthUser,
@@ -235,29 +263,39 @@ export async function saveSignature(
   file: { buffer: Buffer },
   meta: RequestMeta,
 ): Promise<SignatureDetail> {
-  const mime = detectImageType(file.buffer);
-  if (!mime) {
+  const info = inspectImage(file.buffer);
+  if ('error' in info) {
+    if (info.error === 'IMAGE_TOO_LARGE') {
+      throw new ApiError(422, 'IMAGE_TOO_LARGE', "Imzo rasmi o'lchami juda katta");
+    }
     throw new ApiError(422, 'INVALID_FILE_TYPE', 'Imzo rasm fayli sifatida yuborilishi kerak (PNG/JPEG/WebP)');
   }
+  const mime = info.mime;
   if (file.buffer.length > MAX_SIGNATURE_BYTES) {
     throw new ApiError(422, 'FILE_TOO_LARGE', 'Imzo fayli juda katta (maksimum 5 MB)');
   }
 
   const storageKey = `signatures/${jobId}/${crypto.randomUUID()}.${EXT_BY_MIME[mime]}`;
   const hash = crypto.createHash('sha256').update(file.buffer).digest('hex');
+  const size = file.buffer.length;
 
-  const signatureId = await db.transaction(async (trx) => {
+  // ---- TX1: register PENDING under the job lock ----
+  const registered = await db.transaction(async (trx) => {
     const job = await loadScopedJob(actor, jobId, trx, true);
-    if (job.status !== 'IN_PROGRESS') {
-      throw ApiError.conflict("Imzo faqat 'Jarayonda' holatidagi ishda olinadi", 'JOB_NOT_IN_PROGRESS');
+    // Signable while the job is doing work — IN_PROGRESS or, in a §24 reopen
+    // cycle, REOPENED (the customer re-signs the corrected work).
+    if (!isWorkable(job)) {
+      throw ApiError.conflict("Imzo faqat ish jarayonida olinadi", 'JOB_NOT_IN_PROGRESS');
     }
-
     const checklist = await trx('job_checklists').where({ job_id: jobId }).first();
     if (!checklist || !checklist.completed_at) {
-      throw ApiError.conflict('Imzo olishdan avval checklist to\'liq yakunlanishi kerak', 'CHECKLIST_INCOMPLETE');
+      throw ApiError.conflict("Imzo olishdan avval checklist to'liq yakunlanishi kerak", 'CHECKLIST_INCOMPLETE');
     }
-
-    const existing = await trx('customer_signatures').where({ job_id: jobId }).first();
+    // At most one READY (or in-flight PENDING) signature for the current cycle.
+    const existing = await trx('customer_signatures')
+      .where({ job_id: jobId, cycle: job.cycle })
+      .whereIn('status', ['PENDING', 'READY'])
+      .first();
     if (existing) {
       throw ApiError.conflict('Bu ish uchun mijoz imzosi allaqachon olingan', 'SIGNATURE_EXISTS');
     }
@@ -265,35 +303,98 @@ export async function saveSignature(
     const [newId] = await trx('customer_signatures').insert({
       job_id: jobId,
       customer_id: job.customer_id, // server-derived, never client-supplied
+      cycle: job.cycle,
+      status: 'PENDING',
       storage_key: storageKey,
       mime_type: mime,
-      size_bytes: file.buffer.length,
+      content_type: mime,
+      size_bytes: size,
       hash,
     });
 
     await logAudit(
       {
         userId: actor.id,
-        action: 'CUSTOMER_SIGNED',
+        action: 'SIGNATURE_UPLOAD_STARTED',
         entityType: 'job',
         entityId: jobId,
-        newValue: { signatureId: newId, customerId: job.customer_id, hash },
+        newValue: { signatureId: newId, customerId: job.customer_id, cycle: job.cycle },
         ...meta,
       },
       trx,
     );
-
-    return newId as number;
+    return { id: newId as number, cycle: job.cycle as number };
   });
 
+  // ---- STORAGE PUT + verify ----
   try {
-    await getStorageProvider().put(storageKey, file.buffer);
+    const stat = await getStorageProvider().put(storageKey, file.buffer, { contentType: mime, sha256: hash });
+    if (stat.size !== size) throw new StorageError('IO', `Stored size ${stat.size} != expected ${size}`);
   } catch (err) {
-    await db('customer_signatures').where({ id: signatureId }).del();
-    throw err;
+    await markSignatureFailed(registered.id, err instanceof StorageError ? `STORAGE_${err.kind}` : 'STORAGE_WRITE', actor, jobId, meta);
+    logger.error({ err, signatureId: registered.id }, 'Signature storage write failed');
+    throw new ApiError(502, 'STORAGE_UNAVAILABLE', "Imzoni saqlashda xatolik — qayta urinib ko'ring");
+  }
+
+  // ---- TX2: finalize READY (or supersede if the job moved on) ----
+  const finalized = await db.transaction(async (trx) => {
+    const row = await trx('customer_signatures').where({ id: registered.id }).forUpdate().first();
+    if (!row || row.status !== 'PENDING') return { ok: false as const };
+    const job = await trx('jobs').where({ id: jobId }).forUpdate().first();
+    const stillValid = job && isWorkable(job) && job.cycle === registered.cycle;
+    if (!stillValid) {
+      await trx('customer_signatures')
+        .where({ id: registered.id })
+        .update({ status: 'FAILED', failed_at: trx.fn.now(), failure_reason: 'SUPERSEDED' });
+      await logAudit(
+        { userId: actor.id, action: 'SIGNATURE_UPLOAD_FAILED', entityType: 'job', entityId: jobId, newValue: { signatureId: registered.id, reason: 'SUPERSEDED' }, ...meta },
+        trx,
+      );
+      return { ok: false as const };
+    }
+    await trx('customer_signatures').where({ id: registered.id }).update({ status: 'READY', ready_at: trx.fn.now() });
+    await logAudit(
+      {
+        userId: actor.id,
+        action: 'CUSTOMER_SIGNED',
+        entityType: 'job',
+        entityId: jobId,
+        newValue: { signatureId: registered.id, customerId: row.customer_id, cycle: registered.cycle, hash },
+        ...meta,
+      },
+      trx,
+    );
+    return { ok: true as const };
+  });
+
+  if (!finalized.ok) {
+    await getStorageProvider()
+      .delete(storageKey)
+      .catch((err) => logger.warn({ err, storageKey }, 'Orphan signature object delete failed (reconciliation will catch it)'));
+    throw ApiError.conflict("Ish holati o'zgardi — imzo qabul qilinmadi", 'JOB_STATE_CHANGED');
   }
 
   return (await getSignature(actor, jobId))!;
+}
+
+async function markSignatureFailed(
+  id: number,
+  reason: string,
+  actor: AuthUser,
+  jobId: number,
+  meta: RequestMeta,
+): Promise<void> {
+  await db.transaction(async (trx) => {
+    const row = await trx('customer_signatures').where({ id }).forUpdate().first();
+    if (!row || row.status !== 'PENDING') return;
+    await trx('customer_signatures')
+      .where({ id })
+      .update({ status: 'FAILED', failed_at: trx.fn.now(), failure_reason: reason.slice(0, 60) });
+    await logAudit(
+      { userId: actor.id, action: 'SIGNATURE_UPLOAD_FAILED', entityType: 'job', entityId: jobId, newValue: { signatureId: id, reason: reason.slice(0, 60) }, ...meta },
+      trx,
+    );
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -375,13 +476,23 @@ export async function reopenJob(actor: AuthUser, jobId: number, reason: string, 
       throw ApiError.conflict("Faqat yakunlangan (COMPLETED) ishni qayta ochish mumkin", 'JOB_NOT_COMPLETED');
     }
 
+    // Phase 10B: advance the completion cycle so the prior signature no longer
+    // authorizes the corrected work — a fresh READY signature will be required
+    // before re-completion. The old signature stays in history, marked
+    // superseded (never deleted).
+    const newCycle = (job.cycle ?? 1) + 1;
     await trx('jobs').where({ id: jobId }).update({
       status: 'REOPENED',
+      cycle: newCycle,
       reopen_reason: reason,
       reopened_by: actor.id,
       reopened_at: trx.fn.now(),
       updated_at: trx.fn.now(),
     });
+
+    const superseded = await trx('customer_signatures')
+      .where({ job_id: jobId, cycle: job.cycle ?? 1, status: 'READY' })
+      .update({ superseded_at: trx.fn.now() });
 
     await logAudit(
       {
@@ -389,12 +500,26 @@ export async function reopenJob(actor: AuthUser, jobId: number, reason: string, 
         action: 'JOB_REOPENED',
         entityType: 'job',
         entityId: jobId,
-        oldValue: { status: 'COMPLETED' },
-        newValue: { status: 'REOPENED', reason },
+        oldValue: { status: 'COMPLETED', cycle: job.cycle ?? 1 },
+        newValue: { status: 'REOPENED', cycle: newCycle, reason },
         ...meta,
       },
       trx,
     );
+    if (superseded > 0) {
+      await logAudit(
+        {
+          userId: actor.id,
+          action: 'SIGNATURE_SUPERSEDED',
+          entityType: 'job',
+          entityId: jobId,
+          oldValue: { cycle: job.cycle ?? 1 },
+          newValue: { reason: 'JOB_REOPENED', newCycle },
+          ...meta,
+        },
+        trx,
+      );
+    }
   });
 }
 

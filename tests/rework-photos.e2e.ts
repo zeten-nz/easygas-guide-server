@@ -589,7 +589,7 @@ async function run(): Promise<void> {
   await test('all Phase 7 audit actions exist with correct actor attribution', async () => {
     for (const [action, actorId] of [
       ['STOP_CORRECTION_STARTED', fx.ids.ustaA],
-      ['PHOTO_UPLOADED', fx.ids.ustaA],
+      ['PHOTO_UPLOAD_READY', fx.ids.ustaA],
     ] as const) {
       const row = await db('audit_logs').where({ action, user_id: actorId }).first();
       assert.ok(row, `missing audit action ${action} by actor ${actorId}`);

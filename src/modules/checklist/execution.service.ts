@@ -384,8 +384,10 @@ export async function completeStep(
     // CURRENT attempt — a rejected attempt's evidence cannot satisfy the
     // corrected attempt, and no client-sent counter is ever trusted.
     if (jobStep.required_photos > 0) {
+      // Phase 10B: only READY evidence counts — PENDING/FAILED uploads never
+      // satisfy the requirement.
       const [{ c: photoCount }] = (await trx('job_photos')
-        .where({ job_step_id: jobStep.id, attempt })
+        .where({ job_step_id: jobStep.id, attempt, status: 'READY' })
         .count({ c: '*' })) as [{ c: number | string }];
       if (Number(photoCount) < jobStep.required_photos) {
         throw new ApiError(422, 'PHOTOS_REQUIRED', "Bosqich uchun kerakli foto dalillar yetarli emas", [

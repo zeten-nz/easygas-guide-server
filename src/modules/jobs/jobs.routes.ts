@@ -125,10 +125,17 @@ jobsRouter.get(
   requirePermission('jobs.view'),
   validate({ params: jobIdParamsSchema }),
   async (req: Request, res: Response) => {
-    const { buffer, mimeType } = await completionService.getSignatureFile(req.user!, Number(req.params.id));
+    const { stream, mimeType, sizeBytes } = await completionService.getSignatureStream(req.user!, Number(req.params.id));
     res.setHeader('Content-Type', mimeType);
+    res.setHeader('Content-Length', String(sizeBytes));
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Disposition', `inline; filename="signature-${req.params.id}"`);
     res.setHeader('Cache-Control', 'private, max-age=3600');
-    res.send(buffer);
+    stream.on('error', () => {
+      if (!res.headersSent) res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Imzo topilmadi' } });
+      else res.destroy();
+    });
+    stream.pipe(res);
   },
 );
 
