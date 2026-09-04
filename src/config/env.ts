@@ -81,6 +81,11 @@ const envSchema = z.object({
   OTP_RETENTION_DAYS: z.coerce.number().int().positive().default(7),
   SMS_OUTBOX_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
 
+  // --- Phase 10D GPS (loyiha.md §20) — client-reported location evidence policy ---
+  GPS_MAX_ACCURACY_METERS: z.coerce.number().positive().default(100),
+  GPS_MAX_AGE_SECONDS: z.coerce.number().int().positive().default(300),
+  GPS_FUTURE_SKEW_SECONDS: z.coerce.number().int().nonnegative().default(120),
+
   SUPPORT_TELEGRAM_URL: z.string().default('https://t.me/EasygasGarantbot'),
 
   // Object storage (§19/§40). 'local' for development/tests; 's3' for

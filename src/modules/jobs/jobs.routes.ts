@@ -12,8 +12,10 @@ import {
   jobIdParamsSchema,
   listJobsQuerySchema,
 } from './jobs.validators';
+import { z } from 'zod';
 import * as service from './jobs.service';
 import * as completionService from './completion.service';
+import * as assignmentService from './assignment.service';
 import { ApiError } from '../../utils/errors';
 import type { ListJobsQuery } from './jobs.validators';
 
@@ -39,6 +41,14 @@ jobsRouter.get(
   },
 );
 
+// Phase 10D "my assigned jobs" — MUST be declared before '/:id' so 'mine' is
+// not captured as an id param.
+jobsRouter.get('/mine', requirePermission('jobs.view'), async (req: Request, res: Response) => {
+  const page = req.query.page ? Number(req.query.page) : undefined;
+  const pageSize = req.query.pageSize ? Number(req.query.pageSize) : undefined;
+  res.json(await assignmentService.listMyJobs(req.user!, { page, pageSize }));
+});
+
 jobsRouter.get(
   '/:id',
   requirePermission('jobs.view'),
@@ -48,6 +58,24 @@ jobsRouter.get(
     res.json({ job });
   },
 );
+
+// Phase 10D assignment / responsibility.
+const assignBody = z.object({ technicianId: z.coerce.number().int().positive(), reason: z.string().trim().max(500).optional() });
+const unassignBody = z.object({ reason: z.string().trim().max(500).optional() });
+
+jobsRouter.get('/:id/assignment', requirePermission('jobs.view'), validate({ params: jobIdParamsSchema }), async (req: Request, res: Response) => {
+  res.json({ history: await assignmentService.getAssignmentHistory(req.user!, Number(req.params.id)) });
+});
+
+jobsRouter.post('/:id/assign', requirePermission('jobs.assign'), validate({ params: jobIdParamsSchema, body: assignBody }), async (req: Request, res: Response) => {
+  await assignmentService.reassign(req.user!, Number(req.params.id), req.body.technicianId, req.body.reason, requestMeta(req));
+  res.json({ message: 'Texnik biriktirildi' });
+});
+
+jobsRouter.post('/:id/unassign', requirePermission('jobs.assign'), validate({ params: jobIdParamsSchema, body: unassignBody }), async (req: Request, res: Response) => {
+  await assignmentService.unassign(req.user!, Number(req.params.id), req.body.reason, requestMeta(req));
+  res.json({ message: 'Biriktiruv bekor qilindi' });
+});
 
 jobsRouter.post(
   '/',
@@ -110,15 +138,39 @@ jobsRouter.post(
     if (!req.file) {
       throw new ApiError(422, 'NO_FILE', "Imzo fayli yuborilmadi ('signature' maydoni)");
     }
+    // Phase 10D: the client may submit the summary digest it displayed; the
+    // server recomputes the authoritative digest and rejects a stale one.
+    const submittedDigest = typeof req.body?.summaryDigest === 'string' ? req.body.summaryDigest : undefined;
     const signature = await completionService.saveSignature(
       req.user!,
       Number(req.params.id),
       { buffer: req.file.buffer },
       requestMeta(req),
+      submittedDigest,
     );
     res.status(201).json({ signature, message: 'Mijoz imzosi saqlandi' });
   },
 );
+
+// Phase 10D §23: the server-built signable completion summary + its canonical
+// digest (the customer sees the human-readable summary and signs THIS digest).
+jobsRouter.get('/:id/signable-summary', requirePermission('jobs.view'), validate({ params: jobIdParamsSchema }), async (req: Request, res: Response) => {
+  const jobId = Number(req.params.id);
+  await service.getJob(req.user!, jobId); // branch scope (404)
+  const summary = await completionService.getSignableSummary(jobId);
+  if (!summary) throw new ApiError(404, 'NOT_FOUND', 'Ish topilmadi');
+  res.json(summary);
+});
+
+// Phase 10D: the stored immutable completion snapshot for a cycle (history view).
+jobsRouter.get('/:id/completion-snapshot', requirePermission('jobs.view'), validate({ params: jobIdParamsSchema }), async (req: Request, res: Response) => {
+  const jobId = Number(req.params.id);
+  await service.getJob(req.user!, jobId); // branch scope (404)
+  const cycle = req.query.cycle ? Number(req.query.cycle) : undefined;
+  const snapshot = await completionService.getCompletionSnapshotFor(jobId, cycle);
+  if (!snapshot) throw new ApiError(404, 'NOT_FOUND', 'Snapshot topilmadi');
+  res.json(snapshot);
+});
 
 jobsRouter.get(
   '/:id/signature/file',

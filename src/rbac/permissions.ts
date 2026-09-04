@@ -43,6 +43,13 @@ export const PERMISSIONS = [
   'services.view_all',
   'five_why.create',
   'templates.manage',
+
+  // Phase 10D — safety domain
+  'risks.create', // technicians raise risks while performing work
+  'risks.resolve', // supervisory: resolve/revise a risk with evidence
+  'risks.override', // authorized override of a blocking risk (reason required)
+  'jobs.assign', // assign/reassign the responsible technician
+  'gps.override', // authorized override when GPS capture is unavailable
 ] as const;
 
 export type Permission = (typeof PERMISSIONS)[number];
@@ -64,6 +71,7 @@ export const ROLE_PERMISSIONS: Record<RoleCode, readonly Permission[]> = {
     'customers.manage',
     'vehicles.view',
     'vehicles.manage',
+    'risks.create',
   ],
   MASTER: [
     'jobs.view',
@@ -76,9 +84,23 @@ export const ROLE_PERMISSIONS: Record<RoleCode, readonly Permission[]> = {
     'customers.manage',
     'vehicles.view',
     'vehicles.manage',
+    'risks.create',
+    'risks.resolve',
+    'jobs.assign', // service master assigns/reassigns technicians
+    'gps.override',
   ],
   RAHBAR: ['jobs.view', 'five_why.create', 'users.view', 'users.create', 'customers.view', 'vehicles.view'],
-  SIFAT: ['jobs.view', 'jobs.reopen', 'services.view_all', 'five_why.create', 'customers.view', 'vehicles.view'],
+  SIFAT: [
+    'jobs.view',
+    'jobs.reopen',
+    'services.view_all',
+    'five_why.create',
+    'customers.view',
+    'vehicles.view',
+    'risks.resolve',
+    'risks.override',
+    'gps.override',
+  ],
   ADMIN: [
     'users.view',
     'users.create',
@@ -96,6 +118,10 @@ export const ROLE_PERMISSIONS: Record<RoleCode, readonly Permission[]> = {
     'services.view_all',
     'five_why.create',
     'templates.manage',
+    'risks.resolve',
+    'risks.override',
+    'jobs.assign',
+    'gps.override',
   ],
 };
 

@@ -22,6 +22,8 @@ import { jobChecklistRouter } from './modules/checklist/execution.routes';
 import { jobStopRouter } from './modules/checklist/stop.routes';
 import { stepPhotosRouter } from './modules/photos/photos.routes';
 import { jobQualityRouter } from './modules/quality/quality.routes';
+import { jobRiskRouter } from './modules/risk/risk.routes';
+import { jobGpsRouter } from './modules/gps/gps.routes';
 
 export interface CreateAppOptions {
   /** Overrides env.TRUST_PROXY_HOPS (used by tests to exercise both modes). */
@@ -87,6 +89,8 @@ export function createApp(options: CreateAppOptions = {}) {
   app.use('/api/v1/jobs/:jobId/checklist/steps/:stepId/photos', stepPhotosRouter);
   app.use('/api/v1/jobs/:jobId/checklist', jobChecklistRouter);
   app.use('/api/v1/jobs/:jobId/stop', jobStopRouter);
+  app.use('/api/v1/jobs/:jobId/risks', jobRiskRouter);
+  app.use('/api/v1/jobs/:jobId/gps', jobGpsRouter);
   app.use('/api/v1/jobs/:jobId/quality', jobQualityRouter);
   app.use('/api/v1/jobs', jobsRouter);
   app.use('/api/v1/checklist-templates', checklistTemplatesRouter);

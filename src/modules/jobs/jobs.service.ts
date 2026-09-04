@@ -3,6 +3,7 @@ import { db } from '../../config/database';
 import { ApiError } from '../../utils/errors';
 import { logAudit } from '../audit/audit.service';
 import { jobsBranchScope } from '../../rbac/permissions';
+import { assignAtCreation } from './assignment.service';
 import type { AuthUser } from '../../types/auth';
 import type { CreateJobInput, InstallationInput, JobStatus, ListJobsQuery } from './jobs.validators';
 
@@ -246,6 +247,11 @@ export async function createJob(actor: AuthUser, input: CreateJobInput, meta: Re
       status: 'DRAFT',
     });
 
+    // Phase 10D: a USTA/MASTER opening a job is its responsible technician
+    // (SELF_AT_CREATION) — recorded as immutable assignment history. An
+    // admin-created job stays UNASSIGNED until a supervisor assigns one.
+    await assignAtCreation(trx, newId as number, actor, 1);
+
     await logAudit(
       {
         userId: actor.id,
@@ -257,6 +263,7 @@ export async function createJob(actor: AuthUser, input: CreateJobInput, meta: Re
           vehicleId: input.vehicleId,
           branchId: actor.branchId,
           status: 'DRAFT',
+          assignedTechnicianId: ['USTA', 'MASTER'].includes(actor.role) ? actor.id : null,
         },
         ...meta,
       },

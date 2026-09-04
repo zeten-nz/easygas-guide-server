@@ -5,6 +5,7 @@ import { logAudit } from '../audit/audit.service';
 import { jobsBranchScope } from '../../rbac/permissions';
 import { workingStatus } from '../jobs/job-cycle';
 import { STEP_DONE_STATUSES } from './execution.service';
+import { linkStopRejectionRisk, resolveStopRisk } from '../risk/risk.service';
 import type { AuthUser } from '../../types/auth';
 
 interface RequestMeta {
@@ -113,6 +114,15 @@ export async function approveStop(actor: AuthUser, jobId: number, meta: RequestM
     // §24: inside a reopened correction cycle work returns to REOPENED.
     const nextStatus = workingStatus(job);
 
+    // Phase 10D (§17/§21): an approved STOP is the accepted mitigation — resolve
+    // the blocking risk auto-linked when this STOP step was rejected, in the SAME
+    // transaction (no recursion into the risk routes).
+    await resolveStopRisk(
+      trx,
+      { jobId, cycle: job.cycle ?? 1, jobStepId: step.id, actorId: actor.id, stopApprovalId: approval.id },
+      meta,
+    );
+
     // decided_by/decided_at are server-controlled — never client-supplied.
     await trx('stop_approvals')
       .where({ id: approval.id })
@@ -218,7 +228,7 @@ export async function reworkStop(actor: AuthUser, jobId: number, meta: RequestMe
 /** Master rejects with a mandatory reason: step → REJECTED, job → REJECTED (§17). */
 export async function rejectStop(actor: AuthUser, jobId: number, reason: string, meta: RequestMeta): Promise<void> {
   await db.transaction(async (trx) => {
-    const { approval, step } = await lockPendingStop(trx, actor, jobId);
+    const { job, approval, step } = await lockPendingStop(trx, actor, jobId);
 
     await trx('stop_approvals').where({ id: approval.id }).update({
       status: 'REJECTED',
@@ -231,6 +241,16 @@ export async function rejectStop(actor: AuthUser, jobId: number, reason: string,
     // The technician's submitted result (job_steps.completed_by/note and
     // step_measurements rows) is intentionally preserved — history.
     await trx('jobs').where({ id: jobId }).update({ status: 'REJECTED', updated_at: trx.fn.now() });
+
+    // Phase 10D (§17/§21): a rejected STOP safety checkpoint auto-creates a
+    // BLOCKING (CRITICAL) risk for this cycle+step, deduplicated, in the SAME
+    // transaction. It must then be resolved (STOP re-approved, or explicit
+    // resolution) before the job can complete.
+    await linkStopRejectionRisk(
+      trx,
+      { jobId, cycle: job.cycle ?? 1, jobStepId: step.id, attempt: step.attempt as number, actorId: actor.id, stepName: step.step_name, reason },
+      meta,
+    );
 
     await logAudit(
       {

@@ -2,6 +2,7 @@ import { db } from '../../config/database';
 import { ApiError } from '../../utils/errors';
 import { logAudit } from '../audit/audit.service';
 import { jobsBranchScope } from '../../rbac/permissions';
+import { canExecuteJob } from '../jobs/assignment.service';
 import { isWorkable, workingStatus } from '../jobs/job-cycle';
 import { loadStepsWithMeasurements, type StepDetail } from './templates.service';
 import type { AuthUser } from '../../types/auth';
@@ -351,6 +352,12 @@ export async function completeStep(
     // §24: REOPENED is the working state of a reopen-correction cycle.
     if (!job || !isWorkable(job)) {
       throw ApiError.conflict("Bosqichni bajarish uchun ish ish jarayonida bo'lishi kerak", 'JOB_NOT_IN_PROGRESS');
+    }
+    // Phase 10D responsibility: only the ASSIGNED technician (or a supervising
+    // MASTER) may perform restricted checklist work — a same-branch USTA cannot
+    // take another technician's assigned job.
+    if (!canExecuteJob(actor, job)) {
+      throw ApiError.forbidden('Bu ish sizga biriktirilmagan');
     }
 
     // Locking the checklist header serializes ALL step completions for this

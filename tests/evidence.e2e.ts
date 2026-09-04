@@ -137,6 +137,9 @@ async function cleanup(): Promise<void> {
       await db('job_checklists').whereIn('id', clIds).del();
     }
     await db('audit_logs').whereIn('entity_type', ['job', 'job_photo']).whereIn('entity_id', jobIds.map(String)).del();
+    await db('risk_events').whereIn('job_id', jobIds).del();
+    await db('completion_snapshots').whereIn('job_id', jobIds).del();
+    await db('job_assignments').whereIn('job_id', jobIds).del();
     await db('jobs').whereIn('id', jobIds).del();
   }
   const tplIds = (await db('checklist_templates').where('name', 'like', 'TEST EV%').select('id')).map((t: { id: number }) => t.id);
