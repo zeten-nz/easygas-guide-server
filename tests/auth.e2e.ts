@@ -10,10 +10,12 @@
  * SMS gateway. All fixtures live in the +9989900099xx phone range and are
  * cleaned up before and after the run.
  */
+import { assertTestDatabase } from './helpers/test-env'; // MUST be first: NODE_ENV=test + *_test DB
 import assert from 'node:assert/strict';
 import bcrypt from 'bcrypt';
 import { db } from '../src/config/database';
 import { createApp } from '../src/app';
+import { csrfTokenFor } from '../src/middleware/csrf.middleware';
 import { setSmsProviderForTesting } from '../src/sms';
 import type { SmsProvider } from '../src/sms/sms.provider';
 
@@ -67,7 +69,7 @@ async function http(
     method,
     headers: {
       'content-type': 'application/json',
-      ...(opts.cookie ? { cookie: opts.cookie } : {}),
+      ...(opts.cookie ? { cookie: opts.cookie, 'x-csrf-token': csrfTokenFor(opts.cookie.split('=')[1] ?? '') } : {}),
     },
     ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
   });
@@ -150,6 +152,7 @@ async function createFixtures(): Promise<void> {
 
 async function run(): Promise<void> {
   setSmsProviderForTesting(captureSms);
+  await assertTestDatabase(db);
   await cleanup();
   await createFixtures();
 

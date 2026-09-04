@@ -7,6 +7,7 @@ import pinoHttp from 'pino-http';
 import { env } from './config/env';
 import { logger } from './utils/logger';
 import { apiLimiter } from './middleware/rate-limit.middleware';
+import { csrfProtection } from './middleware/csrf.middleware';
 import { errorHandler, notFoundHandler } from './middleware/error.middleware';
 import { authRouter } from './modules/auth/auth.routes';
 import { branchesRouter } from './modules/branches/branches.routes';
@@ -21,10 +22,22 @@ import { jobStopRouter } from './modules/checklist/stop.routes';
 import { stepPhotosRouter } from './modules/photos/photos.routes';
 import { jobQualityRouter } from './modules/quality/quality.routes';
 
-export function createApp() {
+export interface CreateAppOptions {
+  /** Overrides env.TRUST_PROXY_HOPS (used by tests to exercise both modes). */
+  trustProxyHops?: number;
+}
+
+export function createApp(options: CreateAppOptions = {}) {
   const app = express();
 
   app.disable('x-powered-by');
+
+  // Reverse-proxy trust (Phase 10A): 0 = X-Forwarded-For is NEVER trusted
+  // (safe development default — req.ip is the socket address); N = exactly N
+  // trusted proxies (production: 1 for the single Nginx in front). Audit-log
+  // IPs and rate-limit keys both derive from req.ip.
+  const trustProxyHops = options.trustProxyHops ?? env.TRUST_PROXY_HOPS;
+  app.set('trust proxy', trustProxyHops > 0 ? trustProxyHops : false);
 
   app.use(helmet());
   app.use(
@@ -48,6 +61,11 @@ export function createApp() {
   });
 
   app.use('/api/v1', apiLimiter);
+  // CSRF (Phase 10A): every state-changing request under /api/v1 passes
+  // origin screening; every cookie-bearing one additionally needs the
+  // session-bound x-csrf-token header. Mounted before all routers — no route
+  // can be added without protection.
+  app.use('/api/v1', csrfProtection);
   app.use('/api/v1/auth', authRouter);
   app.use('/api/v1/users', usersRouter);
   app.use('/api/v1/branches', branchesRouter);

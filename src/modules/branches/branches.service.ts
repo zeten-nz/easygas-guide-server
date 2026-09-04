@@ -148,6 +148,18 @@ export async function setBranchStatus(
     }
 
     await trx('branches').where({ id }).update({ status, updated_at: trx.fn.now() });
+
+    // Phase 10A branch policy: deactivation immediately revokes the sessions
+    // of every user assigned to this branch (requireAuth additionally refuses
+    // inactive-branch users, so even an unrevoked session could not work).
+    let revokedSessions = 0;
+    if (status === 'INACTIVE') {
+      revokedSessions = await trx('sessions')
+        .whereIn('user_id', trx('users').select('id').where({ branch_id: id }).whereNull('deleted_at'))
+        .whereNull('revoked_at')
+        .update({ revoked_at: trx.fn.now() });
+    }
+
     await logAudit(
       {
         userId: actor.id,
@@ -155,7 +167,7 @@ export async function setBranchStatus(
         entityType: 'branch',
         entityId: id,
         oldValue: { status: current.status },
-        newValue: { status },
+        newValue: status === 'INACTIVE' ? { status, revokedSessions } : { status },
         ...meta,
       },
       trx,

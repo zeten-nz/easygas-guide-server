@@ -9,9 +9,11 @@
  *
  *   npm run test:demo-seed
  */
+import { assertTestDatabase } from './helpers/test-env'; // MUST be first: NODE_ENV=test + *_test DB
 import assert from 'node:assert/strict';
 import { db } from '../src/config/database';
 import { createApp } from '../src/app';
+import { csrfTokenFor } from '../src/middleware/csrf.middleware';
 import { ROLE_PERMISSIONS } from '../src/rbac/permissions';
 import type { RoleCode } from '../src/types/auth';
 
@@ -41,6 +43,7 @@ async function test(name: string, fn: () => Promise<void>): Promise<void> {
 }
 
 async function run(): Promise<void> {
+  await assertTestDatabase(db);
   const app = createApp();
   const server = app.listen(0);
   await new Promise<void>((resolve) => server.once('listening', resolve));
@@ -95,7 +98,10 @@ async function run(): Promise<void> {
         .find((c) => c.startsWith('eg_session='))
         ?.split(';')[0];
       assert.ok(cookie, 'session cookie must be set');
-      await fetch(`${baseUrl}/api/v1/auth/logout`, { method: 'POST', headers: { cookie } });
+      await fetch(`${baseUrl}/api/v1/auth/logout`, {
+        method: 'POST',
+        headers: { cookie, 'x-csrf-token': csrfTokenFor(cookie.split('=')[1] ?? '') },
+      });
     });
   }
 

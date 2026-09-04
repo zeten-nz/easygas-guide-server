@@ -34,6 +34,23 @@ const envSchema = z.object({
   // Object storage (§19/§40): 'local' for development; S3/MinIO providers later.
   STORAGE_PROVIDER: z.enum(['local']).default('local'),
   STORAGE_LOCAL_DIR: z.string().default('./uploads'),
+
+  /**
+   * Number of reverse proxies (e.g. Nginx) in front of the API. 0 (default,
+   * safe for development) means X-Forwarded-For is NEVER trusted and req.ip is
+   * the socket address. Set to 1 when exactly one Nginx sits in front, so
+   * audit logs and rate limiting key on the real client IP. Never set higher
+   * than the actual number of trusted proxies — extra hops let clients spoof
+   * their IP via X-Forwarded-For.
+   */
+  TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(10).default(0),
+
+  /**
+   * Database used by the E2E suites. Destructive test cleanup refuses to run
+   * unless NODE_ENV=test and the database name ends with "_test"
+   * (tests/helpers/test-env.ts enforces this fail-closed).
+   */
+  TEST_DB_NAME: z.string().regex(/_test$/, 'TEST_DB_NAME must end with "_test"').optional(),
 });
 
 const parsed = envSchema.safeParse(process.env);

@@ -17,6 +17,24 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     return;
   }
 
+  // Phase 10A: stable business responses for expected MySQL conflicts —
+  // internal SQL details are logged, never sent to the client. No blanket
+  // automatic retry: transactions here carry audit writes and other side
+  // effects, so retrying is the CLIENT's decision (409 signals it is safe).
+  const mysqlErrno = (err as { errno?: number } | null)?.errno;
+  if (mysqlErrno === 1062) {
+    logger.warn({ err }, 'Duplicate key conflict');
+    res.status(409).json({ error: { code: 'DUPLICATE', message: "Bu ma'lumot allaqachon mavjud" } });
+    return;
+  }
+  if (mysqlErrno === 1213 || mysqlErrno === 1205) {
+    logger.warn({ err }, 'Lock conflict (deadlock or lock wait timeout)');
+    res.status(409).json({
+      error: { code: 'CONFLICT_RETRY', message: "Boshqa amal bilan to'qnashuv yuz berdi — qayta urinib ko'ring" },
+    });
+    return;
+  }
+
   if (err instanceof MulterError) {
     res.status(422).json({
       error: {
