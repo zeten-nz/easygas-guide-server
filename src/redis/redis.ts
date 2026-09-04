@@ -27,11 +27,18 @@ export interface RedisLike {
   quit(): Promise<void>;
 }
 
-// Atomic INCR + first-hit PEXPIRE + PTTL, so the window TTL is set exactly once.
+// Atomic fixed-window counter (single EVAL — INCR, TTL check, conditional
+// PEXPIRE, all server-side): increments the key, and sets the window TTL when
+// the key has none (PTTL < 0 covers both the first hit AND repairing any stray
+// key that ended up without a TTL — so a counter can never block forever). A
+// later hit within the window keeps the ORIGINAL expiry. Returns {count, ttlMs}.
 const INCR_WINDOW_LUA = `
 local c = redis.call('INCR', KEYS[1])
-if c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
 local ttl = redis.call('PTTL', KEYS[1])
+if ttl < 0 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+  ttl = tonumber(ARGV[1])
+end
 return {c, ttl}
 `;
 
@@ -106,7 +113,10 @@ export class MemoryRedis implements RedisLike {
     }
     const count = Number(existing.value) + 1;
     existing.value = String(count);
-    const ttlMs = existing.expiresAt !== null ? Math.max(0, existing.expiresAt - now) : windowMs;
+    // Mirror the Lua: a key with no TTL is repaired to the window (never blocks
+    // forever); a key within its window keeps its original expiry.
+    if (existing.expiresAt === null) existing.expiresAt = now + windowMs;
+    const ttlMs = Math.max(0, existing.expiresAt - now);
     return { count, ttlMs };
   }
 

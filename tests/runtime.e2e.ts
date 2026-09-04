@@ -17,6 +17,7 @@ import { env, validateProductionConfig } from '../src/config/env';
 import { redactPaths } from '../src/utils/logger';
 import { setRedisForTesting, MemoryRedis, type RedisLike } from '../src/redis/redis';
 import { setShuttingDown } from '../src/modules/health/health.service';
+import { setSmsProviderForTesting, smsCapability, smsStartupProblem, type SmsCapability } from '../src/sms';
 
 let baseUrl = '';
 let passed = 0;
@@ -134,6 +135,33 @@ async function run(): Promise<void> {
 
   await test('validateProductionConfig refuses a non-_test DB in test mode', () => {
     assert.ok(validateProductionConfig({ ...goodProdEnv(), NODE_ENV: 'test', DB_NAME: 'easygas' } as any).some((p) => /_test/.test(p)));
+  });
+
+  // ---- A. SMS provider fail-closed: readiness never 200 for a stub ----
+  await test('readiness is 503 when the selected SMS provider is a non-functional stub', async () => {
+    const cap0 = smsCapability();
+    assert.equal(cap0.ready, true, 'baseline (console in test) is ready');
+    // Select an unimplemented (stub) provider.
+    setSmsProviderForTesting({ name: 'eskiz-stub', implemented: false, send: async () => { throw new Error('stub'); } });
+    assert.equal(smsCapability().ready, false, 'stub provider is not ready');
+    const r = await get('/api/v1/ready');
+    assert.equal(r.status, 503, 'readiness must not be 200 for a stub provider');
+    assert.equal(r.body.checks.sms, false);
+    // Restore a functional provider for the remaining tests.
+    setSmsProviderForTesting({ name: 'ok', implemented: true, send: async () => ({ providerMessageId: null, outcome: 'ACCEPTED' as const }) });
+    assert.equal((await get('/api/v1/ready')).status, 200);
+  });
+
+  await test('smsStartupProblem rejects production on a stub/console, allows a ready provider and dev', () => {
+    const stub: SmsCapability = { provider: 'eskiz', implemented: false, configured: true, ready: false };
+    const consoleProd: SmsCapability = { provider: 'console', implemented: true, configured: true, ready: false };
+    const ready: SmsCapability = { provider: 'eskiz', implemented: true, configured: true, ready: true };
+    assert.ok(smsStartupProblem(stub, true), 'prod + Eskiz stub → startup rejected');
+    assert.ok(smsStartupProblem(consoleProd, true), 'prod + console → startup rejected');
+    assert.equal(smsStartupProblem(ready, true), null, 'prod + ready provider → allowed');
+    assert.equal(smsStartupProblem(stub, false), null, 'dev → allowed');
+    // The message carries no credentials/provider internals.
+    assert.ok(!/password|token|redis:\/\/|secret/i.test(smsStartupProblem(stub, true)!));
   });
 
   // ---- Log redaction ----

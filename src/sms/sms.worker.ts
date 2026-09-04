@@ -4,9 +4,9 @@ import { db } from '../config/database';
 import { env } from '../config/env';
 import { decryptSecret } from '../utils/crypto';
 import { logger } from '../utils/logger';
-import { getSmsProvider } from './index';
+import { getSmsProvider, smsCapability } from './index';
 import { SmsSendError } from './sms.provider';
-import type { SmsOutboxRow } from './outbox.service';
+import { smsAad, type SmsOutboxRow } from './outbox.service';
 
 /**
  * Phase 10C durable SMS worker.
@@ -91,10 +91,14 @@ async function deliver(row: SmsOutboxRow): Promise<void> {
   const attempts = row.attempts + 1;
   let message: string;
   try {
-    message = decryptSecret(row.payload_cipher);
+    // AAD binds the ciphertext to this row's type + recipient; a mismatch (or a
+    // tampered/wrong-key body) throws here — plaintext is never produced.
+    message = decryptSecret(row.payload_cipher, smsAad(row.type, row.recipient));
   } catch {
+    // Move to a safe TERMINAL manual-review state — never send corrupted/plain
+    // data, and do not retry indefinitely. Redacted operator event (no body).
     await markTerminal(row.id, { status: 'FAILED', attempts, last_error: 'PAYLOAD_DECRYPT', failed_at: db.fn.now() });
-    logger.error({ outboxId: row.id }, 'SMS failed: payload decrypt error');
+    logger.error({ outboxId: row.id, type: row.type }, 'SMS decrypt failed — quarantined FAILED(PAYLOAD_DECRYPT) for manual review');
     return;
   }
 
@@ -154,6 +158,14 @@ async function processPool(rows: SmsOutboxRow[]): Promise<void> {
 /** One worker cycle: recover stale leases, claim a bounded batch, deliver. */
 export async function runOnce(): Promise<{ claimed: number }> {
   if (stopping) return { claimed: 0 };
+  // Fail closed: never CLAIM messages when the selected provider is a
+  // non-functional stub / not configured — claiming would burn attempts (or,
+  // worse, risk sends we can't reason about). Messages wait as PENDING until a
+  // usable provider is configured.
+  if (!smsCapability().ready) {
+    logger.warn({ provider: smsCapability().provider }, 'SMS worker idle: selected provider is not usable — not claiming messages');
+    return { claimed: 0 };
+  }
   await recoverStaleLeases();
   const rows = await claim(env.SMS_WORKER_BATCH);
   if (rows.length === 0) return { claimed: 0 };
@@ -169,6 +181,13 @@ export async function runOnce(): Promise<{ claimed: number }> {
 
 export function startWorker(): void {
   if (intervalHandle || !env.SMS_WORKER_ENABLED) return;
+  // Do not start the poller for a non-functional provider (defense in depth;
+  // production startup already refuses to boot — see server.ts).
+  const cap = smsCapability();
+  if (!cap.ready) {
+    logger.warn({ provider: cap.provider, implemented: cap.implemented, configured: cap.configured }, 'SMS worker not started: provider not usable');
+    return;
+  }
   stopping = false;
   intervalHandle = setInterval(() => {
     runOnce().catch((err) => logger.error({ err: (err as Error)?.message }, 'SMS worker cycle error'));

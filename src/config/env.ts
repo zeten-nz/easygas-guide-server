@@ -51,6 +51,10 @@ const envSchema = z.object({
   REDIS_KEY_PREFIX: z.string().default('eg:'),
 
   // --- Phase 10C durable SMS outbox / worker ---
+  // Optional dedicated 32-byte key (hex or base64) for the outbox body cipher.
+  // When unset, an HKDF subkey is derived from APP_KEY (deterministic, survives
+  // restart). NEVER an ephemeral random key. See utils/crypto resolveSmsOutboxKey.
+  SMS_OUTBOX_ENCRYPTION_KEY: z.string().optional(),
   SMS_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
   SMS_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
   // A queued message older than this when a worker picks it up is CANCELLED,
@@ -177,6 +181,13 @@ export function validateProductionConfig(e: typeof env): string[] {
   }
   if (e.SMS_PROVIDER === 'eskiz' && (!e.ESKIZ_EMAIL || !e.ESKIZ_PASSWORD || !e.ESKIZ_FROM)) {
     problems.push('SMS_PROVIDER=eskiz requires ESKIZ_EMAIL, ESKIZ_PASSWORD and ESKIZ_FROM (approved sender).');
+  }
+  // A dedicated outbox key, when set, must decode to exactly 32 bytes (else the
+  // cipher would fail at first send). No dedicated key ⇒ HKDF from APP_KEY.
+  if (e.SMS_OUTBOX_ENCRYPTION_KEY) {
+    const k = e.SMS_OUTBOX_ENCRYPTION_KEY;
+    const buf = /^[0-9a-fA-F]{64}$/.test(k) ? Buffer.from(k, 'hex') : Buffer.from(k, 'base64');
+    if (buf.length !== 32) problems.push('SMS_OUTBOX_ENCRYPTION_KEY must decode to exactly 32 bytes (hex or base64).');
   }
   if (!e.CLIENT_ORIGIN || /localhost|127\.0\.0\.1/.test(e.CLIENT_ORIGIN)) {
     problems.push('CLIENT_ORIGIN must be the real public origin in production (not localhost).');

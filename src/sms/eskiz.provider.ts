@@ -25,6 +25,11 @@ import type { SmsProvider, SmsSendResult } from './sms.provider';
  */
 export class EskizSmsProvider implements SmsProvider {
   readonly name = 'eskiz';
+  // DEFERRED stub: not functional until the real adapter is written against a
+  // verified spec. `implemented=false` makes startup + readiness fail closed
+  // (see src/sms/index.ts smsCapability / smsStartupProblem) — production never
+  // serves OTP traffic on this stub. Flip to `true` when send() is implemented.
+  readonly implemented = false;
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   async send(_phone: string, _message: string): Promise<SmsSendResult> {

@@ -1,7 +1,7 @@
 import { db } from '../../config/database';
 import { getRedis } from '../../redis/redis';
 import { getStorageProvider } from '../../storage';
-import { getSmsProvider } from '../../sms';
+import { smsCapability } from '../../sms';
 
 /**
  * Phase 10C liveness/readiness.
@@ -65,9 +65,10 @@ async function checkStorage(): Promise<boolean> {
 
 function checkSmsConfig(): boolean {
   try {
-    // Provider must be constructible for this environment (no message is sent).
-    getSmsProvider();
-    return true;
+    // Phase 10C: readiness requires a provider that is actually USABLE
+    // (implemented + configured) — never 200 for a known non-functional stub
+    // (e.g. the Eskiz stub) or a console-in-production provider. No send is made.
+    return smsCapability().ready;
   } catch {
     return false;
   }

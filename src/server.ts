@@ -2,7 +2,7 @@ import type { Server } from 'node:http';
 import { env, isProduction, assertProductionConfig } from './config/env';
 import { logger } from './utils/logger';
 import { db } from './config/database';
-import { getSmsProvider } from './sms';
+import { getSmsProvider, smsCapability, smsStartupProblem } from './sms';
 import { getStorageProvider } from './storage';
 import { connectRedis, closeRedis } from './redis/redis';
 import { startWorker, stopWorker } from './sms/sms.worker';
@@ -14,6 +14,10 @@ const SHUTDOWN_TIMEOUT_MS = 25_000; // must be < the PM2 kill timeout (see docs)
 async function main(): Promise<void> {
   // Fail fast on misconfiguration.
   if (isProduction) assertProductionConfig();
+  // Phase 10C: a production instance must never boot on a non-functional SMS
+  // provider (e.g. the Eskiz stub) or console — sanitized error, no credentials.
+  const smsProblem = smsStartupProblem(smsCapability(), isProduction);
+  if (smsProblem) throw new Error(smsProblem);
   await db.raw('SELECT 1');
   await connectRedis();
   const sms = getSmsProvider();

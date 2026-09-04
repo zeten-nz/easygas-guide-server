@@ -64,6 +64,55 @@ async function run(): Promise<void> {
     assert.equal(await r.ping(), 'PONG');
   });
 
+  // ---- First hit sets TTL; later hits preserve the original window ----
+  await test('the first hit sets the window TTL and later hits keep the ORIGINAL expiry', async () => {
+    let t = 5_000_000;
+    const r = new MemoryRedis(() => t);
+    const first = await r.incrWindow('w', 1000);
+    assert.deepEqual(first, { count: 1, ttlMs: 1000 }, 'first hit sets the full window');
+    t += 300;
+    const second = await r.incrWindow('w', 1000);
+    assert.equal(second.count, 2);
+    assert.equal(second.ttlMs, 700, 'window is NOT extended — original expiry preserved');
+  });
+
+  // ---- A key with a missing TTL is repaired ----
+  await test('a counter key that ended up without a TTL is repaired (never blocks forever)', async () => {
+    let t = 9_000_000;
+    const r = new MemoryRedis(() => t);
+    await r.set('k', '5'); // value with NO expiry (models a stray key without TTL)
+    const res = await r.incrWindow('k', 1000);
+    assert.equal(res.count, 6);
+    assert.equal(res.ttlMs, 1000, 'a TTL was applied on the next increment');
+    t += 1001; // the repaired TTL now expires the key
+    assert.equal((await r.incrWindow('k', 1000)).count, 1, 'window reset after the repaired TTL expired');
+  });
+
+  // ---- Concurrent increments do not lose updates ----
+  await test('concurrent increments do not lose updates', async () => {
+    const r = new MemoryRedis();
+    const N = 50;
+    const results = await Promise.all(Array.from({ length: N }, () => r.incrWindow('c', 60_000)));
+    assert.equal(Math.max(...results.map((x) => x.count)), N, `final count reaches ${N} (no lost updates)`);
+    assert.equal((await r.get('c')), String(N));
+  });
+
+  // ---- Retry-After derives exactly from the returned TTL ----
+  await test('Retry-After is derived from the returned Redis TTL, not local wall clock', async () => {
+    let t = 1_000_000;
+    setRedisForTesting(new MemoryRedis(() => t));
+    const limiter = createRateLimiter({ name: 'ttl', windowMs: 5_000, limit: 1, failMode: 'closed', key: ipKey });
+    const one = mockResNext();
+    await limiter(mockReq({ ip: '3.3.3.3' }), one.res, one.next); // count 1, window 5000
+    assert.ok(one.result.nexted);
+    t += 2_000; // 3000ms remain
+    const two = mockResNext();
+    await limiter(mockReq({ ip: '3.3.3.3' }), two.res, two.next);
+    assert.equal(two.result.statusCode, 429);
+    assert.equal(two.result.headers['retry-after'], '3', 'Retry-After = ceil(remaining TTL / 1000)');
+    setRedisForTesting(null);
+  });
+
   // ---- Shared counts across two app instances ----
   await test('shared store: two limiter instances sharing one Redis share the count', async () => {
     setRedisForTesting(new MemoryRedis());

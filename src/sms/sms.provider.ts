@@ -37,6 +37,15 @@ export interface SmsProvider {
   readonly name: string;
 
   /**
+   * Whether this adapter is actually functional. A deferred/stub adapter (e.g.
+   * Eskiz pending a verified spec) sets this to `false` so startup and readiness
+   * can fail closed BEFORE any real send, instead of discovering the stub on the
+   * first OTP. Omitted (undefined) means implemented — real providers declare it
+   * explicitly; test fakes may omit it.
+   */
+  readonly implemented?: boolean;
+
+  /**
    * Sends an SMS to a phone number in +998XXXXXXXXX form. Resolves with the
    * provider result on acceptance; throws SmsSendError (classified) on failure.
    * An AMBIGUOUS failure (e.g. a timeout after the request may have been

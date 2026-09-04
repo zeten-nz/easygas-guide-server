@@ -15,6 +15,7 @@ import { env } from '../config/env';
  */
 export class ConsoleSmsProvider implements SmsProvider {
   readonly name = 'console';
+  readonly implemented = true; // functional (dev only — the factory forbids it in production)
 
   async send(phone: string, message: string): Promise<SmsSendResult> {
     if (env.NODE_ENV === 'development') {

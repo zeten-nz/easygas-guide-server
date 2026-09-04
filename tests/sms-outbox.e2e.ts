@@ -22,6 +22,7 @@ import { MemoryRedis, setRedisForTesting } from '../src/redis/redis';
 import { SmsSendError, type SmsProvider } from '../src/sms/sms.provider';
 import { EskizSmsProvider } from '../src/sms/eskiz.provider';
 import { runOnce } from '../src/sms/sms.worker';
+import { smsAad } from '../src/sms/outbox.service';
 import { encryptSecret, decryptSecret } from '../src/utils/crypto';
 
 const USER = '+998990009101';
@@ -61,7 +62,9 @@ async function http(method: string, p: string, body?: unknown): Promise<{ status
 /** Inserts an outbox row directly (full control for worker-mechanics tests). */
 async function insertRow(recipient: string, message: string, over: Record<string, unknown> = {}): Promise<number> {
   const [id] = await db('sms_outbox').insert({
-    type: 'OTP', recipient, template_key: 'test', payload_cipher: encryptSecret(message),
+    type: 'OTP', recipient, template_key: 'test',
+    // Encrypt with the SAME AAD the worker will use to decrypt (type + recipient).
+    payload_cipher: encryptSecret(message, smsAad('OTP', recipient)),
     status: 'PENDING', attempts: 0, max_attempts: 5,
     next_attempt_at: db.fn.now(), not_after: new Date(Date.now() + 300_000), ...over,
   });
@@ -104,8 +107,8 @@ async function run(): Promise<void> {
     assert.ok(row, 'a PENDING outbox row exists');
     // The row must not contain any 6-digit code in cleartext.
     assert.ok(!/\b\d{6}\b/.test(row.payload_cipher), 'no plaintext OTP in payload_cipher');
-    // But it decrypts back to the real message.
-    assert.match(decryptSecret(row.payload_cipher), /parolni tiklash kodi: \d{6}/);
+    // But it decrypts back to the real message with the bound AAD (type+recipient).
+    assert.match(decryptSecret(row.payload_cipher, smsAad('OTP', row.recipient)), /parolni tiklash kodi: \d{6}/);
   });
 
   // ---- Generic API response (enumeration-resistant), delivery is async ----
@@ -243,7 +246,39 @@ async function run(): Promise<void> {
   await test('the Eskiz adapter constructs but fails fast (pending verified official docs)', async () => {
     const eskiz = new EskizSmsProvider();
     assert.equal(eskiz.name, 'eskiz');
+    assert.equal(eskiz.implemented, false, 'the stub declares itself unimplemented');
     await assert.rejects(() => eskiz.send('+998900000000', 'x'), /not implemented|pending/i);
+  });
+
+  // ---- Worker does not claim with a non-functional provider (fail closed) ----
+  await test('the worker does not claim messages when the selected provider is unavailable', async () => {
+    const rcpt = '+998990009209';
+    const id = await insertRow(rcpt, 'code 111222 nostub');
+    // Select a non-functional (unimplemented) provider.
+    setSmsProviderForTesting({ name: 'stub', implemented: false, send: async () => { throw new Error('stub'); } });
+    const before = control.countFor(rcpt);
+    const res = await runOnce();
+    assert.equal(res.claimed, 0, 'no messages claimed with an unavailable provider');
+    assert.equal(control.countFor(rcpt), before);
+    assert.equal((await rowOf(id)).status, 'PENDING', 'message waits as PENDING, no attempt burned');
+    setSmsProviderForTesting(control); // restore
+  });
+
+  // ---- Decryption failure never reaches the provider ----
+  await test('a body that fails to decrypt is quarantined FAILED and never reaches send()', async () => {
+    const rcpt = '+998990009210';
+    // Insert a row whose ciphertext will not decrypt (tampered envelope).
+    const [id] = await db('sms_outbox').insert({
+      type: 'OTP', recipient: rcpt, template_key: 'test',
+      payload_cipher: encryptSecret('code 999888 corrupt', smsAad('OTP', rcpt)).slice(0, -4) + 'dead',
+      status: 'PENDING', attempts: 0, max_attempts: 5, next_attempt_at: db.fn.now(), not_after: new Date(Date.now() + 300_000),
+    });
+    const before = control.countFor(rcpt);
+    await runOnce();
+    assert.equal(control.countFor(rcpt), before, 'provider.send() was NOT called for undecryptable data');
+    const row = await rowOf(id as number);
+    assert.equal(row.status, 'FAILED');
+    assert.equal(row.last_error, 'PAYLOAD_DECRYPT', 'quarantined for manual review, not retried');
   });
 
   await cleanupOutbox();

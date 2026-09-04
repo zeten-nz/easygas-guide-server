@@ -1,8 +1,22 @@
+import crypto from 'node:crypto';
 import type { Knex } from 'knex';
 import { db } from '../config/database';
 import { env } from '../config/env';
-import { encryptSecret } from '../utils/crypto';
+import { encryptSecret, OUTBOX_ENVELOPE_VERSION } from '../utils/crypto';
 import { normalizePhone } from '../utils/phone';
+
+/**
+ * AES-GCM additional authenticated data bound to every outbox body. It ties the
+ * ciphertext to stable, non-secret metadata (envelope version, message type, and
+ * a HASH of the recipient — never the raw number), so a ciphertext cannot be
+ * silently swapped onto a row of a different type/recipient. (The auto-increment
+ * id is not bound — it is unknown before insert; binding it would require a
+ * second UPDATE. type + recipient-hash + version is the practical binding.)
+ */
+export function smsAad(type: string, recipient: string): string {
+  const rh = crypto.createHash('sha256').update(recipient).digest('hex').slice(0, 32);
+  return `sms-outbox:${OUTBOX_ENVELOPE_VERSION}:${type}:${rh}`;
+}
 
 /**
  * Phase 10C durable SMS outbox — enqueue side.
@@ -54,6 +68,7 @@ export interface EnqueueOtpInput {
  */
 export async function enqueueOtpSms(trx: Knex.Transaction, input: EnqueueOtpInput): Promise<number> {
   const recipient = normalizePhone(input.phone);
+  if (!recipient) throw new Error('enqueueOtpSms: recipient is not a valid phone number');
   await trx('sms_outbox')
     .where({ recipient, type: 'OTP' })
     .whereIn('status', ['PENDING', 'RETRY'])
@@ -68,7 +83,7 @@ export async function enqueueOtpSms(trx: Knex.Transaction, input: EnqueueOtpInpu
     user_id: input.userId,
     recipient,
     template_key: 'otp_reset_v1',
-    payload_cipher: encryptSecret(input.message),
+    payload_cipher: encryptSecret(input.message, smsAad('OTP', recipient)),
     status: 'PENDING',
     attempts: 0,
     max_attempts: env.SMS_MAX_ATTEMPTS,

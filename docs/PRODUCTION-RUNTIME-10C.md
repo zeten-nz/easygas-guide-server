@@ -5,14 +5,40 @@ lifecycle with rotation, shared Redis-backed rate limiting, a durable SMS outbox
 with an async worker, liveness/readiness endpoints, graceful shutdown, retention
 maintenance, and production configuration validation.
 
-> **Eskiz status (deferred):** the production SMS provider is Eskiz.uz, but its
-> official API documentation (the owner's Postman documenter link) is a
-> client-rendered SPA that could not be machine-verified during 10C. Implementing
-> its auth/endpoints/delivery-status from memory or third-party wrappers is
-> forbidden, so the Eskiz **adapter** (`src/sms/eskiz.provider.ts`) is a
-> fail-fast stub pending a verified spec. Everything else — the durable outbox,
-> worker, OTP lifecycle — is provider-agnostic and complete. See
-> [Implementing Eskiz](#implementing-eskiz-when-the-spec-is-verified).
+> **Eskiz status (deferred, fail-closed):** the production SMS provider is
+> Eskiz.uz, but its official API documentation (the owner's Postman documenter
+> link) is a client-rendered SPA that could not be machine-verified during 10C.
+> Implementing its auth/endpoints/delivery-status from memory or third-party
+> wrappers is forbidden, so the Eskiz **adapter** (`src/sms/eskiz.provider.ts`)
+> is a stub that declares itself **not implemented**. Everything else — the
+> durable outbox, worker, OTP lifecycle — is provider-agnostic and complete.
+>
+> **Production OTP delivery remains BLOCKED until the real Eskiz adapter is
+> implemented from verified official documentation.** Phase 10C is NOT
+> production-ready while this blocker stands. The system fails **closed** on it
+> (see [SMS provider fail-closed](#sms-provider-fail-closed-capability-gating)):
+> a production instance refuses to start, and `/ready` never returns 200, on a
+> non-functional provider — so it can never accept auth/OTP traffic it cannot
+> serve. See [Implementing Eskiz](#implementing-eskiz-when-the-spec-is-verified).
+
+## SMS provider fail-closed (capability gating)
+
+Each provider declares an `implemented` flag; `smsCapability()` derives
+`{ implemented, configured, ready }` **without sending** (a stub or a
+console-in-production provider is never `ready`). This is enforced at three
+points so a knowingly-unusable provider never serves traffic:
+
+1. **Startup:** in production, `smsStartupProblem()` makes the process **refuse
+   to boot** on a non-ready provider (Eskiz stub, console, or missing creds) with
+   a sanitized error (no credentials/internals).
+2. **Readiness:** `/api/v1/ready` returns **503** (`checks.sms=false`) whenever
+   the selected provider is not ready — never 200 for a stub.
+3. **Worker:** the outbox worker does **not claim** messages when the provider is
+   not ready — queued OTPs wait as `PENDING` (no attempts burned) instead of
+   failing on the stub. It also refuses to start its poller.
+
+Dev/test may use `console` or an injected fake explicitly (`implemented=true`);
+`console` stays forbidden in production.
 
 ## Session lifecycle (A/B)
 
@@ -69,12 +95,19 @@ without `REDIS_URL`.
 
 ## Shared rate limiting (D)
 
-Redis-backed atomic fixed-window (`INCR` + first-hit `PEXPIRE`), shared across
-PM2 instances and restarts. Keys are namespaced (`rl:<name>:<dim>`) and never
-contain PII — phone limits key on an **HMAC** of the normalized number. IP
-limits use the trusted `req.ip` (Phase 10A `TRUST_PROXY_HOPS`), so a spoofed
-`X-Forwarded-For` cannot reset a counter. Blocked requests get `429` +
-`Retry-After`; account existence is never revealed.
+Redis-backed atomic fixed-window, shared across PM2 instances and restarts. The
+increment-and-expiry is a **single atomic Lua `EVAL`** (INCR, PTTL, conditional
+PEXPIRE server-side) — never two separate round-trips — so a counter can never be
+left without a TTL. The script also **repairs** any key found without a TTL
+(sets the window on the next increment), so a stray key can never block a user
+forever; a later hit within the window keeps the **original** expiry. It returns
+`{count, ttlMs}`, and `Retry-After` is derived from that returned TTL (not a
+local wall-clock assumption). `MemoryRedis` reproduces the same observable
+semantics for dev/test. Keys are namespaced (`rl:<name>:<dim>`) and never contain
+PII — phone limits key on an **HMAC** of the normalized number. IP limits use the
+trusted `req.ip` (Phase 10A `TRUST_PROXY_HOPS`), so a spoofed `X-Forwarded-For`
+cannot reset a counter. Blocked requests get `429` + `Retry-After`; account
+existence is never revealed.
 
 **Failure policy:** login / OTP request / OTP verify / reset / registration fail
 **closed** (blocked) when Redis is unavailable — abuse controls are never
@@ -85,8 +118,42 @@ silently disabled; general API traffic and authenticated uploads fail **open**
 
 A message is persisted first (`sms_outbox`, PENDING) inside the producing
 transaction, then delivered by a worker — no fragile write-then-call flow. The
-rendered body is **encrypted at rest** (AES-256-GCM keyed from `APP_KEY`); the
-plaintext OTP is never stored, logged, or audited.
+rendered body is **encrypted at rest**; the plaintext OTP is never stored,
+logged, or audited.
+
+### Body encryption (AES-256-GCM)
+
+- **Envelope:** `v1:ivHex:tagHex:ciphertextHex` — versioned so the format can
+  evolve; a fresh random **96-bit IV** per message; the **auth tag is verified
+  before any plaintext is returned**; malformed IV/tag/ciphertext or an unknown
+  version is strictly rejected.
+- **AAD:** the ciphertext is bound to stable metadata — `version | type |
+  sha256(recipient)` (never the raw number; the auto-increment id is not bound as
+  it is unknown pre-insert) — so a body cannot be swapped onto a row of a
+  different type/recipient.
+- **Key:** a dedicated `SMS_OUTBOX_ENCRYPTION_KEY` (32 bytes, hex or base64) when
+  set, else an **HKDF-SHA256** subkey derived from `APP_KEY` with a unique
+  context (`easygas:sms-outbox:v1`) — domain-separated from the OTP/reset HMAC.
+  The key is **always deterministic** (never an ephemeral random key, which would
+  make queued messages undecryptable after a restart). A malformed dedicated key
+  (wrong decoded length) is rejected at config validation / first use (fail
+  closed). Production validates the decoded length is exactly 32 bytes.
+- **Decryption failure** (wrong key/AAD, tamper, corruption): the message is
+  moved to a **terminal `FAILED(PAYLOAD_DECRYPT)`** state for manual review — it
+  is **never** retried indefinitely and its (undecryptable) content **never
+  reaches `SmsProvider.send()`**; a redacted operator log is emitted (no body).
+
+### Key rotation
+
+The envelope carries a version (`v1`) and the derivation a context id. To rotate:
+(1) **drain** the outbox (stop enqueuing, let the worker deliver/expire pending
+messages — they are short-lived, ≤`SMS_MAX_AGE_SECONDS`); (2) set the new
+`SMS_OUTBOX_ENCRYPTION_KEY` (or rotate `APP_KEY`) and restart. New messages use
+the new key; because pending messages were drained first, none become
+undecryptable. If the configured key is **missing/invalid**, the app fails
+closed (config validation error / decrypt quarantine) rather than silently
+generating an ephemeral key. A future multi-key scheme would bump the envelope
+version and try key-by-id on decrypt.
 
 States: `PENDING → PROCESSING (leased) → SENT (accepted) / DELIVERED (only if
 the provider confirms handset delivery) / RETRY / FAILED / CANCELLED`.
@@ -224,7 +291,11 @@ any queued-but-unsent SMS is lost — drain the outbox first).
   shutdown. Track: `sms_outbox` FAILED/AMBIGUOUS counts, readiness flaps, 429
   rates, rotation/replay events.
 - **Remaining risks:** the **Eskiz adapter is not implemented** (blocked on a
-  verified spec) — OTP delivery via Eskiz is not yet functional in production;
-  the in-process worker should be consolidated to one dedicated process at
-  scale; `AMBIGUOUS` SMS outcomes require manual reconciliation; single-region
-  Redis is a availability dependency for fail-closed auth controls.
+  verified spec) — **production OTP delivery is not functional**, and the system
+  is not production-ready until it is. This now fails **closed** (production
+  refuses to start, `/ready` stays 503, the worker won't claim), so it cannot
+  silently accept traffic it can't serve. Additionally: the in-process worker
+  should be consolidated to one dedicated process at scale; `AMBIGUOUS` SMS
+  outcomes and `FAILED(PAYLOAD_DECRYPT)` quarantines require manual
+  reconciliation; single-region Redis is an availability dependency for the
+  fail-closed auth controls; outbox-key rotation requires a drain (documented).
