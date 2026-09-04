@@ -31,9 +31,26 @@ const envSchema = z.object({
 
   SUPPORT_TELEGRAM_URL: z.string().default('https://t.me/EasygasGarantbot'),
 
-  // Object storage (§19/§40): 'local' for development; S3/MinIO providers later.
-  STORAGE_PROVIDER: z.enum(['local']).default('local'),
+  // Object storage (§19/§40). 'local' for development/tests; 's3' for
+  // production (AWS S3 or any S3-compatible service such as MinIO).
+  STORAGE_PROVIDER: z.enum(['local', 's3']).default('local'),
   STORAGE_LOCAL_DIR: z.string().default('./uploads'),
+  // Explicit, documented emergency override to run local storage in production.
+  ALLOW_LOCAL_STORAGE_IN_PRODUCTION: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true' || v === '1'),
+  // S3 configuration (required when STORAGE_PROVIDER=s3; validated at boot).
+  S3_BUCKET: z.string().optional(),
+  S3_REGION: z.string().optional(),
+  S3_ENDPOINT: z.string().optional(), // optional for AWS, required for MinIO
+  S3_FORCE_PATH_STYLE: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true' || v === '1'),
+  S3_ACCESS_KEY_ID: z.string().optional(),
+  S3_SECRET_ACCESS_KEY: z.string().optional(),
+  S3_SERVER_SIDE_ENCRYPTION: z.string().optional(),
 
   /**
    * Number of reverse proxies (e.g. Nginx) in front of the API. 0 (default,

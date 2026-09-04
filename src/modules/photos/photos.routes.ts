@@ -73,14 +73,23 @@ stepPhotosRouter.get(
   requirePermission('jobs.view'),
   validate({ params: photoParamsSchema }),
   async (req: Request, res: Response) => {
-    const { buffer, mimeType } = await service.getPhotoFile(
+    const { stream, mimeType, sizeBytes } = await service.getPhotoStream(
       req.user!,
       Number(req.params.jobId),
       Number(req.params.stepId),
       Number(req.params.photoId),
     );
+    // Safe download headers: never sniff, always render inline as the detected
+    // type, never expose the internal storage key or filesystem path.
     res.setHeader('Content-Type', mimeType);
+    res.setHeader('Content-Length', String(sizeBytes));
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Disposition', `inline; filename="photo-${req.params.photoId}"`);
     res.setHeader('Cache-Control', 'private, max-age=3600');
-    res.send(buffer);
+    stream.on('error', () => {
+      if (!res.headersSent) res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Rasm topilmadi' } });
+      else res.destroy();
+    });
+    stream.pipe(res);
   },
 );

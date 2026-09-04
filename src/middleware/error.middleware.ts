@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from 'express';
 import { ZodError } from 'zod';
 import { MulterError } from 'multer';
 import { ApiError } from '../utils/errors';
+import { StorageError } from '../storage/storage.provider';
 import { logger } from '../utils/logger';
 import { isProduction } from '../config/env';
 
@@ -32,6 +33,13 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     res.status(409).json({
       error: { code: 'CONFLICT_RETRY', message: "Boshqa amal bilan to'qnashuv yuz berdi — qayta urinib ko'ring" },
     });
+    return;
+  }
+
+  // Storage failures never leak provider detail to the client.
+  if (err instanceof StorageError) {
+    logger.error({ err: { kind: err.kind, message: err.message } }, 'Storage error');
+    res.status(502).json({ error: { code: 'STORAGE_UNAVAILABLE', message: "Fayl xizmatida xatolik — qayta urinib ko'ring" } });
     return;
   }
 
