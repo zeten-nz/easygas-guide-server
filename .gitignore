@@ -1,5 +1,7 @@
 node_modules/
-dist/
 .env
-uploads/
+.env.*
+dist/
+build/
+coverage/
 *.log
