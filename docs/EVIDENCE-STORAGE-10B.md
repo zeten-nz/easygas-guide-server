@@ -9,23 +9,33 @@ Every mandatory evidence file (`job_photos`, `customer_signatures`) carries an
 explicit lifecycle. **Only READY evidence counts** toward checklist step
 completion and job completion.
 
-| State   | Meaning                                                        | Counts? |
-|---------|---------------------------------------------------------------|---------|
-| PENDING | Metadata registered; object write not yet confirmed           | No      |
-| READY   | Object written AND storage metadata (size) verified           | Yes     |
-| FAILED  | Write failed, superseded by workflow change, or reconciliation found it missing/corrupt | No |
+| State      | Meaning                                                                   | Counts? |
+|------------|---------------------------------------------------------------------------|---------|
+| PENDING    | A Phase 10B upload in flight; object write not yet confirmed               | No      |
+| UNVERIFIED | A pre-Phase-10B legacy row; object never checked against its metadata      | No      |
+| READY      | Object written AND verified against its recorded size (+sha256 at upload)  | Yes     |
+| FAILED     | Write failed, superseded, stale, or verification found it missing/altered  | No      |
+
+The `status` column is the single source of provenance: `UNVERIFIED` = legacy
+and never verified, `PENDING` = a 10B upload in progress, `READY` = an object
+actually verified (its `ready_at` is set only on that transition). Nothing
+infers "verified" from `ready_at` or from the mere existence of a row.
 
 ### Transition table
 
-| From    | To     | Trigger                                                              |
-|---------|--------|---------------------------------------------------------------------|
-| —       | PENDING| Upload TX1: validated + registered under the job/step lock          |
-| PENDING | READY  | Upload TX2: object written+verified, step/attempt/cycle still valid |
-| PENDING | FAILED | Storage write error, size mismatch, or workflow moved on (SUPERSEDED); or reconciliation STALE |
-| READY   | FAILED | Reconciliation found the object MISSING or size MISMATCH            |
+| From       | To     | Trigger                                                                         |
+|------------|--------|---------------------------------------------------------------------------------|
+| —          | PENDING| Upload TX1: validated + registered under the job/step lock                      |
+| PENDING    | READY  | Upload TX2: object written+size-verified, step/attempt/cycle still valid        |
+| PENDING    | FAILED | Storage write error, size mismatch, workflow moved on (SUPERSEDED), or reconciliation STALE |
+| UNVERIFIED | READY  | Reconciliation **deep** verify: object read, size + sha256 (+type) all match    |
+| UNVERIFIED | FAILED | Reconciliation deep verify: object missing / size / sha256 / type mismatch      |
+| READY      | FAILED | Reconciliation found the object MISSING or size/sha256 MISMATCH                  |
 
 READY and FAILED are terminal for a given row (evidence is immutable; a new
-attempt/cycle creates a new row). Historical rows are never deleted.
+attempt/cycle creates a new row). `UNVERIFIED` is only ever left by a
+reconciliation deep-verify run — a transient storage error leaves it untouched
+so the run can be retried. Historical rows are never deleted.
 
 ## Upload ordering (two transactions around the storage write)
 
@@ -46,16 +56,28 @@ two transactions:
    written object, and return 409.
 5. Return 201 only after the READY commit.
 
-### Invariants this preserves
+### What is actually guaranteed
 
-- Completion counts only READY → a crash between TX1 and TX2 leaves a PENDING
-  row that never counts; reconciliation later marks it FAILED(STALE).
-- **There is never valid metadata pointing at a missing object.** A storage
-  failure or size mismatch marks the row FAILED (502 to the client); nothing
-  is READY.
+This is the precise guarantee — the implementation does **not** claim that valid
+metadata can never point at a missing object *forever* (an object can be lost or
+altered externally, e.g. bit rot or an accidental delete, after it is READY):
+
+- **No evidence becomes READY before its object is written and verified.** A row
+  reaches READY only after the object is stored and its size confirmed (with the
+  sha256 computed from the received bytes at upload). A storage failure or size
+  mismatch marks the row FAILED (502 to the client); nothing is READY.
+- **Workflow completion accepts only READY evidence** *and* re-checks the object
+  at completion time (see [Completion-time verification](#completion-time-verification)):
+  a photo/signature whose object went missing or changed size blocks the close.
+- **Later external loss or corruption is detected**, not prevented — at
+  completion time (existence + size) and by scheduled reconciliation
+  (existence + size, and full sha256 with `--deep`).
 - A DB failure after the object write may leave an orphan object, but never
-  valid metadata → reconciliation detects and reports it. The recoverable
-  object is only deleted after we record (FAILED) what happened.
+  valid metadata pointing at a missing object at the moment it is created;
+  reconciliation detects and reports orphans/failures. A recoverable object is
+  only deleted after we record (FAILED) what happened.
+- Legacy rows are **UNVERIFIED**, never READY, until a deep verification run
+  proves the object matches — a DB row is not treated as evidence on its own.
 - Attempt-1 evidence can never satisfy attempt 2, and pre-reopen (cycle N)
   evidence can never satisfy cycle N+1 — TX2 re-checks attempt/cycle.
 - Concurrency: job + step row locks in both transactions serialize uploads
@@ -72,29 +94,77 @@ be re-signed before it can be completed again. Signatures are never deleted.
 
 ## Hash & metadata verification strategy
 
-- **Upload:** SHA-256 computed from the received bytes; size + detected type
-  from server inspection; `stat()` after write confirms existence and size
-  before READY. (A full hash re-read on every upload is avoided — the write is
-  immediately followed by a size-verifying stat.)
-- **Completion/read:** gates trust the READY state (set only after the stat
-  check). Downloads stream from storage and 404 cleanly if the object is gone.
-- **Periodic:** `npm run reconcile` does the deeper DB↔storage comparison
-  (existence + size; hash comparison would require a full read and is left to a
-  future scheduled deep scan — documented risk).
+The balance is: verify the full hash where it is affordable (once, at upload,
+and in scheduled deep runs), and use the cheaper existence+size check on the hot
+path (completion), because hashing every object on every close would read the
+whole file each time.
+
+- **Upload:** SHA-256 computed from the received bytes and stored; size +
+  detected image type from server inspection; `stat()` after write confirms
+  existence and size before the row becomes READY.
+- **Completion:** the DB gate counts only READY rows, and the close path then
+  re-stats each relevant object to confirm it still exists at its recorded size
+  (existence + size, not a full re-hash — see below). Downloads stream from
+  storage and 404 cleanly if the object is gone.
+- **Legacy verification / periodic deep scan:** `npm run reconcile --deep`
+  reads each object in full, recomputes its SHA-256, and compares size + hash
+  (+ detected type). This is the only path that promotes an UNVERIFIED legacy
+  row to READY, and the way READY rows are audited against their recorded hash.
+
+## Completion-time verification
+
+`validateJobCompletion` is the DB-truth gate (counts only `status = READY`) and
+is used by the readiness endpoint, so it does no storage I/O and stays cheap.
+The authoritative close path (`closeJob`, `confirmQuality`) additionally calls
+`assertReadyEvidenceObjects(jobId)` **before** taking the write lock:
+
+- It stats every READY object the gate relies on — required photos of the
+  relevant attempt + the current-cycle signature — and confirms each exists at
+  its recorded size.
+- On any missing object, size mismatch, stat timeout or provider error it
+  **fails closed** with a stable `502 EVIDENCE_UNVERIFIABLE`; the job is not
+  completed. No provider detail reaches the client.
+- It runs outside the transaction (no storage I/O under a row lock) and **never
+  mutates** evidence status — turning a lost READY object into FAILED is
+  reconciliation's deliberate, audited job, not a side effect of a read.
+- It verifies existence + size, not a full re-hash, to keep close latency
+  bounded for the current small checklist size; the sha256 was verified at
+  upload and is re-verified by scheduled deep reconciliation.
 
 ## Reconciliation
 
 ```
-npm run reconcile            # dry-run: report only, never mutates, never deletes
-npm run reconcile -- --fix   # mark missing/corrupt READY rows + stale PENDING FAILED
-npm run reconcile -- --json  # machine-readable
+npm run reconcile                     # dry-run: report only, never mutates, never deletes
+npm run reconcile -- --deep           # dry-run, full sha256 re-hash of READY rows too
+npm run reconcile -- --apply          # apply transitions (alias: --fix)
+npm run reconcile -- --apply --deep   # apply, with full-hash READY verification
+npm run reconcile -- --concurrency=8  # bound parallel object reads (default 4)
+npm run reconcile -- --json           # machine-readable
 ```
 
-Findings: `MISSING` (READY row, object absent), `MISMATCH` (stored size ≠
-recorded), `STALE` (PENDING older than 15 min — an interrupted upload).
-`--fix` transitions those rows to FAILED (so they stop counting) and audits
-`EVIDENCE_INTEGRITY_FAILURE`. **It never deletes storage objects.** Dry-run
-exits non-zero when findings remain, for CI/alerting.
+Three passes per table, with **bounded concurrency**:
+
+1. **Legacy** (`UNVERIFIED`) — always deep: the object is read, its SHA-256
+   recomputed and compared with the recorded size + hash (+ detected type). A
+   full match promotes `UNVERIFIED → READY` (audited `EVIDENCE_VERIFIED`); a
+   missing/short/altered object → `FAILED` (audited `EVIDENCE_INTEGRITY_FAILURE`).
+2. **READY integrity** — existence + size by default; with `--deep`, full
+   sha256 too. Missing/mismatch → `FAILED`.
+3. **Stale PENDING** — a PENDING upload older than 15 min → `FAILED(STALE)`.
+   `UNVERIFIED` rows are never touched by this sweep.
+
+Per-record results are reported (`table #id (job) — reason → transition`), never
+storage keys or paths. **It never deletes storage objects.** A transient storage
+error leaves the row unchanged (`ERROR`) so the run is safe to repeat.
+
+- **Idempotent & resumable:** every transition runs in its own transaction and
+  only fires when the row is still in the expected source state, so an
+  interrupted run can simply be re-run and a repeat run changes nothing.
+- **Exit code:** `0` when clean; `2` when invalid or unverifiable evidence
+  remains (missing / mismatch / stale / transient error) — in dry-run these are
+  unaddressed; in apply mode they have been recorded FAILED (or left for retry)
+  and need operator attention before active jobs rely on them; `1` if the run
+  itself failed. Suitable for CI/alerting.
 
 ## Storage providers
 
@@ -148,21 +218,47 @@ and disables the control while an upload is in flight.
 
 ## Migration & deployment
 
-- Migration `20260816000019_evidence_storage_states` adds the lifecycle
-  columns, `jobs.cycle`, and the signature `cycle`; replaces the
-  one-signature-per-job UNIQUE with per-cycle indexing; **backfills all existing
-  rows to READY** (see the backfill assumption in the migration header). Full
-  down/up rollback is tested. Take a DB backup before applying, as with any
-  schema change.
-- Deploy order: apply the migration, deploy the server, then the client (the
-  client's only change is upload UX; it stays compatible with the old server).
-- After deploy, run `npm run reconcile` (dry-run) to confirm the READY backfill
-  matches storage.
+Migration `20260816000019_evidence_storage_states` adds the lifecycle columns,
+`jobs.cycle`, and the signature `cycle`; replaces the one-signature-per-job
+UNIQUE with per-cycle indexing; and **backfills every existing evidence row to
+`UNVERIFIED`, not READY** — a pre-existing DB row is not proof the object is
+present and unaltered, so legacy evidence stays non-valid until a deep
+verification run confirms it. Full down/up rollback is tested.
+
+**A migration temporarily makes historical evidence non-READY.** Until the
+verification run in step 7 below completes, jobs whose completion depends on
+legacy evidence will not close. Plan the window accordingly. This is deliberate:
+it is the mechanism that stops an unverified legacy object from silently
+authorizing a completion.
+
+### Maintenance-safe deployment sequence
+
+1. **Back up** the database *and* the evidence object storage.
+2. **Stop or drain write traffic** (maintenance window) so no uploads/closes run
+   during the migration and verification.
+3. **Deploy the compatible server code** (it reads the new columns).
+4. **Run the migration** (`npm run migrate`).
+5. **Run reconciliation in dry-run + deep mode**
+   (`npm run reconcile -- --deep`) to see what legacy verification will do.
+6. **Review the results** — expect legacy rows reported for verification;
+   investigate any MISSING/MISMATCH.
+7. **Run the explicit apply + deep pass** (`npm run reconcile -- --apply --deep`)
+   to promote verified legacy rows to READY and mark missing/altered ones FAILED.
+8. **Confirm no unresolved legacy records remain for active jobs** (exit code 0,
+   or triage the reported FAILED/ERROR records) before reopening traffic.
+9. **Start / restore server traffic.**
+10. **Deploy the frontend** (its only change is upload UX; it stays compatible
+    with the old server).
+11. **Smoke-test** an upload, a completion, and a signature capture.
+
+Rebuilding a disposable local/test database instead of migrating in place is
+fine and is how the down/up rollback is verified.
 
 ## Remaining risks (not solved in 10B)
 
 - **EXIF stripping** and **malware/AV scanning** of uploads are not implemented.
-- **Full per-object hash reconciliation** is not run automatically (only size +
-  existence); a scheduled deep scan is future work.
+- **Full per-object hash reconciliation** exists (`reconcile --deep`) but is not
+  yet *scheduled* — it must be run manually or wired into a cron/CI job.
+  Completion-time verification checks existence + size, not the full hash.
 - **Storage-side orphan sweep** (objects with no DB row) is not automated;
   reconciliation focuses on the DB→storage direction.

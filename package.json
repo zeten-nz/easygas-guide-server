@@ -26,8 +26,9 @@
     "test:setup": "tsx tests/setup-test-db.ts",
     "test:storage": "tsx tests/storage-contract.e2e.ts",
     "test:evidence": "tsx tests/evidence.e2e.ts",
+    "test:reconcile": "tsx tests/reconcile.e2e.ts",
     "reconcile": "tsx src/modules/evidence/reconcile.cli.ts",
-    "test:all": "npm run test:auth && npm run test:rbac && npm run test:demo-seed && npm run test:cv && npm run test:jobs && npm run test:checklist && npm run test:stop && npm run test:rework && npm run test:completion && npm run test:quality && npm run test:hardening && npm run test:storage && npm run test:evidence"
+    "test:all": "npm run test:auth && npm run test:rbac && npm run test:demo-seed && npm run test:cv && npm run test:jobs && npm run test:checklist && npm run test:stop && npm run test:rework && npm run test:completion && npm run test:quality && npm run test:hardening && npm run test:storage && npm run test:evidence && npm run test:reconcile"
   },
   "keywords": [],
   "author": "",

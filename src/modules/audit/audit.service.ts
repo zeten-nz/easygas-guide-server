@@ -52,6 +52,7 @@ export type AuditAction =
   | 'SIGNATURE_UPLOAD_STARTED'
   | 'SIGNATURE_UPLOAD_FAILED'
   | 'SIGNATURE_SUPERSEDED'
+  | 'EVIDENCE_VERIFIED'
   | 'EVIDENCE_INTEGRITY_FAILURE';
 
 export interface AuditEntry {

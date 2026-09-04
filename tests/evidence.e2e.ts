@@ -443,6 +443,83 @@ async function run(): Promise<void> {
     assert.equal((await http('POST', `/api/v1/jobs/${job.jobId}/complete`, { cookie: master })).status, 200);
   });
 
+  // Drives a job to "checklist done + STOP approved" — ready except the signature.
+  const driveToSignable = async (job: { jobId: number; steps: any[] }) => {
+    await complete(job.jobId, job.steps[0].id);
+    await upload(stepPath(job.jobId, job.steps[1].id), PNG, usta);
+    await complete(job.jobId, job.steps[1].id, { measurements: [{ measurementId: job.steps[1].measurements[0].id, value: 15 }] });
+    await upload(stepPath(job.jobId, job.steps[2].id), PNG, usta);
+    await complete(job.jobId, job.steps[2].id);
+    await http('POST', `/api/v1/jobs/${job.jobId}/stop/approve`, { cookie: master });
+  };
+
+  // ---- 9. Object deleted after READY → completion fails closed ----
+  await test('object lost after READY makes job completion fail closed (502), status unchanged, no silent FAILED', async () => {
+    const job = await mkJob('TEV013MM');
+    await driveToSignable(job);
+    assert.equal((await uploadSig(job.jobId, PNG, usta)).status, 201);
+    // Externally lose a required READY photo object (bit rot / accidental delete).
+    const photo = await db('job_photos').where({ job_step_id: job.steps[1].id, status: 'READY' }).first();
+    await storage.delete(photo.storage_key);
+    const close = await http('POST', `/api/v1/jobs/${job.jobId}/complete`, { cookie: master });
+    assert.equal(close.status, 502, JSON.stringify(close.body));
+    assert.equal(close.body.error.code, 'EVIDENCE_UNVERIFIABLE');
+    assert.notEqual((await db('jobs').where({ id: job.jobId }).first()).status, 'COMPLETED');
+    // The completion read must NOT have mutated the row to FAILED.
+    assert.equal((await db('job_photos').where({ id: photo.id }).first()).status, 'READY');
+  });
+
+  // ---- 10. Storage stat timeout during completion → fails closed ----
+  await test('a storage stat timeout during completion fails closed (502); clearing it lets the close succeed', async () => {
+    const job = await mkJob('TEV014NN');
+    await driveToSignable(job);
+    assert.equal((await uploadSig(job.jobId, PNG, usta)).status, 201);
+    const sigRow = await db('customer_signatures').where({ job_id: job.jobId, status: 'READY' }).first();
+    storage.statOverride.set(sigRow.storage_key, new StorageError('TIMEOUT', 'gone'));
+    const blocked = await http('POST', `/api/v1/jobs/${job.jobId}/complete`, { cookie: master });
+    assert.equal(blocked.status, 502);
+    assert.equal(blocked.body.error.code, 'EVIDENCE_UNVERIFIABLE');
+    storage.statOverride.delete(sigRow.storage_key);
+    assert.equal((await http('POST', `/api/v1/jobs/${job.jobId}/complete`, { cookie: master })).status, 200);
+  });
+
+  // ---- 11. Reopened job still requires a current-cycle READY signature ----
+  await test('after reopen the old signature is superseded and a fresh current-cycle signature is required', async () => {
+    const job = await mkJob('TEV015OO');
+    await driveToSignable(job);
+    assert.equal((await uploadSig(job.jobId, PNG, usta)).status, 201);
+    assert.equal((await http('POST', `/api/v1/jobs/${job.jobId}/complete`, { cookie: master })).status, 200); // COMPLETED cycle 1
+    const reopen = await http('POST', `/api/v1/jobs/${job.jobId}/reopen`, { cookie: admin, body: { reason: 'qayta korib chiqish kerak' } });
+    assert.equal(reopen.status, 200, JSON.stringify(reopen.body));
+    assert.equal((await db('jobs').where({ id: job.jobId }).first()).cycle, 2);
+    assert.ok((await db('customer_signatures').where({ job_id: job.jobId, cycle: 1 }).first()).superseded_at, 'cycle-1 signature superseded, not deleted');
+    // Re-close is blocked without a cycle-2 signature (the old one no longer authorizes).
+    const blocked = await http('POST', `/api/v1/jobs/${job.jobId}/complete`, { cookie: master });
+    assert.equal(blocked.status, 422);
+    assert.ok(blocked.body.error.details.some((d: any) => d.code === 'CUSTOMER_SIGNATURE_REQUIRED'));
+    // Fresh cycle-2 signature → close proceeds to QUALITY_REVIEW.
+    assert.equal((await uploadSig(job.jobId, PNG, usta)).status, 201);
+    assert.equal((await http('POST', `/api/v1/jobs/${job.jobId}/complete`, { cookie: master })).status, 200);
+    assert.equal((await db('jobs').where({ id: job.jobId }).first()).status, 'QUALITY_REVIEW');
+  });
+
+  // ---- 12. Failed legacy evidence never satisfies a completion gate ----
+  await test('a FAILED (integrity-invalidated) signature never satisfies completion', async () => {
+    const job = await mkJob('TEV016PP');
+    await driveToSignable(job);
+    const jobRow = await db('jobs').where({ id: job.jobId }).first();
+    // A signature that reconciliation would have marked FAILED (e.g. hash mismatch).
+    await db('customer_signatures').insert({
+      job_id: job.jobId, customer_id: jobRow.customer_id, cycle: jobRow.cycle, status: 'FAILED',
+      storage_key: `signatures/${job.jobId}/legacy-bad-${Date.now()}.png`, mime_type: 'image/png',
+      content_type: 'image/png', size_bytes: PNG.length, hash: 'deadbeef',
+      failure_reason: 'LEGACY_HASH_MISMATCH', failed_at: db.fn.now(),
+    });
+    const blocked = await http('POST', `/api/v1/jobs/${job.jobId}/complete`, { cookie: master });
+    assert.equal(blocked.status, 422);
+    assert.ok(blocked.body.error.details.some((d: any) => d.code === 'CUSTOMER_SIGNATURE_REQUIRED'), JSON.stringify(blocked.body));
+  });
+
   await cleanup();
   server.close();
   await db.destroy();

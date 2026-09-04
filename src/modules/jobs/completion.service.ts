@@ -60,6 +60,12 @@ function toThousandths(v: number): number {
  * values re-validated against the template rules, and the signature artifact.
  * The §22 "no unresolved critical issue" condition awaits the §21 risk engine
  * (deferred, documented) — there is no risk data to check yet.
+ *
+ * This is the DB-truth gate (counts only status=READY). It does NOT touch object
+ * storage, so it stays cheap for the readiness endpoint. The authoritative close
+ * path additionally calls {@link assertReadyEvidenceObjects} to confirm the
+ * READY objects still physically exist and match their size before the job may
+ * be completed — see the note on the completion guarantee there.
  */
 export async function validateJobCompletion(jobId: number, trx?: Knex.Transaction): Promise<CompletionReadiness> {
   const conn = trx ?? db;
@@ -197,6 +203,76 @@ export async function validateJobCompletion(jobId: number, trx?: Knex.Transactio
   }
 
   return { canComplete: reasons.length === 0, reasons, conditions };
+}
+
+/**
+ * Phase 10B completion-time storage verification.
+ *
+ * The DB gate proves the metadata is READY; this proves the OBJECT is still
+ * physically there. It stats every READY object the gate relies on (required
+ * photos of the relevant attempt + the current-cycle signature) and confirms it
+ * exists and its size still matches. Run OUTSIDE any transaction so we never
+ * hold a job/step row lock during storage network I/O — the same rule the
+ * upload path follows.
+ *
+ * Fails CLOSED with a single stable service error (502 EVIDENCE_UNVERIFIABLE) on
+ * any missing object, size mismatch, stat timeout or provider error: the job
+ * cannot be completed. It NEVER mutates evidence status — detecting and
+ * recording loss (READY -> FAILED) is reconciliation's deliberate, audited job,
+ * not a side effect of a completion read.
+ *
+ * Full sha256 is not re-read here (it is verified at upload and by scheduled
+ * deep reconciliation) to keep close latency bounded; existence + current size
+ * is the completion-time guarantee. The small window between this check and the
+ * close commit is covered by reconciliation and the next completion attempt.
+ */
+export async function assertReadyEvidenceObjects(jobId: number): Promise<void> {
+  const targets: { storageKey: string; size: number }[] = [];
+
+  const checklist = await db('job_checklists').where({ job_id: jobId }).first();
+  if (checklist) {
+    const steps = await db('job_steps')
+      .select('job_steps.id', 'checklist_steps.required_photos')
+      .join('checklist_steps', 'checklist_steps.id', 'job_steps.step_id')
+      .where('job_steps.job_checklist_id', checklist.id);
+    const stepIds = steps.map((s: any) => s.id);
+    // Relevant attempt per step — identical rule to validateJobCompletion so the
+    // verified objects are exactly the ones the gate counted.
+    const approvals =
+      stepIds.length > 0 ? await db('stop_approvals').whereIn('job_step_id', stepIds).orderBy('attempt', 'desc') : [];
+    const latestAttempt = new Map<number, number>();
+    for (const a of approvals) if (!latestAttempt.has(a.job_step_id)) latestAttempt.set(a.job_step_id, a.attempt);
+
+    for (const s of steps.filter((x: any) => x.required_photos > 0)) {
+      const rows = await db('job_photos')
+        .where({ job_step_id: s.id, attempt: latestAttempt.get(s.id) ?? 1, status: 'READY' })
+        .select('storage_key', 'size_bytes');
+      for (const r of rows) targets.push({ storageKey: r.storage_key, size: r.size_bytes });
+    }
+  }
+
+  const job = await db('jobs').where({ id: jobId }).first();
+  const currentCycle = job?.cycle ?? 1;
+  const sig = await db('customer_signatures')
+    .where({ job_id: jobId, cycle: currentCycle, status: 'READY' })
+    .orderBy('id', 'desc')
+    .first();
+  if (sig) targets.push({ storageKey: sig.storage_key, size: sig.size_bytes });
+
+  const storage = getStorageProvider();
+  for (const t of targets) {
+    let stat: Awaited<ReturnType<typeof storage.stat>>;
+    try {
+      stat = await storage.stat(t.storageKey);
+    } catch (err) {
+      logger.warn({ jobId, err }, 'Completion-time evidence stat failed — failing closed');
+      throw new ApiError(502, 'EVIDENCE_UNVERIFIABLE', "Dalil fayllarini tekshirib bo'lmadi — keyinroq qayta urinib ko'ring");
+    }
+    if (!stat || stat.size !== t.size) {
+      logger.warn({ jobId, missing: !stat }, 'Completion-time evidence object missing/mismatched — failing closed');
+      throw new ApiError(502, 'EVIDENCE_UNVERIFIABLE', "Dalil fayllarini tekshirib bo'lmadi — keyinroq qayta urinib ko'ring");
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +486,19 @@ async function markSignatureFailed(
  * on the job row lock; failure = rollback, zero partial state.
  */
 export async function closeJob(actor: AuthUser, jobId: number, meta: RequestMeta): Promise<void> {
+  // Pre-lock: scope + status + DB readiness, then completion-time object
+  // verification. Storage I/O runs here, BEFORE the write lock, so we never hold
+  // the job/step row locks during a storage stat (same rule as the upload path).
+  const pre = await loadScopedJob(actor, jobId);
+  if (pre.status !== 'IN_PROGRESS' && pre.status !== 'REOPENED') {
+    throw ApiError.conflict(`Bu holatdagi ishni yopib bo'lmaydi (${pre.status})`, 'JOB_NOT_CLOSABLE');
+  }
+  const preReadiness = await validateJobCompletion(jobId);
+  if (!preReadiness.canComplete) {
+    throw new ApiError(422, 'COMPLETION_BLOCKED', "Ishni yopish shartlari to'liq bajarilmagan", preReadiness.reasons);
+  }
+  await assertReadyEvidenceObjects(jobId);
+
   await db.transaction(async (trx) => {
     const job = await loadScopedJob(actor, jobId, trx, true);
     const reopenCycle = job.status === 'REOPENED';
@@ -417,6 +506,7 @@ export async function closeJob(actor: AuthUser, jobId: number, meta: RequestMeta
       throw ApiError.conflict(`Bu holatdagi ishni yopib bo'lmaydi (${job.status})`, 'JOB_NOT_CLOSABLE');
     }
 
+    // Defense in depth: the DB gate must still hold under the lock.
     const readiness = await validateJobCompletion(jobId, trx);
     if (!readiness.canComplete) {
       throw new ApiError(422, 'COMPLETION_BLOCKED', "Ishni yopish shartlari to'liq bajarilmagan", readiness.reasons);
@@ -530,6 +620,18 @@ export async function reopenJob(actor: AuthUser, jobId: number, reason: string, 
  * completion stays permanently in the first JOB_CLOSED audit row.
  */
 export async function confirmQuality(actor: AuthUser, jobId: number, meta: RequestMeta): Promise<void> {
+  // Pre-lock: status + DB readiness + completion-time object verification
+  // (storage I/O outside the write lock — see closeJob).
+  const pre = await loadScopedJob(actor, jobId);
+  if (pre.status !== 'QUALITY_REVIEW') {
+    throw ApiError.conflict("Bu ish sifat nazorati bosqichida emas", 'JOB_NOT_IN_QUALITY_REVIEW');
+  }
+  const preReadiness = await validateJobCompletion(jobId);
+  if (!preReadiness.canComplete) {
+    throw new ApiError(422, 'COMPLETION_BLOCKED', "Ishni yopish shartlari to'liq bajarilmagan", preReadiness.reasons);
+  }
+  await assertReadyEvidenceObjects(jobId);
+
   await db.transaction(async (trx) => {
     const job = await loadScopedJob(actor, jobId, trx, true);
     if (job.status !== 'QUALITY_REVIEW') {

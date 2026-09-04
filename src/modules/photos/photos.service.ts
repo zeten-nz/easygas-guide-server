@@ -82,7 +82,10 @@ function assertImage(buffer: Buffer): { mime: ImageMime } {
  * Invariants:
  *  - The completion gate counts only READY rows, so a crash between TX1 and TX2
  *    leaves a PENDING row that never counts as evidence (reconciliation cleans
- *    it). There is never valid metadata pointing at a missing object.
+ *    it). No row becomes READY before its object is written and size-verified;
+ *    an object can still be lost or altered externally AFTER it is READY, which
+ *    is why completion re-checks existence+size (assertReadyEvidenceObjects) and
+ *    reconciliation re-verifies periodically.
  *  - A storage failure marks the row FAILED (no valid evidence) and rethrows.
  *  - If the workflow moved on (cancel/complete/reopen/new attempt) before TX2,
  *    the row is marked FAILED(SUPERSEDED) and the just-written object deleted —

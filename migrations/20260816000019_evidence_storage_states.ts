@@ -7,18 +7,29 @@ import type { Knex } from 'knex';
  * that completion gates count only evidence whose object has actually been
  * stored and verified:
  *
- *   PENDING  — metadata registered, object write not yet confirmed
- *   READY    — object written AND storage metadata verified (only this counts)
- *   FAILED   — write failed, superseded, or reconciliation found it corrupt
+ *   PENDING    — metadata registered, object write not yet confirmed
+ *   UNVERIFIED — pre-Phase-10B legacy row, never checked against storage
+ *   READY      — object written AND verified against its metadata (only this counts)
+ *   FAILED     — write failed, superseded, or reconciliation found it corrupt
  *
  * Signatures additionally gain a `cycle` (the reopen cycle they belong to) and
  * lose the one-per-job UNIQUE constraint, so a reopened job requires a fresh
  * READY signature for the new cycle while old signatures remain in history.
  *
- * BACKFILL ASSUMPTION (documented): every pre-existing evidence row is treated
- * as READY. Before Phase 10B a row was only created (and never deleted) after a
- * successful in-process storage write, so existing rows correspond to written
- * objects. Reconciliation (`npm run reconcile`) can verify this afterwards.
+ * LEGACY BACKFILL POLICY (documented): a pre-existing DB row is NOT proof that
+ * its object is present, whole, and matches its recorded size/sha256 — the file
+ * may be missing, truncated, or altered. So every pre-existing evidence row is
+ * backfilled to UNVERIFIED (a NON-valid state that can never satisfy a
+ * completion gate — those count only READY), NOT to READY. `ready_at` is left
+ * null so provenance is unambiguous from the status column alone: UNVERIFIED =
+ * legacy/never-verified, PENDING = a Phase 10B upload in flight, READY = an
+ * object actually verified. Only a successful deep verification promotes a
+ * legacy row: run `npm run reconcile -- --apply --deep`, which reads each
+ * object, recomputes sha256, compares size + hash (+ detected type), and
+ * transitions UNVERIFIED -> READY on a match or -> FAILED when the object is
+ * missing/altered. The stale-PENDING sweep never touches UNVERIFIED rows, so
+ * legacy evidence is not auto-failed by the age window; it waits for an
+ * explicit verification run.
  *
  * MySQL notes (DDL is non-transactional): column additions are hasColumn-
  * guarded so a partially-applied migration can be re-run; and the replacement
@@ -34,7 +45,10 @@ export async function up(knex: Knex): Promise<void> {
     t.timestamp('failed_at').nullable();
     t.string('failure_reason', 60).nullable();
   }, ['status', 'content_type', 'ready_at', 'failed_at', 'failure_reason']);
-  await knex('job_photos').where({ status: 'PENDING' }).update({ status: 'READY', ready_at: knex.fn.now() });
+  // Legacy rows -> UNVERIFIED (never READY): existence and integrity are unknown
+  // until a deep reconciliation run verifies each object. UNVERIFIED never
+  // satisfies a completion gate. See the LEGACY BACKFILL POLICY above.
+  await knex('job_photos').where({ status: 'PENDING' }).update({ status: 'UNVERIFIED' });
   await ensureIndex(knex, 'job_photos', ['job_step_id', 'attempt', 'status'], 'idx_job_photos_step_attempt_status');
   await ensureIndex(knex, 'job_photos', ['status'], 'idx_job_photos_status');
 
@@ -54,7 +68,9 @@ export async function up(knex: Knex): Promise<void> {
     t.string('failure_reason', 60).nullable();
     t.timestamp('superseded_at').nullable();
   }, ['status', 'cycle', 'content_type', 'ready_at', 'failed_at', 'failure_reason', 'superseded_at']);
-  await knex('customer_signatures').where({ status: 'PENDING' }).update({ status: 'READY', ready_at: knex.fn.now() });
+  // Legacy signatures -> UNVERIFIED (never READY) for the same reason as photos:
+  // a row is not proof the signature image is present and unaltered.
+  await knex('customer_signatures').where({ status: 'PENDING' }).update({ status: 'UNVERIFIED' });
 
   // New indexes FIRST — idx_...job_cycle_status starts with job_id, so it can
   // back the job_id FK once the old UNIQUE is dropped.

@@ -22,6 +22,8 @@ export class MemoryStorageProvider implements StorageProvider {
   onPutEnter: (() => void) | null = null;
   afterPut: ((key: string) => Promise<void>) | null = null;
   statOverride: Map<string, ObjectStat | 'MISSING' | StorageError> = new Map();
+  /** Per-key transient failure for getStream (e.g. a TIMEOUT during a deep read). */
+  getStreamOverride: Map<string, StorageError> = new Map();
 
   private assertKey(key: string): void {
     if (typeof key !== 'string' || key.length === 0 || key.startsWith('/') || key.includes('..')) {
@@ -53,6 +55,8 @@ export class MemoryStorageProvider implements StorageProvider {
 
   async getStream(key: string): Promise<Readable> {
     this.assertKey(key);
+    const override = this.getStreamOverride.get(key);
+    if (override) throw override;
     const obj = this.objects.get(key);
     if (!obj) throw new StorageError('NOT_FOUND', 'Object not found');
     return Readable.from(obj.data);
@@ -77,7 +81,12 @@ export class MemoryStorageProvider implements StorageProvider {
     this.objects.delete(key);
   }
 
-  // Test introspection
+  // Test introspection / setup
+  /** Places raw bytes directly (bypassing put hooks) — simulates a legacy or
+   *  externally-modified object. */
+  setObject(key: string, data: Buffer, contentType?: string): void {
+    this.objects.set(key, { data: Buffer.from(data), contentType });
+  }
   has(key: string): boolean {
     return this.objects.has(key);
   }
