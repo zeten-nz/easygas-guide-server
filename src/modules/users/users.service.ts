@@ -281,6 +281,12 @@ export async function updateUser(
         { ...auditBase, action: 'USER_ROLE_CHANGED', oldValue: { role: current.role_code }, newValue: { role: input.roleCode } },
         trx,
       );
+      // Phase 10C note: a sensitive role change takes effect IMMEDIATELY without
+      // revoking the session, because requireAuth re-loads the user's role and
+      // recomputes permissions on EVERY request (continuous re-authorization) —
+      // stronger than session-based revocation for a demotion, and no stale
+      // privilege can be exercised. Block / branch-deactivation / password-reset
+      // still hard-revoke sessions.
     }
     if (input.branchId !== undefined && input.branchId !== current.branch_id) {
       await logAudit(

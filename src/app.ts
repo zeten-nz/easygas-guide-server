@@ -9,6 +9,7 @@ import { logger } from './utils/logger';
 import { apiLimiter } from './middleware/rate-limit.middleware';
 import { csrfProtection } from './middleware/csrf.middleware';
 import { errorHandler, notFoundHandler } from './middleware/error.middleware';
+import { readiness } from './modules/health/health.service';
 import { authRouter } from './modules/auth/auth.routes';
 import { branchesRouter } from './modules/branches/branches.routes';
 import { registrationAdminRouter } from './modules/users/registration.admin.routes';
@@ -44,6 +45,9 @@ export function createApp(options: CreateAppOptions = {}) {
     cors({
       origin: env.CLIENT_ORIGIN,
       credentials: true,
+      // Phase 10C: the SPA reads the rotated CSRF token + its monotonic sequence
+      // (and rate-limit headers) from responses; these must be exposed to JS.
+      exposedHeaders: ['x-csrf-token', 'x-session-rotation', 'Retry-After', 'RateLimit-Limit', 'RateLimit-Remaining'],
     }),
   );
   app.use(compression());
@@ -52,12 +56,21 @@ export function createApp(options: CreateAppOptions = {}) {
   app.use(
     pinoHttp({
       logger,
-      autoLogging: { ignore: (req) => req.url === '/api/v1/health' },
+      autoLogging: { ignore: (req) => req.url === '/api/v1/health' || req.url === '/api/v1/ready' },
     }),
   );
 
+  // Liveness (Phase 10C): minimal, no external dependencies. Used by PM2/orchestrator.
   app.get('/api/v1/health', (_req, res) => {
     res.json({ status: 'ok' });
+  });
+
+  // Readiness (Phase 10C): checks DB/Redis/storage/SMS-config with strict
+  // timeouts and flips to 503 during graceful shutdown. Used by Nginx to decide
+  // whether to route traffic here.
+  app.get('/api/v1/ready', async (_req, res) => {
+    const r = await readiness();
+    res.status(r.ready ? 200 : 503).json({ status: r.ready ? 'ready' : 'not_ready', checks: r.checks });
   });
 
   app.use('/api/v1', apiLimiter);

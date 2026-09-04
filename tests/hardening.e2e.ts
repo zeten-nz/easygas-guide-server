@@ -19,6 +19,7 @@ import { csrfTokenFor } from '../src/middleware/csrf.middleware';
 import { errorHandler } from '../src/middleware/error.middleware';
 import { env } from '../src/config/env';
 import { setSmsProviderForTesting } from '../src/sms';
+import { runOnce } from '../src/sms/sms.worker';
 
 const USERS = {
   adminX: '+998990008801',
@@ -215,9 +216,12 @@ async function run(): Promise<void> {
     name: 'test-capture',
     async send(phone, message) {
       smsInbox.push({ phone, message });
+      return { providerMessageId: `test-${smsInbox.length}`, outcome: 'ACCEPTED' as const };
     },
   });
-  const lastOtpFor = (phone: string) => {
+  // Phase 10C: OTP goes through the durable outbox; flush the worker (no sleeps).
+  const lastOtpFor = async (phone: string): Promise<string> => {
+    await runOnce();
     const msg = [...smsInbox].reverse().find((m) => m.phone === phone);
     assert.ok(msg, `no SMS captured for ${phone}`);
     return msg.message.match(/\b(\d{6})\b/)![1];
@@ -372,14 +376,14 @@ async function run(): Promise<void> {
       `attempts must be capped at ${env.OTP_MAX_ATTEMPTS} even under concurrency (got ${record.attempts})`,
     );
     const lateCorrect = await http('POST', '/api/v1/auth/verify-otp', {
-      body: { phone: USERS.otpUser1, otp: lastOtpFor(USERS.otpUser1) },
+      body: { phone: USERS.otpUser1, otp: await lastOtpFor(USERS.otpUser1) },
     });
     assert.equal(lateCorrect.status, 429, 'the correct code is refused once the limit is reached');
   });
 
   await test('OTP: a valid code is consumed exactly once under concurrency', async () => {
     assert.equal((await http('POST', '/api/v1/auth/forgot-password', { body: { phone: USERS.otpUser2 } })).status, 200);
-    const otp = lastOtpFor(USERS.otpUser2);
+    const otp = await lastOtpFor(USERS.otpUser2);
     const [a, b] = await Promise.all([
       http('POST', '/api/v1/auth/verify-otp', { body: { phone: USERS.otpUser2, otp } }),
       http('POST', '/api/v1/auth/verify-otp', { body: { phone: USERS.otpUser2, otp } }),
@@ -400,7 +404,7 @@ async function run(): Promise<void> {
     const preSession = await login(USERS.resetUser);
     assert.equal((await http('POST', '/api/v1/auth/forgot-password', { body: { phone: USERS.resetUser } })).status, 200);
     const verify = await http('POST', '/api/v1/auth/verify-otp', {
-      body: { phone: USERS.resetUser, otp: lastOtpFor(USERS.resetUser) },
+      body: { phone: USERS.resetUser, otp: await lastOtpFor(USERS.resetUser) },
     });
     assert.equal(verify.status, 200);
     const resetToken = verify.body.resetToken;

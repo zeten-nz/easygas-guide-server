@@ -2,7 +2,8 @@ import type { NextFunction, Request, Response } from 'express';
 import { db } from '../config/database';
 import { env } from '../config/env';
 import { ApiError } from '../utils/errors';
-import { hashSessionToken } from '../utils/crypto';
+import { csrfTokenFor } from './csrf.middleware';
+import { resolveSession, setSessionCookie } from '../modules/auth/session.service';
 import { toAuthUser, type UserWithRole } from '../modules/users/user.mapper';
 import type { AuthUser, SessionRow } from '../types/auth';
 
@@ -12,47 +13,44 @@ interface ResolvedAuth {
 }
 
 /**
- * Resolves the session cookie to an active session + active user, or null.
- * Rejects expired/revoked sessions and inactive users (a blocked user's
- * existing sessions become useless immediately).
+ * Resolves the session cookie to an active session + active user, applying the
+ * Phase 10C lifecycle (absolute/idle expiry + token rotation + replay defense).
+ * When the token rotates, the new cookie and a fresh CSRF token are delivered on
+ * the response; on every authenticated response the current CSRF token and its
+ * monotonic rotation sequence are exposed so the SPA can converge safely.
+ * Returns null (unauthenticated) for any invalid/expired/revoked/replayed token.
  */
-async function resolveAuth(req: Request): Promise<ResolvedAuth | null> {
-  const token: unknown = req.cookies?.[env.SESSION_COOKIE_NAME];
-  if (typeof token !== 'string' || token.length !== 64) return null;
-
-  const session = (await db('sessions')
-    .where({ token_hash: hashSessionToken(token) })
-    .first()) as SessionRow | undefined;
-
-  if (!session || session.revoked_at || new Date(session.expires_at).getTime() <= Date.now()) {
-    return null;
-  }
+async function resolveAuth(req: Request, res: Response): Promise<ResolvedAuth | null> {
+  const rawToken: unknown = req.cookies?.[env.SESSION_COOKIE_NAME];
+  const outcome = await resolveSession(rawToken);
+  if (outcome === 'invalid' || outcome === 'replay') return null;
 
   const user = (await db('users')
     .select('users.*', 'roles.code as role_code', 'branches.status as branch_status')
     .join('roles', 'roles.id', 'users.role_id')
     .leftJoin('branches', 'branches.id', 'users.branch_id')
-    .where('users.id', session.user_id)
+    .where('users.id', outcome.session.user_id)
     .whereNull('users.deleted_at')
     .first()) as (UserWithRole & { branch_status: string | null }) | undefined;
 
   if (!user || user.status !== 'ACTIVE') return null;
-  // Phase 10A branch policy: users assigned to a deactivated branch cannot
-  // authenticate — existing sessions die here immediately. Global roles
-  // (branch_id NULL: ADMIN/SIFAT) are unaffected and keep read access to the
-  // deactivated branch's historical data through their all-branch scope.
+  // Phase 10A branch policy: users on a deactivated branch cannot authenticate.
   if (user.branch_id !== null && user.branch_status !== 'ACTIVE') return null;
 
-  // Touch last_used_at at most once a minute to avoid a write per request.
-  if (Date.now() - new Date(session.last_used_at).getTime() > 60_000) {
-    await db('sessions').where({ id: session.id }).update({ last_used_at: db.fn.now() });
+  // Deliver the effective CSRF token + rotation sequence. On rotation the new
+  // cookie is set here; the CSRF token is HMAC(cookie) so it follows the token.
+  const effectiveToken = outcome.rotated?.token ?? (rawToken as string);
+  if (outcome.rotated) {
+    setSessionCookie(res, outcome.rotated.token, outcome.rotated.rememberMe, outcome.rotated.absoluteExpiresAt);
   }
+  res.setHeader('x-csrf-token', csrfTokenFor(effectiveToken));
+  res.setHeader('x-session-rotation', String(outcome.session.rotation_seq));
 
-  return { user: toAuthUser(user), session };
+  return { user: toAuthUser(user), session: outcome.session };
 }
 
-export async function requireAuth(req: Request, _res: Response, next: NextFunction): Promise<void> {
-  const resolved = await resolveAuth(req);
+export async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const resolved = await resolveAuth(req, res);
   if (!resolved) {
     throw ApiError.unauthorized();
   }
@@ -63,11 +61,10 @@ export async function requireAuth(req: Request, _res: Response, next: NextFuncti
 
 /**
  * Attaches req.user when a valid session cookie is present, but never rejects.
- * Used by endpoints that adapt their response to the caller (e.g. GET /branches
- * returns full management data to authorized users, a minimal public list otherwise).
+ * Still applies rotation/CSRF delivery for authenticated callers.
  */
-export async function optionalAuth(req: Request, _res: Response, next: NextFunction): Promise<void> {
-  const resolved = await resolveAuth(req);
+export async function optionalAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const resolved = await resolveAuth(req, res);
   if (resolved) {
     req.user = resolved.user;
     req.authSession = resolved.session;

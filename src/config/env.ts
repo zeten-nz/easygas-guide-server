@@ -21,13 +21,65 @@ const envSchema = z.object({
   BCRYPT_ROUNDS: z.coerce.number().int().min(10).max(15).default(12),
 
   SESSION_COOKIE_NAME: z.string().default('eg_session'),
+  // --- Phase 10C session lifecycle (replaces the single long-lived TTL) ---
+  // Absolute lifetime cap for a "remember me" session family; a session can
+  // never live past created_at + this, regardless of activity or rotation.
+  SESSION_ABSOLUTE_DAYS: z.coerce.number().int().positive().default(30),
+  // Idle timeout: a session dies this long after its last use (applies to both
+  // remember and non-remember sessions).
+  SESSION_IDLE_MINUTES: z.coerce.number().int().positive().default(720), // 12h
+  // Rotate the opaque token at most once per this interval (not every request).
+  SESSION_ROTATE_MINUTES: z.coerce.number().int().positive().default(60),
+  // How long a just-rotated (superseded) token stays usable, to absorb the
+  // browser's in-flight parallel requests without minting divergent sessions.
+  SESSION_ROTATION_GRACE_SECONDS: z.coerce.number().int().nonnegative().default(30),
+  // Retained for the non-remember cookie maxAge only (kept for compatibility).
   SESSION_TTL_HOURS: z.coerce.number().int().positive().default(24),
   SESSION_REMEMBER_TTL_DAYS: z.coerce.number().int().positive().default(180),
 
-  SMS_PROVIDER: z.enum(['console']).optional(),
+  SMS_PROVIDER: z.enum(['console', 'eskiz']).optional(),
   OTP_TTL_MINUTES: z.coerce.number().int().positive().default(5),
   OTP_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
   RESET_TOKEN_TTL_MINUTES: z.coerce.number().int().positive().default(10),
+
+  // --- Phase 10C Redis (shared rate limiting + coordination) ---
+  // Required in production (fail-closed abuse controls depend on it). Optional
+  // in dev/test, where an isolated in-memory implementation is used instead.
+  REDIS_URL: z.string().optional(), // redis:// or rediss:// (TLS)
+  REDIS_CONNECT_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+  REDIS_COMMAND_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
+  REDIS_KEY_PREFIX: z.string().default('eg:'),
+
+  // --- Phase 10C durable SMS outbox / worker ---
+  // Optional dedicated 32-byte key (hex or base64) for the outbox body cipher.
+  // When unset, an HKDF subkey is derived from APP_KEY (deterministic, survives
+  // restart). NEVER an ephemeral random key. See utils/crypto resolveSmsOutboxKey.
+  SMS_OUTBOX_ENCRYPTION_KEY: z.string().optional(),
+  SMS_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
+  SMS_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
+  // A queued message older than this when a worker picks it up is CANCELLED,
+  // never delivered (an OTP must not arrive after it has expired).
+  SMS_MAX_AGE_SECONDS: z.coerce.number().int().positive().default(300),
+  SMS_WORKER_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v !== 'false' && v !== '0'), // default on; tests drive the worker manually
+  SMS_WORKER_INTERVAL_MS: z.coerce.number().int().positive().default(5_000),
+  SMS_WORKER_BATCH: z.coerce.number().int().positive().default(20),
+  SMS_LEASE_SECONDS: z.coerce.number().int().positive().default(60),
+
+  // --- Phase 10C Eskiz provider (validated only when SMS_PROVIDER=eskiz) ---
+  // NOTE: the Eskiz adapter itself is deferred pending a verified official spec
+  // (see docs/PRODUCTION-RUNTIME-10C.md); these are declared so config is ready.
+  ESKIZ_EMAIL: z.string().optional(),
+  ESKIZ_PASSWORD: z.string().optional(),
+  ESKIZ_FROM: z.string().optional(),
+  ESKIZ_BASE_URL: z.string().default('https://notify.eskiz.uz/api'),
+
+  // --- Phase 10C maintenance retention (days) ---
+  SESSION_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
+  OTP_RETENTION_DAYS: z.coerce.number().int().positive().default(7),
+  SMS_OUTBOX_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
 
   SUPPORT_TELEGRAM_URL: z.string().default('https://t.me/EasygasGarantbot'),
 
@@ -85,3 +137,82 @@ if (!parsed.success) {
 export const env = parsed.data;
 
 export const isProduction = env.NODE_ENV === 'production';
+
+/**
+ * Phase 10C production configuration validation. Structural parsing (above)
+ * cannot express cross-field production rules, so they are checked here and the
+ * process refuses to start in production if any fails. Returns the list of
+ * problems (empty when OK) — exported so a test can assert the rules without
+ * killing the process.
+ */
+export function validateProductionConfig(e: typeof env): string[] {
+  const problems: string[] = [];
+  if (e.NODE_ENV !== 'production') {
+    // Guard the inverse in non-prod: never point a test run at a real database.
+    if (e.NODE_ENV === 'test' && !/_test$/.test(e.DB_NAME)) {
+      problems.push(`In test mode DB_NAME ("${e.DB_NAME}") must end with "_test".`);
+    }
+    return problems;
+  }
+
+  // APP_KEY strength: length is enforced by the schema (>=32); reject an obvious
+  // placeholder / low-entropy value in production.
+  if (/^(?:x+|0+|secret|changeme|test|dev)/i.test(e.APP_KEY) || new Set(e.APP_KEY.split('')).size < 12) {
+    problems.push('APP_KEY looks weak/placeholder — use a long random value (>=32 chars, high entropy).');
+  }
+  // Exactly-one-Nginx assumption: real client IPs require a trusted proxy hop.
+  if (e.TRUST_PROXY_HOPS < 1) {
+    problems.push('TRUST_PROXY_HOPS must be >=1 in production (all traffic via one trusted Nginx; Node port not public).');
+  }
+  // Redis is mandatory: fail-closed auth/OTP/reset abuse controls depend on it.
+  if (!e.REDIS_URL) {
+    problems.push('REDIS_URL is required in production (shared rate limiting / abuse controls depend on Redis).');
+  }
+  // Object storage (Phase 10B): production must not silently use local disk.
+  if (e.STORAGE_PROVIDER === 'local' && !e.ALLOW_LOCAL_STORAGE_IN_PRODUCTION) {
+    problems.push('STORAGE_PROVIDER=local is refused in production (set s3, or ALLOW_LOCAL_STORAGE_IN_PRODUCTION=true to override).');
+  }
+  if (e.STORAGE_PROVIDER === 's3' && (!e.S3_BUCKET || !e.S3_REGION)) {
+    problems.push('STORAGE_PROVIDER=s3 requires S3_BUCKET and S3_REGION.');
+  }
+  // SMS: console is dev-only; a real provider needs its credentials.
+  if (!e.SMS_PROVIDER || e.SMS_PROVIDER === 'console') {
+    problems.push('SMS_PROVIDER must be a real provider in production (console is dev-only).');
+  }
+  if (e.SMS_PROVIDER === 'eskiz' && (!e.ESKIZ_EMAIL || !e.ESKIZ_PASSWORD || !e.ESKIZ_FROM)) {
+    problems.push('SMS_PROVIDER=eskiz requires ESKIZ_EMAIL, ESKIZ_PASSWORD and ESKIZ_FROM (approved sender).');
+  }
+  // A dedicated outbox key, when set, must decode to exactly 32 bytes (else the
+  // cipher would fail at first send). No dedicated key ⇒ HKDF from APP_KEY.
+  if (e.SMS_OUTBOX_ENCRYPTION_KEY) {
+    const k = e.SMS_OUTBOX_ENCRYPTION_KEY;
+    const buf = /^[0-9a-fA-F]{64}$/.test(k) ? Buffer.from(k, 'hex') : Buffer.from(k, 'base64');
+    if (buf.length !== 32) problems.push('SMS_OUTBOX_ENCRYPTION_KEY must decode to exactly 32 bytes (hex or base64).');
+  }
+  if (!e.CLIENT_ORIGIN || /localhost|127\.0\.0\.1/.test(e.CLIENT_ORIGIN)) {
+    problems.push('CLIENT_ORIGIN must be the real public origin in production (not localhost).');
+  }
+  // Cookies are only Secure when NODE_ENV=production (see auth.controller) — that
+  // holds here; nothing to add, but assert the DB is not a test schema.
+  if (/_test$/.test(e.DB_NAME)) {
+    problems.push('DB_NAME must not be a *_test database in production.');
+  }
+  // Session timing sanity: rotate < idle < absolute; grace bounded.
+  const idleMin = e.SESSION_IDLE_MINUTES;
+  const absMin = e.SESSION_ABSOLUTE_DAYS * 24 * 60;
+  if (!(e.SESSION_ROTATE_MINUTES < idleMin)) problems.push('SESSION_ROTATE_MINUTES must be < SESSION_IDLE_MINUTES.');
+  if (!(idleMin <= absMin)) problems.push('SESSION_IDLE_MINUTES must be <= SESSION_ABSOLUTE_DAYS.');
+  if (e.SESSION_ROTATION_GRACE_SECONDS > 300) problems.push('SESSION_ROTATION_GRACE_SECONDS should be small (<=300).');
+  return problems;
+}
+
+/** Enforces production config at startup (called from server.ts before listen). */
+export function assertProductionConfig(): void {
+  const problems = validateProductionConfig(env);
+  if (problems.length > 0) {
+    // eslint-disable-next-line no-console
+    console.error('Refusing to start — production configuration problems:');
+    for (const p of problems) console.error(`  - ${p}`);
+    throw new Error('Invalid production configuration');
+  }
+}

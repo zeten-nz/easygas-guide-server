@@ -1,38 +1,33 @@
-import type { CookieOptions, Request, Response } from 'express';
-import { env, isProduction } from '../../config/env';
+import type { Request, Response } from 'express';
+import { env } from '../../config/env';
 import { csrfTokenFor } from '../../middleware/csrf.middleware';
+import { setSessionCookie, clearSessionCookie } from './session.service';
 import { requestMeta } from '../audit/audit.service';
 import * as authService from './auth.service';
 
-function sessionCookieOptions(rememberMe: boolean, expiresAt: Date): CookieOptions {
-  return {
-    httpOnly: true,
-    secure: isProduction,
-    sameSite: 'lax',
-    path: '/',
-    // Without "remember me" the cookie is a browser-session cookie;
-    // the server-side session still expires after SESSION_TTL_HOURS.
-    ...(rememberMe ? { expires: expiresAt } : {}),
-  };
-}
-
 export async function login(req: Request, res: Response): Promise<void> {
   const result = await authService.login(req.body, requestMeta(req));
-  res.cookie(env.SESSION_COOKIE_NAME, result.token, sessionCookieOptions(result.rememberMe, result.expiresAt));
-  // Session-bound CSRF token (see csrf.middleware.ts) — kept in client memory only.
-  res.json({ user: result.user, csrfToken: csrfTokenFor(result.token) });
+  setSessionCookie(res, result.token, result.rememberMe, result.expiresAt);
+  // Session-bound CSRF token (see csrf.middleware.ts) — client memory only. The
+  // rotation sequence lets the SPA ignore an out-of-order older CSRF value.
+  res.setHeader('x-csrf-token', csrfTokenFor(result.token));
+  res.setHeader('x-session-rotation', String(result.rotationSeq));
+  res.json({ user: result.user, csrfToken: csrfTokenFor(result.token), rotationSeq: result.rotationSeq });
 }
 
 export async function logout(req: Request, res: Response): Promise<void> {
   await authService.logout(req.cookies?.[env.SESSION_COOKIE_NAME], requestMeta(req));
-  res.clearCookie(env.SESSION_COOKIE_NAME, { httpOnly: true, secure: isProduction, sameSite: 'lax', path: '/' });
+  clearSessionCookie(res);
   res.status(204).end();
 }
 
 export async function me(req: Request, res: Response): Promise<void> {
-  // Re-issue the CSRF token so a reloaded SPA can resume mutations.
-  const rawCookie = req.cookies?.[env.SESSION_COOKIE_NAME] as string;
-  res.json({ user: req.user, csrfToken: csrfTokenFor(rawCookie) });
+  // requireAuth has already delivered the effective CSRF token + rotation seq as
+  // response headers (and rotated the cookie if due); echo them in the body so a
+  // reloaded SPA can bootstrap its in-memory CSRF state.
+  const csrfToken = (res.getHeader('x-csrf-token') as string) ?? '';
+  const rotationSeq = req.authSession?.rotation_seq ?? 0;
+  res.json({ user: req.user, csrfToken, rotationSeq });
 }
 
 export async function register(req: Request, res: Response): Promise<void> {
