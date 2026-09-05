@@ -10,6 +10,7 @@ import { StorageError } from '../../storage/storage.provider';
 import { inspectImage } from '../../utils/image';
 import { logger } from '../../utils/logger';
 import { countOpenBlockingRisks } from '../risk/risk.service';
+import { assertRiskPolicyApproved } from '../risk/risk-policy.service';
 import { currentSummaryDigest, buildCompletionSnapshot, buildSignableSummary, getCompletionSnapshot, SUMMARY_SCHEMA_VERSION, SNAPSHOT_SCHEMA_VERSION } from '../completion/summary.service';
 import type { AuthUser } from '../../types/auth';
 
@@ -607,6 +608,8 @@ export async function closeJob(actor: AuthUser, jobId: number, meta: RequestMeta
     if (!readiness.canComplete) {
       throw new ApiError(422, 'COMPLETION_BLOCKED', "Ishni yopish shartlari to'liq bajarilmagan", readiness.reasons);
     }
+    // Phase 10D governance: completion fails closed under an unapproved risk policy.
+    await assertRiskPolicyApproved(trx);
     // Phase 10D: the accepted signature must still match the current summary.
     const cycle = job.cycle ?? 1;
     await assertSignatureFresh(trx, jobId, cycle);
@@ -745,6 +748,7 @@ export async function confirmQuality(actor: AuthUser, jobId: number, meta: Reque
       throw new ApiError(422, 'COMPLETION_BLOCKED', "Ishni yopish shartlari to'liq bajarilmagan", readiness.reasons);
     }
     const cycle = job.cycle ?? 1;
+    await assertRiskPolicyApproved(trx);
     await assertSignatureFresh(trx, jobId, cycle);
 
     await trx('jobs')

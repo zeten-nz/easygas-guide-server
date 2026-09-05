@@ -48,6 +48,7 @@ export const PERMISSIONS = [
   'risks.create', // technicians raise risks while performing work
   'risks.resolve', // supervisory: resolve/revise a risk with evidence
   'risks.override', // authorized override of a blocking risk (reason required)
+  'risk.matrix.approve', // create/activate/retire a risk-matrix version (safety governance)
   'jobs.assign', // assign/reassign the responsible technician
   'gps.override', // authorized override when GPS capture is unavailable
 ] as const;
@@ -99,6 +100,7 @@ export const ROLE_PERMISSIONS: Record<RoleCode, readonly Permission[]> = {
     'vehicles.view',
     'risks.resolve',
     'risks.override',
+    'risk.matrix.approve',
     'gps.override',
   ],
   ADMIN: [
@@ -120,6 +122,7 @@ export const ROLE_PERMISSIONS: Record<RoleCode, readonly Permission[]> = {
     'templates.manage',
     'risks.resolve',
     'risks.override',
+    'risk.matrix.approve',
     'jobs.assign',
     'gps.override',
   ],

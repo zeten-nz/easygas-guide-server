@@ -4,6 +4,7 @@ import { ApiError } from '../../utils/errors';
 import { logAudit } from '../audit/audit.service';
 import { jobsBranchScope } from '../../rbac/permissions';
 import { assignAtCreation } from './assignment.service';
+import { assertRiskPolicyApproved } from '../risk/risk-policy.service';
 import type { AuthUser } from '../../types/auth';
 import type { CreateJobInput, InstallationInput, JobStatus, ListJobsQuery } from './jobs.validators';
 
@@ -308,6 +309,9 @@ async function lockJobForTransition(
 export async function startJob(actor: AuthUser, id: number, meta: RequestMeta): Promise<JobDetail> {
   await db.transaction(async (trx) => {
     await lockJobForTransition(trx, actor, id, ['DRAFT']);
+    // Phase 10D governance: work may not start under an unapproved risk policy
+    // (fail closed → RISK_POLICY_NOT_APPROVED).
+    await assertRiskPolicyApproved(trx);
     await trx('jobs').where({ id }).update({ status: 'IN_PROGRESS', started_at: trx.fn.now(), updated_at: trx.fn.now() });
     await logAudit(
       {

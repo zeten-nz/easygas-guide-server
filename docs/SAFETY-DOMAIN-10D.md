@@ -9,19 +9,54 @@ Specification anchors: loyiha.md §12 (Job), §13 (job creation), §17 (STOP), �
 (GPS), §21 (Risk), §22 (completion gate), §23 (signature), §24 (reopen), §26
 (quality), §31 (`risk_events`), §4 (permission matrix).
 
-## Risk matrix & version (§21)
+## Risk matrix & version (§21) — GOVERNED
 
 Levels `LOW | MEDIUM | HIGH | CRITICAL` (from the spec). Scoring is
-**server-only** under a frozen `matrix_version` (`v1`); the client may propose a
+**server-only** under a frozen `matrix_version`; the client may propose a
 hazard/severity/likelihood but never the level, score, or blocking flag. Old
-records keep the version they were scored under, so a future matrix never
-rewrites past classifications.
+`risk_events` keep the version/score/level/blocking they were scored under, so a
+future matrix never rewrites past classifications.
 
-**v1 policy** (`src/modules/risk/risk-matrix.ts`): `score = severity × likelihood`
-(1–4 each, 1–16). `≥12 → CRITICAL`, `≥8 → HIGH`, `≥4 → MEDIUM`, else `LOW`.
-Source overrides: a rejected STOP is always `CRITICAL`; severity 4 is at least
-`HIGH`. **Blocking = CRITICAL** — this is exactly §22's "no unresolved critical
+**v1 policy** (`risk_matrix_versions`, definition JSON): `score = severity ×
+likelihood` (1–4 each, 1–16). `≥12 → CRITICAL`, `≥8 → HIGH`, `≥4 → MEDIUM`, else
+`LOW`. Source overrides: a rejected STOP is always `CRITICAL`; severity 4 is at
+least `HIGH`. **Blocking = CRITICAL** — exactly §22's "no unresolved critical
 issue".
+
+### Governance lifecycle (approval required)
+
+The v1 thresholds are **PROVISIONAL** — chosen during implementation, they must
+be approved by EasyGas's responsible safety specialist before they govern.
+`risk_matrix_versions` rows move `DRAFT → ACTIVE → RETIRED`:
+
+- The definition is **immutable**; a change requires a NEW version.
+- Activation requires the `risk.matrix.approve` permission (SIFAT/ADMIN), a
+  non-empty **rationale/reference**, and passes validation (allowed
+  severity/likelihood, complete score coverage, descending thresholds, unique
+  version, ≥1 blocking level including CRITICAL). Exactly **one ACTIVE** at a
+  time (activation retires the previous; concurrent activations serialize on a
+  row lock → one ACTIVE). Create/activate/retire are audited
+  (`RISK_MATRIX_CREATED/ACTIVATED/RETIRED`). **A migration never auto-approves** —
+  v1 is seeded `DRAFT`.
+- **Fail closed:** with no ACTIVE matrix, `assessRisk` and every safety op that
+  needs it refuse with `409 RISK_POLICY_NOT_APPROVED` — **new risk assessment,
+  job start, and completion/quality confirmation are all blocked**, and
+  readiness reports `riskPolicy: false` (so `/ready` is 503 and the safety
+  domain is never reported healthy without an approved policy).
+
+**Activating the first matrix.** Via the API (`POST
+/risk-policy/v1/activate` with a rationale, as SIFAT/ADMIN) or the bootstrap CLI
+when readiness is 503:
+
+```
+npm run risk-policy -- activate --version v1 --approver <userId> --rationale "..."
+```
+
+The CLI requires an approver whose role holds `risk.matrix.approve`; there is no
+default auto-approval. Dev/test activate v1 via `npm run test:setup` (a
+test-only bootstrap). API surface: `GET /risk-policy` (active state, any
+authenticated user — drives the warning banner), `GET /risk-policy/versions`,
+`POST /risk-policy/versions` (create DRAFT), `POST /risk-policy/:v/{activate,retire}`.
 
 ## Risk state machine
 
@@ -167,6 +202,7 @@ Reversible, additive, no destructive backfill (all verified down/up):
   `assignment_status`; legacy rows → `LEGACY_UNASSIGNED`)
 - `20260905000003_completion_snapshots` (+ signature `summary_digest`)
 - `20260905000004_job_gps_events`
+- `20260906000001_risk_matrix_versions` (governance; seeds v1 as **DRAFT**)
 
 Safety/legal history uses `ON DELETE RESTRICT` (no cascade that silently deletes
 risk/assignment/snapshot history). Microsecond `datetime(6)` where ordering
@@ -193,6 +229,40 @@ backend. 4. Deploy the frontend. Migrations are additive and reversible; no
 backfill rewrites existing rows (legacy jobs are marked, not invented). Rollback:
 frontend → backend → `migrate:rollback` (drops the new tables/columns; safety
 history is lost on rollback, so export first if needed).
+
+## Frontend (routes, roles, flows)
+
+New routes (permission-gated in the router; the backend re-checks every request):
+- `/app/my-jobs` (`checklist.execute`) — the technician's assigned-jobs queue
+  (`GET /jobs/mine`), loading/empty/error/retry, `LEGACY_UNASSIGNED` flagged.
+- `/app/admin/risk-policy` (`risk.matrix.approve`) — read/approve matrix
+  versions; activate a DRAFT with a mandatory rationale; warns when none active.
+- A global `RiskPolicyBanner` shows the "no approved policy" warning to
+  `risk.matrix.approve` holders on every screen.
+
+Reusable safety components: `CompletionReadinessPanel` (server-driven blockers;
+✓/✗ with a text status, not colour alone), `GpsCaptureButton` (prompts only on
+click, shows requesting/success/denied/unavailable/timeout/low-accuracy, retry,
+accuracy; never fabricates a coordinate), plus the safety API client
+(`api/safety.api.ts`) and the tested logic helpers (GPS/risk-form/completion/
+CSRF-ordering/stale-signature). **All authority is the backend response** — the
+UI never computes score/level/gate/digest.
+
+**User flows.** GPS: explained → user clicks → browser prompt → states shown →
+retry; authorized `gps.override` action with a reason is separate. Signing:
+fetch the server signable summary + digest → customer confirms → sign → submit
+the server digest → success only on READY; on `SIGNATURE_STALE`/`SUMMARY_STALE`
+the acceptance is discarded, the summary refetched, and re-signing required.
+
+**Client tests.** `npm run test:unit` (tsx + node:test, pure logic — GPS states,
+risk-form, completion blockers, stale-signature, CSRF ordering) and `npm run
+test:component` (vitest + jsdom + RTL — MyJobs states, risk-policy warning +
+authorized/unauthorized controls, completion-blocker render, GPS button states).
+Playwright config + specs live in `client/e2e/` (happy / blocked-completion /
+GPS paths) — **not executed here** (no browser/DB harness); run locally with
+`npm i -D @playwright/test && npx playwright install && npm run test:e2e` against
+the isolated test DB. **Note:** vitest's dev toolchain (esbuild/vite) carries
+dev-only npm-audit advisories; it never ships in the production build.
 
 ## Remaining risks / deferred
 

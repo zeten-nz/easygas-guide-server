@@ -23,6 +23,7 @@ import { jobStopRouter } from './modules/checklist/stop.routes';
 import { stepPhotosRouter } from './modules/photos/photos.routes';
 import { jobQualityRouter } from './modules/quality/quality.routes';
 import { jobRiskRouter } from './modules/risk/risk.routes';
+import { riskPolicyRouter } from './modules/risk/risk-policy.routes';
 import { jobGpsRouter } from './modules/gps/gps.routes';
 
 export interface CreateAppOptions {
@@ -94,6 +95,7 @@ export function createApp(options: CreateAppOptions = {}) {
   app.use('/api/v1/jobs/:jobId/quality', jobQualityRouter);
   app.use('/api/v1/jobs', jobsRouter);
   app.use('/api/v1/checklist-templates', checklistTemplatesRouter);
+  app.use('/api/v1/risk-policy', riskPolicyRouter);
   app.use('/api/v1/admin/registration-requests', registrationAdminRouter);
 
   app.use(notFoundHandler);

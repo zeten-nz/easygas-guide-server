@@ -33,6 +33,25 @@ async function main() {
   console.log(`[test-setup] Migrations applied now: ${migrations.length}`);
   await db.seed.run({ directory: path.resolve(__dirname, '../seeds'), loadExtensions: ['.ts'] });
   console.log('[test-setup] Seeds applied');
+
+  // Phase 10D: activate the provisional v1 risk matrix for deterministic tests
+  // (a test-only bootstrap — production requires an explicit authorized approval
+  // via the API or the risk-policy CLI). Idempotent.
+  const active = await db('risk_matrix_versions').where({ status: 'ACTIVE' }).first();
+  if (!active) {
+    const approver = await db('users').join('roles', 'roles.id', 'users.role_id').where('roles.code', 'ADMIN').select('users.id').first();
+    const target = await db('risk_matrix_versions').where({ version: 'v1' }).first();
+    if (approver && target) {
+      await db('risk_matrix_versions').where({ status: 'ACTIVE' }).update({ status: 'RETIRED' });
+      await db('risk_matrix_versions').where({ id: target.id }).update({
+        status: 'ACTIVE',
+        approved_by: approver.id,
+        approved_at: db.raw('CURRENT_TIMESTAMP(6)'),
+        rationale: 'TEST BOOTSTRAP — provisional v1 activated for deterministic tests',
+      });
+      console.log('[test-setup] Risk matrix v1 activated (test bootstrap)');
+    }
+  }
   await db.destroy();
 }
 

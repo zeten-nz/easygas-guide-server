@@ -4,7 +4,8 @@ import { ApiError } from '../../utils/errors';
 import { logAudit } from '../audit/audit.service';
 import { can } from '../../rbac/permissions';
 import { jobsBranchScope } from '../../rbac/permissions';
-import { computeRisk, RISK_MATRIX_VERSION, type RiskSource } from './risk-matrix';
+import { type RiskSource } from './risk-matrix';
+import { assessRisk } from './risk-policy.service';
 import type { AuthUser } from '../../types/auth';
 
 /**
@@ -69,11 +70,13 @@ export async function createRisk(actor: AuthUser, jobId: number, input: CreateRi
     throw ApiError.badRequest('Xavf turi va tavsifi majburiy', 'RISK_INPUT_REQUIRED');
   }
   const source: RiskSource = input.source ?? 'MANUAL';
-  const assessment = computeRisk({ severity: input.severity, likelihood: input.likelihood, source });
 
   return db.transaction(async (trx) => {
     const job = await loadScopedJob(actor, jobId, trx, true);
     if (!isRiskRaisable(job)) throw ApiError.conflict('Yopilgan ish uchun xavf qo\'shib bo\'lmaydi', 'JOB_NOT_WORKABLE');
+    // Server-authoritative scoring under the ACTIVE approved matrix — fails
+    // closed (RISK_POLICY_NOT_APPROVED) when no policy is approved.
+    const assessment = await assessRisk(trx, { severity: input.severity, likelihood: input.likelihood, source });
 
     let attempt: number | null = null;
     if (input.jobStepId != null) {
@@ -138,7 +141,7 @@ export async function linkStopRejectionRisk(
     .first();
   if (existing) return; // preserve independent history without duplicating the blocker
 
-  const assessment = computeRisk({ severity: 4, likelihood: 4, source: 'STOP_REJECTED' });
+  const assessment = await assessRisk(trx, { severity: 4, likelihood: 4, source: 'STOP_REJECTED' });
   const [id] = await trx('risk_events').insert({
     job_id: args.jobId,
     cycle: args.cycle,
@@ -245,7 +248,7 @@ export async function reviseRisk(actor: AuthUser, riskId: number, input: ReviseR
     const job = await loadScopedJob(actor, orig.job_id, trx, true);
     if (!OPEN_STATUSES.includes(orig.status)) throw ApiError.conflict('Yopilgan xavfni tuzatib bo\'lmaydi', 'RISK_NOT_OPEN');
 
-    const assessment = computeRisk({ severity: input.severity, likelihood: input.likelihood, source: orig.source });
+    const assessment = await assessRisk(trx, { severity: input.severity, likelihood: input.likelihood, source: orig.source });
     const [newId] = await trx('risk_events').insert({
       job_id: orig.job_id,
       cycle: orig.cycle,
@@ -353,4 +356,3 @@ export async function listRisks(
   };
 }
 
-export { RISK_MATRIX_VERSION };
