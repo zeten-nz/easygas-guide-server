@@ -39,6 +39,10 @@ export interface JobDetail {
   reopenReason: string | null;
   reopenedAt: Date | null;
   reopenedByName: string | null;
+  assignedTechnicianId: number | null;
+  assignedTechnicianName: string | null;
+  assignmentStatus: string;
+  cycle: number;
   installation: {
     gasType: 'LPG' | 'CNG' | null;
     kit: string | null;
@@ -78,6 +82,11 @@ interface JobRow {
   reopened_at: Date | null;
   reopener_first_name: string | null;
   reopener_last_name: string | null;
+  assigned_technician_id: number | null;
+  assignee_first_name: string | null;
+  assignee_last_name: string | null;
+  assignment_status: string | null;
+  cycle: number | null;
   gas_type: 'LPG' | 'CNG' | null;
   kit: string | null;
   ecu: string | null;
@@ -112,6 +121,10 @@ function toDetail(row: JobRow): JobDetail {
     reopenReason: row.reopen_reason,
     reopenedAt: row.reopened_at,
     reopenedByName: row.reopener_first_name ? `${row.reopener_first_name} ${row.reopener_last_name}` : null,
+    assignedTechnicianId: row.assigned_technician_id ?? null,
+    assignedTechnicianName: row.assignee_first_name ? `${row.assignee_first_name} ${row.assignee_last_name}` : null,
+    assignmentStatus: row.assignment_status ?? 'UNASSIGNED',
+    cycle: row.cycle ?? 1,
     installation: {
       gasType: row.gas_type,
       kit: row.kit,
@@ -142,6 +155,8 @@ const baseSelect = () =>
       'closer.last_name as closer_last_name',
       'reopener.first_name as reopener_first_name',
       'reopener.last_name as reopener_last_name',
+      'assignee.first_name as assignee_first_name',
+      'assignee.last_name as assignee_last_name',
     )
     .join('customers', 'customers.id', 'jobs.customer_id')
     .join('vehicles', 'vehicles.id', 'jobs.vehicle_id')
@@ -149,7 +164,8 @@ const baseSelect = () =>
     .join('users as creator', 'creator.id', 'jobs.created_by')
     .leftJoin('users as canceller', 'canceller.id', 'jobs.cancelled_by')
     .leftJoin('users as closer', 'closer.id', 'jobs.closed_by')
-    .leftJoin('users as reopener', 'reopener.id', 'jobs.reopened_by');
+    .leftJoin('users as reopener', 'reopener.id', 'jobs.reopened_by')
+    .leftJoin('users as assignee', 'assignee.id', 'jobs.assigned_technician_id');
 
 // ---------------------------------------------------------------------------
 // Queries (branch-scoped per loyiha.md §11 via jobsBranchScope)

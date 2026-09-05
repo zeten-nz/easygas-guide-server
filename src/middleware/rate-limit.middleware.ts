@@ -1,8 +1,21 @@
 import type { NextFunction, Request, Response } from 'express';
 import { getRedis } from '../redis/redis';
+import { isProduction } from '../config/env';
 import { hmacSecret } from '../utils/crypto';
 import { normalizePhone } from '../utils/phone';
 import { logger } from '../utils/logger';
+
+/**
+ * Test-only escape hatch for the reproducible browser E2E harness
+ * (server: `npm run test:e2e:serve`), which logs the SAME demo user in across
+ * many Playwright tests and re-runs and would otherwise trip the abuse limiters.
+ * STRICTLY guarded: it can NEVER be active in production, and it is read
+ * per-request so it only applies while the harness sets it. The real limiters are
+ * still exercised by tests/ratelimit.e2e (which never sets this flag).
+ */
+function rateLimitBypassedForE2E(): boolean {
+  return !isProduction && process.env.E2E_DISABLE_RATE_LIMIT === '1';
+}
 
 /**
  * Phase 10C shared rate limiting.
@@ -61,6 +74,10 @@ function reject(res: Response, ttlMs: number, limit: number): void {
 
 export function createRateLimiter(opts: LimiterOptions) {
   return async function rateLimiter(req: Request, res: Response, next: NextFunction): Promise<void> {
+    if (rateLimitBypassedForE2E()) {
+      next();
+      return;
+    }
     const dim = opts.key(req);
     if (dim === null) {
       next();

@@ -110,6 +110,28 @@ export async function listMyJobs(actor: AuthUser, opts: { page?: number; pageSiz
 }
 
 /**
+ * Branch-scoped eligible assignment candidates (ACTIVE USTA/MASTER in the job's
+ * branch). Needed so a `jobs.assign` holder can pick a technician WITHOUT the
+ * broad `users.view` permission. Never exposes cross-branch users or PII beyond
+ * name/role.
+ */
+export async function listCandidates(actor: AuthUser, jobId: number): Promise<Array<{ id: number; name: string; role: string }>> {
+  if (!can(actor.role, 'jobs.assign')) throw ApiError.forbidden();
+  const scope = jobsBranchScope(actor);
+  const job = await db('jobs').where({ id: jobId }).first();
+  if (!job || (scope !== null && job.branch_id !== scope)) throw ApiError.notFound('Ish topilmadi');
+  const rows = await db('users')
+    .join('roles', 'roles.id', 'users.role_id')
+    .where('users.branch_id', job.branch_id)
+    .where('users.status', 'ACTIVE')
+    .whereNull('users.deleted_at')
+    .whereIn('roles.code', ASSIGNABLE_ROLES as unknown as string[])
+    .orderBy(['users.first_name', 'users.last_name'])
+    .select('users.id', 'users.first_name', 'users.last_name', 'roles.code as role');
+  return rows.map((r: Record<string, any>) => ({ id: r.id, name: `${r.first_name} ${r.last_name}`, role: r.role }));
+}
+
+/**
  * Execution guard (test 13): who may perform restricted checklist work on a job.
  * The assigned technician may; a supervisor (MASTER) may; when the job is
  * unassigned/legacy, any same-branch checklist.execute holder may (back-compat).
