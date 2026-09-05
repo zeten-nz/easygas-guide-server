@@ -67,6 +67,10 @@ jobsRouter.get('/:id/assignment', requirePermission('jobs.view'), validate({ par
   res.json({ history: await assignmentService.getAssignmentHistory(req.user!, Number(req.params.id)) });
 });
 
+jobsRouter.get('/:id/assignment/candidates', requirePermission('jobs.assign'), validate({ params: jobIdParamsSchema }), async (req: Request, res: Response) => {
+  res.json({ candidates: await assignmentService.listCandidates(req.user!, Number(req.params.id)) });
+});
+
 jobsRouter.post('/:id/assign', requirePermission('jobs.assign'), validate({ params: jobIdParamsSchema, body: assignBody }), async (req: Request, res: Response) => {
   await assignmentService.reassign(req.user!, Number(req.params.id), req.body.technicianId, req.body.reason, requestMeta(req));
   res.json({ message: 'Texnik biriktirildi' });
