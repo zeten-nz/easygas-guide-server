@@ -7,6 +7,7 @@ import { logger } from '../utils/logger';
 import { getSmsProvider, smsCapability } from './index';
 import { SmsSendError } from './sms.provider';
 import { smsAad, type SmsOutboxRow } from './outbox.service';
+import { smsWorkerOutcomesTotal } from '../observability/metrics';
 
 /**
  * Phase 10C durable SMS worker.
@@ -85,6 +86,7 @@ async function deliver(row: SmsOutboxRow): Promise<void> {
   if (new Date(row.not_after).getTime() <= Date.now()) {
     await markTerminal(row.id, { status: 'CANCELLED', last_error: 'EXPIRED_BEFORE_SEND', failed_at: db.fn.now() });
     logger.info({ outboxId: row.id, type: row.type }, 'SMS cancelled: expired before send');
+    smsWorkerOutcomesTotal.inc({ outcome: 'expired' });
     return;
   }
 
@@ -99,6 +101,7 @@ async function deliver(row: SmsOutboxRow): Promise<void> {
     // data, and do not retry indefinitely. Redacted operator event (no body).
     await markTerminal(row.id, { status: 'FAILED', attempts, last_error: 'PAYLOAD_DECRYPT', failed_at: db.fn.now() });
     logger.error({ outboxId: row.id, type: row.type }, 'SMS decrypt failed — quarantined FAILED(PAYLOAD_DECRYPT) for manual review');
+    smsWorkerOutcomesTotal.inc({ outcome: 'decrypt_failed' });
     return;
   }
 
@@ -114,6 +117,7 @@ async function deliver(row: SmsOutboxRow): Promise<void> {
       sent_at: db.fn.now(),
     });
     logger.info({ outboxId: row.id, type: row.type, provider: provider.name, outcome: result.outcome }, 'SMS accepted by provider');
+    smsWorkerOutcomesTotal.inc({ outcome: result.outcome === 'DELIVERED' ? 'delivered' : 'sent' });
   } catch (err) {
     const kind = err instanceof SmsSendError ? err.kind : 'RETRYABLE';
     const code = err instanceof SmsSendError ? err.code : 'SEND_ERROR';
@@ -122,11 +126,13 @@ async function deliver(row: SmsOutboxRow): Promise<void> {
       // duplicate OTP). Record for operator reconciliation.
       await markTerminal(row.id, { status: 'FAILED', attempts, last_error: `AMBIGUOUS:${code}`.slice(0, 60), failed_at: db.fn.now() });
       logger.warn({ outboxId: row.id, code }, 'SMS ambiguous timeout — recorded for reconciliation, not retried');
+      smsWorkerOutcomesTotal.inc({ outcome: 'ambiguous' });
       return;
     }
     if (kind === 'PERMANENT' || attempts >= row.max_attempts) {
       await markTerminal(row.id, { status: 'FAILED', attempts, last_error: `${kind}:${code}`.slice(0, 60), failed_at: db.fn.now() });
       logger.warn({ outboxId: row.id, kind, code, attempts }, 'SMS permanently failed');
+      smsWorkerOutcomesTotal.inc({ outcome: 'permanent_failed' });
       return;
     }
     // Retryable + attempts remain → schedule with backoff (DB clock).
@@ -140,6 +146,7 @@ async function deliver(row: SmsOutboxRow): Promise<void> {
       updated_at: db.fn.now(),
     });
     logger.info({ outboxId: row.id, attempts, code }, 'SMS retry scheduled');
+    smsWorkerOutcomesTotal.inc({ outcome: 'retry_scheduled' });
   }
 }
 

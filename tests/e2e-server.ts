@@ -28,6 +28,9 @@ import { createApp } from '../src/app';
 import { setSmsProviderForTesting } from '../src/sms';
 import { setStorageProviderForTesting } from '../src/storage';
 import { MemoryStorageProvider } from './helpers/memory-storage';
+import { createTemplate, addStep, publishVersion, listAssignableTemplates } from '../src/modules/checklist/templates.service';
+import { ROLE_PERMISSIONS } from '../src/rbac/permissions';
+import type { AuthUser } from '../src/types/auth';
 
 const PORT = Number(process.env.E2E_API_PORT ?? 4000);
 
@@ -48,6 +51,41 @@ async function ensureActivePolicy(): Promise<void> {
     approved_at: db.raw('CURRENT_TIMESTAMP(6)'),
     rationale: 'E2E harness — provisional v1 activated for browser tests only',
   });
+}
+
+/**
+ * Seeds one PUBLISHED checklist template (via the real validated template
+ * service, as an ADMIN actor) so the browser can drive checklist assignment.
+ * Simple steps (no required photos / measurements / STOP) keep the happy-path
+ * deterministic. Best-effort: never blocks API startup.
+ */
+async function ensurePublishedTemplate(): Promise<void> {
+  try {
+    if ((await listAssignableTemplates()).some((t) => t.name === 'E2E Checklist')) return;
+    const adminRow = await db('users').join('roles', 'roles.id', 'users.role_id').where('roles.code', 'ADMIN').whereNull('users.deleted_at').select('users.*').first();
+    if (!adminRow) return;
+    const actor: AuthUser = {
+      id: adminRow.id,
+      firstName: adminRow.first_name,
+      lastName: adminRow.last_name,
+      phone: adminRow.phone,
+      region: adminRow.region,
+      branchId: adminRow.branch_id ?? null,
+      role: 'ADMIN',
+      status: 'ACTIVE',
+      avatarUrl: null,
+      permissions: ROLE_PERMISSIONS.ADMIN,
+    };
+    const meta = { ip: null, userAgent: null };
+    const tpl = await createTemplate(actor, { name: 'E2E Checklist', description: 'Deterministic template for browser E2E' }, meta);
+    const versionId = tpl.versions[0].id;
+    await addStep(actor, tpl.id, versionId, { name: 'E2E Step One', isStop: false, riskWeight: 0, requiredPhotos: 0, measurements: [] }, meta);
+    await addStep(actor, tpl.id, versionId, { name: 'E2E Step Two', isStop: false, riskWeight: 0, requiredPhotos: 0, measurements: [] }, meta);
+    await publishVersion(actor, tpl.id, versionId, meta);
+    console.log('[e2e-server] seeded published "E2E Checklist" template');
+  } catch (err) {
+    console.warn('[e2e-server] template seed skipped:', err instanceof Error ? err.message : err);
+  }
 }
 
 /**
@@ -99,6 +137,7 @@ async function main(): Promise<void> {
   });
   setStorageProviderForTesting(new MemoryStorageProvider());
   await ensureActivePolicy();
+  await ensurePublishedTemplate();
   await ensureSeedJob();
 
   const app = createApp();

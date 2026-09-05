@@ -4,6 +4,7 @@ import { isProduction } from '../config/env';
 import { hmacSecret } from '../utils/crypto';
 import { normalizePhone } from '../utils/phone';
 import { logger } from '../utils/logger';
+import { rateLimitRejectionsTotal } from '../observability/metrics';
 
 /**
  * Test-only escape hatch for the reproducible browser E2E harness
@@ -92,6 +93,7 @@ export function createRateLimiter(opts: LimiterOptions) {
       // into the request pipeline (that would 500 every request).
       if (opts.failMode === 'closed') {
         logger.error({ limiter: opts.name, err: (err as Error)?.message }, 'Rate limiter Redis error — failing CLOSED');
+        rateLimitRejectionsTotal.inc({ limiter: opts.name, mode: 'redis_closed' });
         reject(res, opts.windowMs, opts.limit);
         return;
       }
@@ -100,6 +102,7 @@ export function createRateLimiter(opts: LimiterOptions) {
       return;
     }
     if (result.count > opts.limit) {
+      rateLimitRejectionsTotal.inc({ limiter: opts.name, mode: 'over_limit' });
       reject(res, result.ttlMs, opts.limit);
       return;
     }

@@ -1,0 +1,15 @@
+{
+  "_comment": "Phase 10F release attestations. Copy to release-attestation.json (git-ignored) and fill in for a real release. Each item must be explicitly attested with WHO and WHEN. These are human/operational confirmations the release gate cannot verify by itself. They do NOT bypass the LIVE safety blockers (SMS provider, approved risk matrix) — those are checked against the running system and cannot be waived.",
+  "attestations": {
+    "ci_all_green": { "attested": false, "by": "", "at": "" },
+    "db_migrations_verified": { "attested": false, "by": "", "at": "" },
+    "test_restore_succeeded": { "attested": false, "by": "", "at": "" },
+    "prod_npm_audit_meets_policy": { "attested": false, "by": "", "at": "" },
+    "fullstack_playwright_passed": { "attested": false, "by": "", "at": "" },
+    "backup_configured_and_restore_tested": { "attested": false, "by": "", "at": "" },
+    "nginx_firewall_trustproxy_verified": { "attested": false, "by": "", "at": "" },
+    "production_secrets_distinct_strong": { "attested": false, "by": "", "at": "" },
+    "monitoring_alerts_configured": { "attested": false, "by": "", "at": "" },
+    "manual_smoke_signed_off": { "attested": false, "by": "", "at": "" }
+  }
+}

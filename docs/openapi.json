@@ -1,0 +1,7103 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "EASY GAS API",
+    "version": "1.0.0",
+    "description": "Safety-critical CNG/LPG installation checklist system.\n\nThe server is the single source of authority for RBAC, branch scoping, and\nthe risk policy. Clients never compute risk scores, blocking status,\ncompletion readiness, or content digests — every such value in a response is\nserver-computed and authoritative; the UI only renders it.\n\n## Authentication\nSession auth via an HttpOnly cookie named `eg_session`. Sign in with\n`POST /auth/login`; the session cookie is set on the response.\n\n## CSRF model\nState-changing requests (POST/PATCH/DELETE) that carry the session cookie\nMUST send the request header `x-csrf-token`, whose value equals\n`HMAC-SHA256(APP_KEY, \"csrf:\" + <raw session cookie>)`. Origin is also\nchecked. On failure the API returns 403 with code `CSRF_TOKEN` or\n`CSRF_ORIGIN`. Authenticated responses (and `POST /auth/login` and\n`GET /auth/me`) return the current token in the `x-csrf-token` response\nheader plus a monotonic `x-session-rotation` sequence; clients should adopt\nthe latest values on every response.\n\n## Pagination — two envelope shapes (NOT unified)\na) Classic CRUD lists return `{ <resourceKey>, total, page, limit }` where\n   `resourceKey` is one of `jobs`, `users`, `vehicles`, `customers`.\nb) Safety / assignment lists return `{ items, total, page, pageSize }`\n   (risks, GPS, my-jobs). GPS returns `{ items, total }` only.\n\n## Risk policy (fail-closed)\nRisk scoring depends on an ACTIVE risk matrix. When none is active the\nsafety domain fails CLOSED: raising a risk, starting a job, and completing a\njob return 409 `RISK_POLICY_NOT_APPROVED` until a matrix is activated."
+  },
+  "servers": [
+    {
+      "url": "/api/v1",
+      "description": "API base path"
+    }
+  ],
+  "security": [
+    {
+      "cookieAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "Health",
+      "description": "Liveness and readiness probes."
+    },
+    {
+      "name": "Auth",
+      "description": "Session login/logout, self-registration, password reset."
+    },
+    {
+      "name": "Users",
+      "description": "User administration."
+    },
+    {
+      "name": "Registration",
+      "description": "Review of self-registration requests."
+    },
+    {
+      "name": "Branches",
+      "description": "Branch (filial) management."
+    },
+    {
+      "name": "Customers",
+      "description": "Global customer registry."
+    },
+    {
+      "name": "Vehicles",
+      "description": "Global vehicle registry."
+    },
+    {
+      "name": "Jobs",
+      "description": "Installation jobs (branch-scoped)."
+    },
+    {
+      "name": "Assignment",
+      "description": "Technician assignment of jobs."
+    },
+    {
+      "name": "Checklist",
+      "description": "Per-job checklist execution."
+    },
+    {
+      "name": "STOP",
+      "description": "STOP-step approval workflow."
+    },
+    {
+      "name": "Photos/Evidence",
+      "description": "Immutable step photo evidence."
+    },
+    {
+      "name": "Risk",
+      "description": "Job risk register (server-scored)."
+    },
+    {
+      "name": "GPS",
+      "description": "GPS evidence capture (server-validated)."
+    },
+    {
+      "name": "Completion",
+      "description": "Signature, readiness, and job completion."
+    },
+    {
+      "name": "Quality",
+      "description": "Quality-review confirmation."
+    },
+    {
+      "name": "Templates",
+      "description": "Checklist template authoring."
+    },
+    {
+      "name": "RiskPolicy",
+      "description": "Risk-matrix governance."
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "operationId": "healthCheck",
+        "summary": "Liveness probe",
+        "description": "Public. Returns a static liveness marker.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Service is alive.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "const": "ok"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "operationId": "readinessCheck",
+        "summary": "Readiness probe",
+        "description": "Public. Aggregates dependency checks; returns 503 when the instance should not receive traffic (including during graceful shutdown or when no risk matrix is active).",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Ready to receive traffic.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Readiness"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Not ready (a dependency failed or the instance is shutting down).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Readiness"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/login": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "operationId": "authLogin",
+        "summary": "Log in",
+        "description": "Public. Sets the `eg_session` cookie and returns the CSRF token and rotation sequence.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "phone",
+                  "password"
+                ],
+                "properties": {
+                  "phone": {
+                    "type": "string",
+                    "example": "+998900000000"
+                  },
+                  "password": {
+                    "type": "string",
+                    "format": "password",
+                    "example": "demo-password"
+                  },
+                  "rememberMe": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Authenticated.",
+            "headers": {
+              "x-csrf-token": {
+                "$ref": "#/components/headers/XCsrfToken"
+              },
+              "x-session-rotation": {
+                "$ref": "#/components/headers/XSessionRotation"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthSession"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "operationId": "authLogout",
+        "summary": "Log out",
+        "description": "Clears the current session cookie.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Session cleared."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/auth/me": {
+      "get": {
+        "tags": [
+          "Auth"
+        ],
+        "operationId": "authMe",
+        "summary": "Current session",
+        "description": "Returns the authenticated user, current CSRF token, and rotation sequence.",
+        "responses": {
+          "200": {
+            "description": "Current user.",
+            "headers": {
+              "x-csrf-token": {
+                "$ref": "#/components/headers/XCsrfToken"
+              },
+              "x-session-rotation": {
+                "$ref": "#/components/headers/XSessionRotation"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthSession"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/auth/register": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "operationId": "authRegister",
+        "summary": "Submit a self-registration request",
+        "description": "Public. Creates a PENDING registration request for admin review.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "firstName",
+                  "lastName",
+                  "phone",
+                  "region",
+                  "branchId",
+                  "password"
+                ],
+                "properties": {
+                  "firstName": {
+                    "type": "string",
+                    "example": "Demo"
+                  },
+                  "lastName": {
+                    "type": "string",
+                    "example": "Demo"
+                  },
+                  "phone": {
+                    "type": "string",
+                    "example": "+998900000000"
+                  },
+                  "region": {
+                    "type": "string",
+                    "example": "Toshkent"
+                  },
+                  "branchId": {
+                    "type": "integer",
+                    "example": 1
+                  },
+                  "comment": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string",
+                    "format": "password"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Registration request submitted."
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/auth/forgot-password": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "operationId": "authForgotPassword",
+        "summary": "Request a password-reset OTP",
+        "description": "Public. Sends a one-time password by SMS. Always responds success to avoid account enumeration.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "phone"
+                ],
+                "properties": {
+                  "phone": {
+                    "type": "string",
+                    "example": "+998900000000"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OTP dispatched if the account exists."
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/auth/verify-otp": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "operationId": "authVerifyOtp",
+        "summary": "Verify a reset OTP",
+        "description": "Public. Exchanges a valid 6-digit OTP for a single-use reset token.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "phone",
+                  "otp"
+                ],
+                "properties": {
+                  "phone": {
+                    "type": "string",
+                    "example": "+998900000000"
+                  },
+                  "otp": {
+                    "type": "string",
+                    "pattern": "^[0-9]{6}$",
+                    "example": "000000"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OTP accepted; reset token returned.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "resetToken": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "resetToken"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/auth/reset-password": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "operationId": "authResetPassword",
+        "summary": "Reset password",
+        "description": "Public. Sets a new password using a single-use reset token.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "resetToken",
+                  "password"
+                ],
+                "properties": {
+                  "resetToken": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "password": {
+                    "type": "string",
+                    "format": "password"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Password updated."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          }
+        }
+      }
+    },
+    "/users": {
+      "get": {
+        "tags": [
+          "Users"
+        ],
+        "operationId": "usersList",
+        "summary": "List users",
+        "description": "Requires permission: users.view. Branch-scoped for non-admin roles.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SearchQuery"
+          },
+          {
+            "name": "role",
+            "in": "query",
+            "schema": {
+              "$ref": "#/components/schemas/RoleCode"
+            }
+          },
+          {
+            "name": "branchId",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "schema": {
+              "$ref": "#/components/schemas/UserStatus"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/PageQuery"
+          },
+          {
+            "$ref": "#/components/parameters/LimitQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Classic paginated user list.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsersListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Users"
+        ],
+        "operationId": "usersCreate",
+        "summary": "Create user",
+        "description": "Requires permission: users.create.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "firstName",
+                  "lastName",
+                  "phone",
+                  "region",
+                  "role",
+                  "password"
+                ],
+                "properties": {
+                  "firstName": {
+                    "type": "string",
+                    "example": "Demo"
+                  },
+                  "lastName": {
+                    "type": "string",
+                    "example": "Demo"
+                  },
+                  "phone": {
+                    "type": "string",
+                    "example": "+998900000000"
+                  },
+                  "region": {
+                    "type": "string",
+                    "example": "Toshkent"
+                  },
+                  "role": {
+                    "$ref": "#/components/schemas/RoleCode"
+                  },
+                  "branchId": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "password": {
+                    "type": "string",
+                    "format": "password"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "User created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/users/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Users"
+        ],
+        "operationId": "usersGet",
+        "summary": "Get user",
+        "description": "Requires permission: users.view.",
+        "responses": {
+          "200": {
+            "description": "User detail.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "Users"
+        ],
+        "operationId": "usersUpdate",
+        "summary": "Update user",
+        "description": "Requires permission: users.update.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "firstName": {
+                    "type": "string"
+                  },
+                  "lastName": {
+                    "type": "string"
+                  },
+                  "phone": {
+                    "type": "string"
+                  },
+                  "region": {
+                    "type": "string"
+                  },
+                  "role": {
+                    "$ref": "#/components/schemas/RoleCode"
+                  },
+                  "branchId": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "User updated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/users/{id}/block": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Users"
+        ],
+        "operationId": "usersBlock",
+        "summary": "Block user",
+        "description": "Requires permission: users.block.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "User blocked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/users/{id}/unblock": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Users"
+        ],
+        "operationId": "usersUnblock",
+        "summary": "Unblock user",
+        "description": "Requires permission: users.block.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "User unblocked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/admin/registration-requests": {
+      "get": {
+        "tags": [
+          "Registration"
+        ],
+        "operationId": "registrationList",
+        "summary": "List registration requests",
+        "description": "Requires permission: registration.review.",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "schema": {
+              "$ref": "#/components/schemas/RegistrationStatus"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Registration requests.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "requests": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/RegistrationRequest"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/admin/registration-requests/{id}/approve": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Registration"
+        ],
+        "operationId": "registrationApprove",
+        "summary": "Approve a registration request",
+        "description": "Requires permission: registration.review. Creates the user account.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "roleCode": {
+                    "$ref": "#/components/schemas/RoleCode"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Request approved; user created."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/admin/registration-requests/{id}/reject": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Registration"
+        ],
+        "operationId": "registrationReject",
+        "summary": "Reject a registration request",
+        "description": "Requires permission: registration.review.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "reason"
+                ],
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "minLength": 3,
+                    "maxLength": 500
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Request rejected."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/branches": {
+      "get": {
+        "tags": [
+          "Branches"
+        ],
+        "operationId": "branchesList",
+        "summary": "List branches",
+        "description": "Optional auth: unauthenticated callers get the minimal public shape (registration picker); authenticated callers with branches.manage get the full administrative shape.",
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {}
+        ],
+        "responses": {
+          "200": {
+            "description": "Branches (shape adapts to caller).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "branches": {
+                      "type": "array",
+                      "items": {
+                        "oneOf": [
+                          {
+                            "$ref": "#/components/schemas/Branch"
+                          },
+                          {
+                            "$ref": "#/components/schemas/BranchFull"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Branches"
+        ],
+        "operationId": "branchesCreate",
+        "summary": "Create branch",
+        "description": "Requires permission: branches.manage.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "region"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "region": {
+                    "type": "string"
+                  },
+                  "address": {
+                    "type": "string"
+                  },
+                  "phone": {
+                    "type": "string",
+                    "example": "+998900000000"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Branch created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchFull"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/branches/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Branches"
+        ],
+        "operationId": "branchesGet",
+        "summary": "Get branch",
+        "description": "Requires permission: branches.manage.",
+        "responses": {
+          "200": {
+            "description": "Branch detail.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchFull"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "Branches"
+        ],
+        "operationId": "branchesUpdate",
+        "summary": "Update branch",
+        "description": "Requires permission: branches.manage.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "region": {
+                    "type": "string"
+                  },
+                  "address": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "phone": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Branch updated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchFull"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/branches/{id}/activate": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Branches"
+        ],
+        "operationId": "branchesActivate",
+        "summary": "Activate branch",
+        "description": "Requires permission: branches.manage.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Branch activated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchFull"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/branches/{id}/deactivate": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Branches"
+        ],
+        "operationId": "branchesDeactivate",
+        "summary": "Deactivate branch",
+        "description": "Requires permission: branches.manage.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Branch deactivated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchFull"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/customers": {
+      "get": {
+        "tags": [
+          "Customers"
+        ],
+        "operationId": "customersList",
+        "summary": "List customers",
+        "description": "Requires permission: customers.view. Global registry (not branch-scoped).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SearchQuery"
+          },
+          {
+            "$ref": "#/components/parameters/PageQuery"
+          },
+          {
+            "$ref": "#/components/parameters/LimitQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Classic paginated customer list.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomersListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Customers"
+        ],
+        "operationId": "customersCreate",
+        "summary": "Create customer",
+        "description": "Requires permission: customers.manage.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "phone"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "example": "Demo"
+                  },
+                  "phone": {
+                    "type": "string",
+                    "example": "+998900000000"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Customer created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Customer"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/customers/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Customers"
+        ],
+        "operationId": "customersGet",
+        "summary": "Get customer",
+        "description": "Requires permission: customers.view.",
+        "responses": {
+          "200": {
+            "description": "Customer detail.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Customer"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "Customers"
+        ],
+        "operationId": "customersUpdate",
+        "summary": "Update customer",
+        "description": "Requires permission: customers.manage.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "phone": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Customer updated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Customer"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/customers/{id}/vehicles": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Customers"
+        ],
+        "operationId": "customersVehicles",
+        "summary": "List a customer's vehicles",
+        "description": "Requires permissions: customers.view and vehicles.view.",
+        "responses": {
+          "200": {
+            "description": "The customer's vehicles.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "vehicles": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Vehicle"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/vehicles": {
+      "get": {
+        "tags": [
+          "Vehicles"
+        ],
+        "operationId": "vehiclesList",
+        "summary": "List vehicles",
+        "description": "Requires permission: vehicles.view. Global registry (not branch-scoped).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SearchQuery"
+          },
+          {
+            "name": "customerId",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/PageQuery"
+          },
+          {
+            "$ref": "#/components/parameters/LimitQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Classic paginated vehicle list.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VehiclesListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Vehicles"
+        ],
+        "operationId": "vehiclesCreate",
+        "summary": "Create vehicle",
+        "description": "Requires permission: vehicles.manage.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "customerId",
+                  "plateNumber",
+                  "make",
+                  "model"
+                ],
+                "properties": {
+                  "customerId": {
+                    "type": "integer",
+                    "example": 1
+                  },
+                  "plateNumber": {
+                    "type": "string",
+                    "example": "01A000AA"
+                  },
+                  "vin": {
+                    "type": "string"
+                  },
+                  "make": {
+                    "type": "string",
+                    "example": "Chevrolet"
+                  },
+                  "model": {
+                    "type": "string",
+                    "example": "Cobalt"
+                  },
+                  "year": {
+                    "type": "integer",
+                    "example": 2020
+                  },
+                  "engine": {
+                    "type": "string"
+                  },
+                  "mileage": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Vehicle created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Vehicle"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/vehicles/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Vehicles"
+        ],
+        "operationId": "vehiclesGet",
+        "summary": "Get vehicle",
+        "description": "Requires permission: vehicles.view.",
+        "responses": {
+          "200": {
+            "description": "Vehicle detail.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Vehicle"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "Vehicles"
+        ],
+        "operationId": "vehiclesUpdate",
+        "summary": "Update vehicle",
+        "description": "Requires permission: vehicles.manage.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "plateNumber": {
+                    "type": "string"
+                  },
+                  "vin": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "make": {
+                    "type": "string"
+                  },
+                  "model": {
+                    "type": "string"
+                  },
+                  "year": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "engine": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "mileage": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Vehicle updated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Vehicle"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/jobs": {
+      "get": {
+        "tags": [
+          "Jobs"
+        ],
+        "operationId": "jobsList",
+        "summary": "List jobs",
+        "description": "Requires permission: jobs.view. Branch-scoped unless the caller has services.view_all.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SearchQuery"
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "schema": {
+              "$ref": "#/components/schemas/JobStatus"
+            }
+          },
+          {
+            "name": "branchId",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/PageQuery"
+          },
+          {
+            "$ref": "#/components/parameters/LimitQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Classic paginated job list.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobsListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Jobs"
+        ],
+        "operationId": "jobsCreate",
+        "summary": "Create job",
+        "description": "Requires permission: jobs.create. Opens a DRAFT job for a customer vehicle.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "customerId",
+                  "vehicleId"
+                ],
+                "properties": {
+                  "customerId": {
+                    "type": "integer",
+                    "example": 1
+                  },
+                  "vehicleId": {
+                    "type": "integer",
+                    "example": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Job created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "job": {
+                      "$ref": "#/components/schemas/Job"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/jobs/mine": {
+      "get": {
+        "tags": [
+          "Assignment"
+        ],
+        "operationId": "jobsMine",
+        "summary": "List my assigned jobs",
+        "description": "Requires permission: jobs.view. Returns the jobs assigned to the calling technician.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PageQuery"
+          },
+          {
+            "$ref": "#/components/parameters/PageSizeQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Items-envelope paginated job list.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MyJobsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/jobs/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Jobs"
+        ],
+        "operationId": "jobsGet",
+        "summary": "Get job",
+        "description": "Requires permission: jobs.view.",
+        "responses": {
+          "200": {
+            "description": "Job detail.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "job": {
+                      "$ref": "#/components/schemas/Job"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/jobs/{id}/assignment": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Assignment"
+        ],
+        "operationId": "jobsAssignmentHistory",
+        "summary": "Get assignment history",
+        "description": "Requires permission: jobs.view.",
+        "responses": {
+          "200": {
+            "description": "Assignment history.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "history": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/AssignmentHistoryItem"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/jobs/{id}/assignment/candidates": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Assignment"
+        ],
+        "operationId": "jobsAssignmentCandidates",
+        "summary": "List assignable technicians",
+        "description": "Requires permission: jobs.assign.",
+        "responses": {
+          "200": {
+            "description": "Candidate technicians.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "candidates": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/AssignmentCandidate"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/jobs/{id}/assign": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Assignment"
+        ],
+        "operationId": "jobsAssign",
+        "summary": "Assign technician",
+        "description": "Requires permission: jobs.assign.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "technicianId"
+                ],
+                "properties": {
+                  "technicianId": {
+                    "type": "integer",
+                    "example": 1
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Technician assigned."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/jobs/{id}/unassign": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Assignment"
+        ],
+        "operationId": "jobsUnassign",
+        "summary": "Unassign technician",
+        "description": "Requires permission: jobs.assign.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "reason": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Technician unassigned."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/jobs/{id}/start": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Jobs"
+        ],
+        "operationId": "jobsStart",
+        "summary": "Start job",
+        "description": "Requires permission: jobs.create. Moves the job to IN_PROGRESS. Fails closed with 409 RISK_POLICY_NOT_APPROVED if no risk matrix is active.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job started.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "job": {
+                      "$ref": "#/components/schemas/Job"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/jobs/{id}/installation": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "patch": {
+        "tags": [
+          "Jobs"
+        ],
+        "operationId": "jobsUpdateInstallation",
+        "summary": "Update installation details",
+        "description": "Requires permission: jobs.create.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "gasType": {
+                    "$ref": "#/components/schemas/GasType"
+                  },
+                  "kit": {
+                    "type": "string"
+                  },
+                  "ecu": {
+                    "type": "string"
+                  },
+                  "cylinder": {
+                    "type": "string"
+                  },
+                  "note": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Installation updated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "job": {
+                      "$ref": "#/components/schemas/Job"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/jobs/{id}/completion": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Completion"
+        ],
+        "operationId": "jobsGetCompletion",
+        "summary": "Get completion readiness",
+        "description": "Requires permission: jobs.view. Returns server-computed readiness, signature metadata, and job status.",
+        "responses": {
+          "200": {
+            "description": "Completion readiness.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "readiness": {
+                      "$ref": "#/components/schemas/CompletionReadiness"
+                    },
+                    "signature": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/SignatureDetail"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "jobStatus": {
+                      "$ref": "#/components/schemas/JobStatus"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/jobs/{id}/signature": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Completion"
+        ],
+        "operationId": "jobsUploadSignature",
+        "summary": "Upload customer signature",
+        "description": "Requires permission: checklist.execute. Accepts the signature image. Optionally send `summaryDigest` to bind the signature to the exact signable summary the customer reviewed (mismatch returns 409 SUMMARY_STALE).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "signature"
+                ],
+                "properties": {
+                  "signature": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Signature image (png)."
+                  },
+                  "summaryDigest": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Signature stored.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignatureDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/jobs/{id}/signable-summary": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Completion"
+        ],
+        "operationId": "jobsGetSignableSummary",
+        "summary": "Get signable summary",
+        "description": "Requires permission: jobs.view. Returns the server-built material summary (with its digest) that the customer reviews before signing.",
+        "responses": {
+          "200": {
+            "description": "Signable summary.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignableSummary"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/jobs/{id}/completion-snapshot": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Completion"
+        ],
+        "operationId": "jobsGetCompletionSnapshot",
+        "summary": "Get completion snapshot",
+        "description": "Requires permission: jobs.view. Returns the immutable completion snapshot for a cycle (defaults to the latest).",
+        "parameters": [
+          {
+            "name": "cycle",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Completion snapshot.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompletionSnapshot"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/jobs/{id}/signature/file": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Completion"
+        ],
+        "operationId": "jobsGetSignatureFile",
+        "summary": "Download signature image",
+        "description": "Requires permission: jobs.view. Streams the stored signature image.",
+        "responses": {
+          "200": {
+            "description": "Signature image bytes.",
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/jobs/{id}/complete": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Completion"
+        ],
+        "operationId": "jobsComplete",
+        "summary": "Complete job",
+        "description": "Requires permission: jobs.close. Finalizes the job (moves it to QUALITY_REVIEW/COMPLETED). Rejected unless readiness conditions pass; fails closed with 409 RISK_POLICY_NOT_APPROVED if no risk matrix is active.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job completed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "job": {
+                      "$ref": "#/components/schemas/Job"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/jobs/{id}/reopen": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Jobs"
+        ],
+        "operationId": "jobsReopen",
+        "summary": "Reopen job",
+        "description": "Requires permission: jobs.reopen. Opens a new work cycle.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "reason"
+                ],
+                "properties": {
+                  "reason": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Job reopened.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "job": {
+                      "$ref": "#/components/schemas/Job"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/jobs/{id}/cancel": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Jobs"
+        ],
+        "operationId": "jobsCancel",
+        "summary": "Cancel job",
+        "description": "Requires permission: jobs.create.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "reason"
+                ],
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "minLength": 3,
+                    "maxLength": 500
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Job cancelled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "job": {
+                      "$ref": "#/components/schemas/Job"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/jobs/{jobId}/checklist": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobIdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Checklist"
+        ],
+        "operationId": "checklistGet",
+        "summary": "Get job checklist",
+        "description": "Requires permission: jobs.view.",
+        "responses": {
+          "200": {
+            "description": "The job checklist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "checklist": {
+                      "$ref": "#/components/schemas/JobChecklist"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Checklist"
+        ],
+        "operationId": "checklistAssign",
+        "summary": "Assign a template to the job",
+        "description": "Requires permission: checklist.execute. Instantiates a checklist from a published template version.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "templateId"
+                ],
+                "properties": {
+                  "templateId": {
+                    "type": "integer",
+                    "example": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Checklist assigned.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "checklist": {
+                      "$ref": "#/components/schemas/JobChecklist"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/jobs/{jobId}/checklist/steps/{stepId}/complete": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobIdPath"
+        },
+        {
+          "$ref": "#/components/parameters/StepIdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Checklist"
+        ],
+        "operationId": "checklistCompleteStep",
+        "summary": "Complete a checklist step",
+        "description": "Requires permission: checklist.execute. Submits measurements and an optional note. Out-of-range measurements are rejected with 422 OUT_OF_RANGE.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "measurements"
+                ],
+                "properties": {
+                  "note": {
+                    "type": "string"
+                  },
+                  "measurements": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "measurementId",
+                        "value"
+                      ],
+                      "properties": {
+                        "measurementId": {
+                          "type": "integer"
+                        },
+                        "value": {
+                          "type": "number"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Step completed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "checklist": {
+                      "$ref": "#/components/schemas/JobChecklist"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/jobs/{jobId}/checklist/steps/{stepId}/redo": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobIdPath"
+        },
+        {
+          "$ref": "#/components/parameters/StepIdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Checklist"
+        ],
+        "operationId": "checklistRedoStep",
+        "summary": "Redo a checklist step",
+        "description": "Requires permission: checklist.execute. Reopens a completed step for a new attempt.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Step reopened.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "checklist": {
+                      "$ref": "#/components/schemas/JobChecklist"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/jobs/{jobId}/stop": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobIdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "STOP"
+        ],
+        "operationId": "stopGet",
+        "summary": "List STOP approvals",
+        "description": "Requires permission: jobs.view.",
+        "responses": {
+          "200": {
+            "description": "STOP approvals for the job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "approvals": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/StepStopApproval"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/jobs/{jobId}/stop/approve": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobIdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "STOP"
+        ],
+        "operationId": "stopApprove",
+        "summary": "Approve a STOP step",
+        "description": "Requires permission: stops.approve.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "STOP approved.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "checklist": {
+                      "$ref": "#/components/schemas/JobChecklist"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/jobs/{jobId}/stop/rework": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobIdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "STOP"
+        ],
+        "operationId": "stopRework",
+        "summary": "Send a STOP step back for rework",
+        "description": "Requires permission: checklist.execute.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sent for rework.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "checklist": {
+                      "$ref": "#/components/schemas/JobChecklist"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/jobs/{jobId}/stop/reject": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobIdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "STOP"
+        ],
+        "operationId": "stopReject",
+        "summary": "Reject a STOP step",
+        "description": "Requires permission: stops.approve.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "reason"
+                ],
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "minLength": 3,
+                    "maxLength": 500
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "STOP rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "checklist": {
+                      "$ref": "#/components/schemas/JobChecklist"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/jobs/{jobId}/checklist/steps/{stepId}/photos": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobIdPath"
+        },
+        {
+          "$ref": "#/components/parameters/StepIdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Photos/Evidence"
+        ],
+        "operationId": "photosList",
+        "summary": "List step photos",
+        "description": "Requires permission: jobs.view. Evidence is immutable — there is no delete.",
+        "responses": {
+          "200": {
+            "description": "Photos for the step.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "photos": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/StepPhoto"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Photos/Evidence"
+        ],
+        "operationId": "photosUpload",
+        "summary": "Upload a step photo",
+        "description": "Requires permission: checklist.execute. Accepts image/jpeg, image/png, or image/webp in the `photo` field. Evidence is immutable once stored.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "photo"
+                ],
+                "properties": {
+                  "photo": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "image/jpeg, image/png, or image/webp."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Photo stored.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepPhoto"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/jobs/{jobId}/checklist/steps/{stepId}/photos/{photoId}/file": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobIdPath"
+        },
+        {
+          "$ref": "#/components/parameters/StepIdPath"
+        },
+        {
+          "$ref": "#/components/parameters/PhotoIdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Photos/Evidence"
+        ],
+        "operationId": "photosGetFile",
+        "summary": "Download a step photo",
+        "description": "Requires permission: jobs.view. Streams the stored photo bytes.",
+        "responses": {
+          "200": {
+            "description": "Photo image bytes.",
+            "content": {
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/webp": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/jobs/{jobId}/risks": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobIdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Risk"
+        ],
+        "operationId": "risksList",
+        "summary": "List job risks",
+        "description": "Requires permission: jobs.view.",
+        "parameters": [
+          {
+            "name": "cycle",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/PageQuery"
+          },
+          {
+            "$ref": "#/components/parameters/PageSizeQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Items-envelope paginated risk list.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RiskListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Risk"
+        ],
+        "operationId": "risksCreate",
+        "summary": "Raise a risk",
+        "description": "Requires permission: risks.create. The client sends only the raw hazard inputs; score, level, and blocking status are SERVER-COMPUTED and never accepted from the client. Fails closed with 409 RISK_POLICY_NOT_APPROVED if no risk matrix is active.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "hazard",
+                  "description",
+                  "severity",
+                  "likelihood"
+                ],
+                "properties": {
+                  "hazard": {
+                    "type": "string",
+                    "minLength": 2,
+                    "maxLength": 80
+                  },
+                  "description": {
+                    "type": "string",
+                    "minLength": 3,
+                    "maxLength": 2000
+                  },
+                  "severity": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4
+                  },
+                  "likelihood": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4
+                  },
+                  "jobStepId": {
+                    "type": "integer"
+                  },
+                  "responsibleUserId": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Risk created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "risk": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "id"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/jobs/{jobId}/risks/{riskId}/resolve": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobIdPath"
+        },
+        {
+          "$ref": "#/components/parameters/RiskIdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Risk"
+        ],
+        "operationId": "risksResolve",
+        "summary": "Resolve a risk",
+        "description": "Requires permission: risks.resolve.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "note"
+                ],
+                "properties": {
+                  "note": {
+                    "type": "string",
+                    "minLength": 3,
+                    "maxLength": 2000
+                  },
+                  "mitigation": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Risk resolved."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/jobs/{jobId}/risks/{riskId}/revise": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobIdPath"
+        },
+        {
+          "$ref": "#/components/parameters/RiskIdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Risk"
+        ],
+        "operationId": "risksRevise",
+        "summary": "Revise a risk",
+        "description": "Requires permission: risks.resolve. Re-scores the risk from new severity/likelihood inputs (score/level/blocking are re-computed server-side).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "severity",
+                  "likelihood",
+                  "reason"
+                ],
+                "properties": {
+                  "severity": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4
+                  },
+                  "likelihood": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4
+                  },
+                  "hazard": {
+                    "type": "string",
+                    "minLength": 2,
+                    "maxLength": 80
+                  },
+                  "description": {
+                    "type": "string",
+                    "minLength": 3,
+                    "maxLength": 2000
+                  },
+                  "reason": {
+                    "type": "string",
+                    "minLength": 3,
+                    "maxLength": 500
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Risk revised (new revision created).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "risk": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "id"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/jobs/{jobId}/risks/{riskId}/override": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobIdPath"
+        },
+        {
+          "$ref": "#/components/parameters/RiskIdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Risk"
+        ],
+        "operationId": "risksOverride",
+        "summary": "Override a blocking risk",
+        "description": "Requires permission: risks.override. Authorized override of a blocking risk; reason is mandatory and audited.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "reason"
+                ],
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "minLength": 3,
+                    "maxLength": 500
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Risk overridden."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/jobs/{jobId}/gps": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobIdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "GPS"
+        ],
+        "operationId": "gpsList",
+        "summary": "List GPS events",
+        "description": "Requires permission: jobs.view. Returns `{ items, total }`.",
+        "responses": {
+          "200": {
+            "description": "GPS events for the job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GpsListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "GPS"
+        ],
+        "operationId": "gpsCapture",
+        "summary": "Capture a GPS reading",
+        "description": "Requires permission: checklist.execute. The server re-validates the reading and rejects invalid data with 422 GPS_INVALID; the `details[].code` explains why (NAN_OR_INFINITE, OUT_OF_RANGE, NULL_ISLAND, LOW_ACCURACY, BAD_TIMESTAMP, FUTURE_TIMESTAMP, STALE).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "latitude",
+                  "longitude",
+                  "accuracy",
+                  "clientTimestamp"
+                ],
+                "properties": {
+                  "latitude": {
+                    "type": "number",
+                    "example": 41.311081
+                  },
+                  "longitude": {
+                    "type": "number",
+                    "example": 69.240562
+                  },
+                  "accuracy": {
+                    "type": "number",
+                    "example": 12.5
+                  },
+                  "clientTimestamp": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "purpose": {
+                    "$ref": "#/components/schemas/GpsPurpose"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "GPS reading stored.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "gps": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "id"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/jobs/{jobId}/gps/override": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobIdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "GPS"
+        ],
+        "operationId": "gpsOverride",
+        "summary": "Record a GPS override",
+        "description": "Requires permission: gps.override. Records an authorized override when GPS capture is unavailable; reason is mandatory.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "reason"
+                ],
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "minLength": 3,
+                    "maxLength": 500
+                  },
+                  "purpose": {
+                    "$ref": "#/components/schemas/GpsPurpose"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Override recorded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "gps": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "id"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/jobs/{jobId}/quality": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobIdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Quality"
+        ],
+        "operationId": "qualityGet",
+        "summary": "Get quality timeline",
+        "description": "Requires permission: jobs.reopen. Returns the aggregate quality-review timeline for the job.",
+        "responses": {
+          "200": {
+            "description": "Quality-review aggregate.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/jobs/{jobId}/quality/confirm": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobIdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Quality"
+        ],
+        "operationId": "qualityConfirm",
+        "summary": "Confirm quality review",
+        "description": "Requires permission: jobs.reopen. Moves the job from QUALITY_REVIEW to COMPLETED.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Quality review confirmed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "job": {
+                      "$ref": "#/components/schemas/Job"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/checklist-templates/assignable": {
+      "get": {
+        "tags": [
+          "Templates"
+        ],
+        "operationId": "templatesAssignable",
+        "summary": "List assignable templates",
+        "description": "Requires permission: checklist.execute. Returns templates with a published version that can be assigned to a job.",
+        "responses": {
+          "200": {
+            "description": "Assignable templates.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "templates": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ChecklistTemplate"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/checklist-templates": {
+      "get": {
+        "tags": [
+          "Templates"
+        ],
+        "operationId": "templatesList",
+        "summary": "List templates",
+        "description": "Requires permission: templates.manage.",
+        "responses": {
+          "200": {
+            "description": "Templates.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "templates": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ChecklistTemplate"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Templates"
+        ],
+        "operationId": "templatesCreate",
+        "summary": "Create template",
+        "description": "Requires permission: templates.manage.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Template created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChecklistTemplate"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/checklist-templates/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Templates"
+        ],
+        "operationId": "templatesGet",
+        "summary": "Get template",
+        "description": "Requires permission: templates.manage.",
+        "responses": {
+          "200": {
+            "description": "Template detail.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChecklistTemplate"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/checklist-templates/{id}/versions": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Templates"
+        ],
+        "operationId": "templatesCreateVersion",
+        "summary": "Create a draft version",
+        "description": "Requires permission: templates.manage. Creates a new DRAFT version of the template.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Version created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemplateVersion"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/checklist-templates/{id}/versions/{versionId}/steps": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        },
+        {
+          "$ref": "#/components/parameters/VersionIdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Templates"
+        ],
+        "operationId": "templatesCreateStep",
+        "summary": "Add a step to a version",
+        "description": "Requires permission: templates.manage. Only DRAFT versions are editable.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "isStop",
+                  "riskWeight",
+                  "requiredPhotos"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
+                  "requirements": {
+                    "type": "string"
+                  },
+                  "isStop": {
+                    "type": "boolean"
+                  },
+                  "riskWeight": {
+                    "type": "integer"
+                  },
+                  "requiredPhotos": {
+                    "type": "integer"
+                  },
+                  "measurements": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/MeasurementInput"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Step created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemplateStep"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/checklist-templates/{id}/versions/{versionId}/steps/{stepId}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        },
+        {
+          "$ref": "#/components/parameters/VersionIdPath"
+        },
+        {
+          "$ref": "#/components/parameters/StepIdPath"
+        }
+      ],
+      "patch": {
+        "tags": [
+          "Templates"
+        ],
+        "operationId": "templatesUpdateStep",
+        "summary": "Update a template step",
+        "description": "Requires permission: templates.manage. Only DRAFT versions are editable.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "requirements": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "isStop": {
+                    "type": "boolean"
+                  },
+                  "riskWeight": {
+                    "type": "integer"
+                  },
+                  "requiredPhotos": {
+                    "type": "integer"
+                  },
+                  "measurements": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/MeasurementInput"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Step updated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemplateStep"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Templates"
+        ],
+        "operationId": "templatesDeleteStep",
+        "summary": "Delete a template step",
+        "description": "Requires permission: templates.manage. Only DRAFT versions are editable.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Step deleted."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/checklist-templates/{id}/versions/{versionId}/steps/{stepId}/move": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        },
+        {
+          "$ref": "#/components/parameters/VersionIdPath"
+        },
+        {
+          "$ref": "#/components/parameters/StepIdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Templates"
+        ],
+        "operationId": "templatesMoveStep",
+        "summary": "Reorder a template step",
+        "description": "Requires permission: templates.manage. Moves the step up or down within the version.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "direction"
+                ],
+                "properties": {
+                  "direction": {
+                    "type": "string",
+                    "enum": [
+                      "up",
+                      "down"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Step reordered."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/checklist-templates/{id}/versions/{versionId}/publish": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        },
+        {
+          "$ref": "#/components/parameters/VersionIdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Templates"
+        ],
+        "operationId": "templatesPublishVersion",
+        "summary": "Publish a version",
+        "description": "Requires permission: templates.manage. Publishes a DRAFT version, making it assignable.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Version published.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemplateVersion"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/checklist-templates/{id}/versions/{versionId}/archive": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IdPath"
+        },
+        {
+          "$ref": "#/components/parameters/VersionIdPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "Templates"
+        ],
+        "operationId": "templatesArchiveVersion",
+        "summary": "Archive a version",
+        "description": "Requires permission: templates.manage.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Version archived.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemplateVersion"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/risk-policy": {
+      "get": {
+        "tags": [
+          "RiskPolicy"
+        ],
+        "operationId": "riskPolicyState",
+        "summary": "Get active risk-policy state",
+        "description": "Requires an authenticated session. Reports whether a matrix is active and, if so, its version.",
+        "responses": {
+          "200": {
+            "description": "Risk-policy state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "active": {
+                      "type": "boolean"
+                    },
+                    "version": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "active",
+                    "version"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/risk-policy/versions": {
+      "get": {
+        "tags": [
+          "RiskPolicy"
+        ],
+        "operationId": "riskPolicyVersions",
+        "summary": "List risk-matrix versions",
+        "description": "Requires an authenticated session.",
+        "responses": {
+          "200": {
+            "description": "Matrix versions.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "versions": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/MatrixVersion"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "RiskPolicy"
+        ],
+        "operationId": "riskPolicyCreateVersion",
+        "summary": "Create a risk-matrix version",
+        "description": "Requires permission: risk.matrix.approve. Creates a DRAFT matrix version.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "version",
+                  "definition"
+                ],
+                "properties": {
+                  "version": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 32
+                  },
+                  "definition": {
+                    "$ref": "#/components/schemas/MatrixDefinition"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Matrix version created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MatrixVersion"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/risk-policy/{version}/activate": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/VersionPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "RiskPolicy"
+        ],
+        "operationId": "riskPolicyActivate",
+        "summary": "Activate a risk-matrix version",
+        "description": "Requires permission: risk.matrix.approve. Activates the version (retiring any currently active one). Rationale is mandatory.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "rationale"
+                ],
+                "properties": {
+                  "rationale": {
+                    "type": "string",
+                    "minLength": 3,
+                    "maxLength": 1000
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Version activated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MatrixVersion"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          }
+        }
+      }
+    },
+    "/risk-policy/{version}/retire": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/VersionPath"
+        }
+      ],
+      "post": {
+        "tags": [
+          "RiskPolicy"
+        ],
+        "operationId": "riskPolicyRetire",
+        "summary": "Retire a risk-matrix version",
+        "description": "Requires permission: risk.matrix.approve. Retiring the only ACTIVE matrix leaves the safety domain fail-closed (RISK_POLICY_NOT_APPROVED).",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfTokenHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Version retired.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MatrixVersion"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "cookieAuth": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "eg_session",
+        "description": "HttpOnly session cookie set by POST /auth/login. State-changing requests must also send the x-csrf-token header (see the CSRF model in the API description)."
+      }
+    },
+    "parameters": {
+      "IdPath": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "JobIdPath": {
+        "name": "jobId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "StepIdPath": {
+        "name": "stepId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "RiskIdPath": {
+        "name": "riskId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "PhotoIdPath": {
+        "name": "photoId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "VersionIdPath": {
+        "name": "versionId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "VersionPath": {
+        "name": "version",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        },
+        "description": "Risk-matrix version identifier."
+      },
+      "PageQuery": {
+        "name": "page",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        }
+      },
+      "LimitQuery": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 20
+        }
+      },
+      "PageSizeQuery": {
+        "name": "pageSize",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 20
+        }
+      },
+      "SearchQuery": {
+        "name": "search",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "CsrfTokenHeader": {
+        "name": "x-csrf-token",
+        "in": "header",
+        "required": true,
+        "description": "CSRF token = HMAC-SHA256(APP_KEY, \"csrf:\" + raw session cookie). Required on all state-changing (POST/PATCH/DELETE) requests that carry the session cookie. Invalid/missing token or bad origin returns 403 (CSRF_TOKEN / CSRF_ORIGIN).",
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "headers": {
+      "XCsrfToken": {
+        "description": "Current CSRF token for the session; adopt this value for subsequent state-changing requests.",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "XSessionRotation": {
+        "description": "Monotonic session rotation sequence. Increases when the session is rotated; clients should track the latest value.",
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Malformed request. Stable codes: BAD_REQUEST.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Not authenticated or invalid credentials. Stable codes: UNAUTHORIZED.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "Authenticated but not permitted, or CSRF check failed. Stable codes: FORBIDDEN, CSRF_TOKEN, CSRF_ORIGIN.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Resource not found (or hidden by branch scope). Stable codes: NOT_FOUND.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "State conflict. Stable codes: CONFLICT, RISK_POLICY_NOT_APPROVED (fail-closed when no risk matrix is active), SUMMARY_STALE (signable summary changed).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "ValidationError": {
+        "description": "Request failed validation. Stable codes: VALIDATION_ERROR, GPS_INVALID (details[].code one of NAN_OR_INFINITE, OUT_OF_RANGE, NULL_ISLAND, LOW_ACCURACY, BAD_TIMESTAMP, FUTURE_TIMESTAMP, STALE), OUT_OF_RANGE (checklist measurement out of range).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "TooManyRequests": {
+        "description": "Rate limit exceeded. Stable codes: TOO_MANY_REQUESTS. See the Retry-After / RateLimit-* headers.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ErrorDetail": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "description": "Stable business error code."
+              },
+              "message": {
+                "type": "string"
+              },
+              "details": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ErrorDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "RoleCode": {
+        "type": "string",
+        "enum": [
+          "USTA",
+          "MASTER",
+          "RAHBAR",
+          "SIFAT",
+          "ADMIN"
+        ]
+      },
+      "UserStatus": {
+        "type": "string",
+        "enum": [
+          "ACTIVE",
+          "BLOCKED"
+        ]
+      },
+      "RegistrationStatus": {
+        "type": "string",
+        "enum": [
+          "PENDING",
+          "APPROVED",
+          "REJECTED"
+        ]
+      },
+      "GasType": {
+        "type": "string",
+        "enum": [
+          "LPG",
+          "CNG"
+        ]
+      },
+      "JobStatus": {
+        "type": "string",
+        "enum": [
+          "DRAFT",
+          "IN_PROGRESS",
+          "WAITING_STOP_APPROVAL",
+          "REJECTED",
+          "QUALITY_REVIEW",
+          "COMPLETED",
+          "REOPENED",
+          "CANCELLED"
+        ]
+      },
+      "VersionStatus": {
+        "type": "string",
+        "enum": [
+          "DRAFT",
+          "PUBLISHED",
+          "ARCHIVED"
+        ]
+      },
+      "RiskLevel": {
+        "type": "string",
+        "enum": [
+          "LOW",
+          "MEDIUM",
+          "HIGH",
+          "CRITICAL"
+        ]
+      },
+      "GpsPurpose": {
+        "type": "string",
+        "enum": [
+          "JOB_START",
+          "CHECKLIST_COMPLETE",
+          "CUSTOMER_SIGNATURE",
+          "JOB_COMPLETE",
+          "RISK_STOP_EVENT"
+        ]
+      },
+      "User": {
+        "type": "object",
+        "description": "Authenticated user with the server-issued permission list.",
+        "required": [
+          "id",
+          "firstName",
+          "lastName",
+          "phone",
+          "region",
+          "role",
+          "status",
+          "permissions"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "firstName": {
+            "type": "string"
+          },
+          "lastName": {
+            "type": "string"
+          },
+          "phone": {
+            "type": "string"
+          },
+          "region": {
+            "type": "string"
+          },
+          "branchId": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "role": {
+            "$ref": "#/components/schemas/RoleCode"
+          },
+          "status": {
+            "$ref": "#/components/schemas/UserStatus"
+          },
+          "avatarUrl": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "permissions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "UserDetail": {
+        "type": "object",
+        "required": [
+          "id",
+          "firstName",
+          "lastName",
+          "phone",
+          "region",
+          "role",
+          "status",
+          "createdAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "firstName": {
+            "type": "string"
+          },
+          "lastName": {
+            "type": "string"
+          },
+          "phone": {
+            "type": "string"
+          },
+          "region": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/RoleCode"
+          },
+          "branchId": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "branchName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/UserStatus"
+          },
+          "lastLoginAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "AuthSession": {
+        "type": "object",
+        "description": "The current user plus CSRF token and rotation sequence (also mirrored in response headers).",
+        "required": [
+          "user",
+          "csrfToken",
+          "rotationSeq"
+        ],
+        "properties": {
+          "user": {
+            "$ref": "#/components/schemas/User"
+          },
+          "csrfToken": {
+            "type": "string"
+          },
+          "rotationSeq": {
+            "type": "integer"
+          }
+        }
+      },
+      "RegistrationRequest": {
+        "type": "object",
+        "required": [
+          "id",
+          "firstName",
+          "lastName",
+          "phone",
+          "region",
+          "branchId",
+          "status",
+          "createdAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "firstName": {
+            "type": "string"
+          },
+          "lastName": {
+            "type": "string"
+          },
+          "phone": {
+            "type": "string"
+          },
+          "region": {
+            "type": "string"
+          },
+          "branchId": {
+            "type": "integer"
+          },
+          "branchName": {
+            "type": "string"
+          },
+          "comment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/RegistrationStatus"
+          },
+          "rejectReason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reviewedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Branch": {
+        "type": "object",
+        "description": "Minimal public branch shape.",
+        "required": [
+          "id",
+          "name",
+          "region"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "region": {
+            "type": "string"
+          }
+        }
+      },
+      "BranchFull": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Branch"
+          },
+          {
+            "type": "object",
+            "required": [
+              "status"
+            ],
+            "properties": {
+              "address": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "phone": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "ACTIVE",
+                  "INACTIVE"
+                ]
+              },
+              "userCount": {
+                "type": "integer"
+              }
+            }
+          }
+        ]
+      },
+      "Customer": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "phone",
+          "vehicleCount",
+          "createdAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "phone": {
+            "type": "string"
+          },
+          "vehicleCount": {
+            "type": "integer"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Vehicle": {
+        "type": "object",
+        "required": [
+          "id",
+          "customerId",
+          "plateNumber",
+          "make",
+          "model",
+          "createdAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "customerId": {
+            "type": "integer"
+          },
+          "customerName": {
+            "type": "string"
+          },
+          "customerPhone": {
+            "type": "string"
+          },
+          "plateNumber": {
+            "type": "string"
+          },
+          "vin": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "make": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "year": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "engine": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mileage": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "JobInstallation": {
+        "type": "object",
+        "properties": {
+          "gasType": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GasType"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ecu": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cylinder": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Job": {
+        "type": "object",
+        "description": "Installation job (branch-scoped). Lifecycle fields reflect the current cycle.",
+        "required": [
+          "id",
+          "status",
+          "customerId",
+          "vehicleId",
+          "branchId",
+          "cycle",
+          "createdAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus"
+          },
+          "customerId": {
+            "type": "integer"
+          },
+          "customerName": {
+            "type": "string"
+          },
+          "customerPhone": {
+            "type": "string"
+          },
+          "vehicleId": {
+            "type": "integer"
+          },
+          "plateNumber": {
+            "type": "string"
+          },
+          "vin": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "make": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "year": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "branchId": {
+            "type": "integer"
+          },
+          "branchName": {
+            "type": "string"
+          },
+          "createdById": {
+            "type": "integer"
+          },
+          "createdByName": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "startedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "cancelledAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "cancelReason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cancelledByName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "closedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "closedByName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reopenReason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reopenedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "reopenedByName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "assignedTechnicianId": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "assignedTechnicianName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "assignmentStatus": {
+            "type": "string"
+          },
+          "cycle": {
+            "type": "integer"
+          },
+          "installation": {
+            "$ref": "#/components/schemas/JobInstallation"
+          }
+        }
+      },
+      "AssignmentHistoryItem": {
+        "type": "object",
+        "required": [
+          "id",
+          "assignedBy",
+          "provenance",
+          "createdAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "technicianId": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "assignedBy": {
+            "type": "integer"
+          },
+          "provenance": {
+            "type": "string"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "AssignmentCandidate": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "role"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          }
+        }
+      },
+      "MeasurementInput": {
+        "type": "object",
+        "description": "Measurement definition supplied when authoring a template step.",
+        "required": [
+          "name",
+          "unit",
+          "required"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "unit": {
+            "type": "string"
+          },
+          "minValue": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "maxValue": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "expectedValue": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "required": {
+            "type": "boolean"
+          }
+        }
+      },
+      "MeasurementDef": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "unit",
+          "required"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "unit": {
+            "type": "string"
+          },
+          "minValue": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "maxValue": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "expectedValue": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "required": {
+            "type": "boolean"
+          }
+        }
+      },
+      "TemplateStep": {
+        "type": "object",
+        "required": [
+          "id",
+          "sortOrder",
+          "name",
+          "isStop",
+          "riskWeight",
+          "requiredPhotos",
+          "measurements"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "sortOrder": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requirements": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "isStop": {
+            "type": "boolean"
+          },
+          "riskWeight": {
+            "type": "integer"
+          },
+          "requiredPhotos": {
+            "type": "integer"
+          },
+          "measurements": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MeasurementDef"
+            }
+          }
+        }
+      },
+      "TemplateVersion": {
+        "type": "object",
+        "required": [
+          "id",
+          "version",
+          "status",
+          "stepCount"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "version": {
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/VersionStatus"
+          },
+          "publishedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "stepCount": {
+            "type": "integer"
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TemplateStep"
+            }
+          }
+        }
+      },
+      "ChecklistTemplate": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "versions"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "versions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TemplateVersion"
+            }
+          }
+        }
+      },
+      "JobStepMeasurement": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/MeasurementDef"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "submittedValue": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "isWithinRange": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "StepStopApproval": {
+        "type": "object",
+        "required": [
+          "status",
+          "attempt",
+          "submittedByName",
+          "submittedAt"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "PENDING",
+              "APPROVED",
+              "REJECTED"
+            ]
+          },
+          "attempt": {
+            "type": "integer"
+          },
+          "submittedByName": {
+            "type": "string"
+          },
+          "submittedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "decidedByName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decidedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "rejectReason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "StepPhoto": {
+        "type": "object",
+        "required": [
+          "id",
+          "attempt",
+          "originalName",
+          "mimeType",
+          "sizeBytes",
+          "uploadedByName",
+          "createdAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "attempt": {
+            "type": "integer"
+          },
+          "originalName": {
+            "type": "string"
+          },
+          "mimeType": {
+            "type": "string",
+            "enum": [
+              "image/jpeg",
+              "image/png",
+              "image/webp"
+            ]
+          },
+          "sizeBytes": {
+            "type": "integer"
+          },
+          "uploadedByName": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "JobStep": {
+        "type": "object",
+        "required": [
+          "id",
+          "templateStepId",
+          "sortOrder",
+          "name",
+          "isStop",
+          "status",
+          "measurements",
+          "photos"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "templateStepId": {
+            "type": "integer"
+          },
+          "sortOrder": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requirements": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "isStop": {
+            "type": "boolean"
+          },
+          "riskWeight": {
+            "type": "integer"
+          },
+          "requiredPhotos": {
+            "type": "integer"
+          },
+          "measurements": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JobStepMeasurement"
+            }
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "PENDING",
+              "COMPLETED",
+              "WAITING_APPROVAL",
+              "APPROVED",
+              "REJECTED"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "completedByName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "completedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "isCurrent": {
+            "type": "boolean"
+          },
+          "stopApproval": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StepStopApproval"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "currentAttempt": {
+            "type": "integer"
+          },
+          "photos": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StepPhoto"
+            }
+          },
+          "photoProgress": {
+            "type": "object",
+            "properties": {
+              "have": {
+                "type": "integer"
+              },
+              "need": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      },
+      "JobChecklist": {
+        "type": "object",
+        "required": [
+          "id",
+          "templateName",
+          "version",
+          "steps"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "templateName": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          },
+          "assignedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "completedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "progress": {
+            "type": "object",
+            "properties": {
+              "completed": {
+                "type": "integer"
+              },
+              "total": {
+                "type": "integer"
+              }
+            }
+          },
+          "currentStepId": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JobStep"
+            }
+          }
+        }
+      },
+      "RiskListItem": {
+        "type": "object",
+        "description": "A risk in the job register. level/blocking are server-computed from the active matrix.",
+        "required": [
+          "id",
+          "cycle",
+          "hazard",
+          "description",
+          "level",
+          "blocking",
+          "status",
+          "matrixVersion",
+          "source",
+          "createdAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "cycle": {
+            "type": "integer"
+          },
+          "hazard": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "level": {
+            "$ref": "#/components/schemas/RiskLevel"
+          },
+          "blocking": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": "string"
+          },
+          "matrixVersion": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "jobStepId": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "GpsEvent": {
+        "type": "object",
+        "description": "A stored GPS event. Field names mirror the persisted record (snake_case) as returned by the API.",
+        "required": [
+          "id",
+          "cycle",
+          "purpose",
+          "provenance",
+          "actor_id"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "cycle": {
+            "type": "integer"
+          },
+          "purpose": {
+            "type": "string"
+          },
+          "latitude": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "longitude": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "accuracy_m": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "client_timestamp": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "server_received_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "provenance": {
+            "type": "string"
+          },
+          "actor_id": {
+            "type": "integer"
+          }
+        }
+      },
+      "CompletionReadiness": {
+        "type": "object",
+        "description": "Server-computed completion readiness. The job may be completed only when every condition is satisfied.",
+        "required": [
+          "canComplete",
+          "reasons",
+          "conditions"
+        ],
+        "properties": {
+          "canComplete": {
+            "type": "boolean"
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "code",
+                "message"
+              ],
+              "properties": {
+                "code": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "conditions": {
+            "type": "object",
+            "required": [
+              "checklist",
+              "stops",
+              "photos",
+              "measurements",
+              "risks",
+              "signature"
+            ],
+            "properties": {
+              "checklist": {
+                "type": "boolean"
+              },
+              "stops": {
+                "type": "boolean"
+              },
+              "photos": {
+                "type": "boolean"
+              },
+              "measurements": {
+                "type": "boolean"
+              },
+              "risks": {
+                "type": "boolean"
+              },
+              "signature": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "SignatureDetail": {
+        "type": "object",
+        "required": [
+          "id",
+          "mimeType",
+          "sizeBytes",
+          "createdAt"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "mimeType": {
+            "type": "string"
+          },
+          "sizeBytes": {
+            "type": "integer"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "SignableSummaryContent": {
+        "type": "object",
+        "description": "The server-built material summary the customer reviews before signing (§23).",
+        "required": [
+          "schemaVersion",
+          "jobId",
+          "cycle",
+          "branchId",
+          "steps",
+          "stops",
+          "openBlockingRiskIds"
+        ],
+        "properties": {
+          "schemaVersion": {
+            "type": "string"
+          },
+          "jobId": {
+            "type": "integer"
+          },
+          "cycle": {
+            "type": "integer"
+          },
+          "branchId": {
+            "type": "integer"
+          },
+          "assignedTechnicianId": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "checklistTemplateId": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "checklistVersion": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "installation": {
+            "type": "object",
+            "properties": {
+              "gasType": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "kit": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "ecu": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "cylinder": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "note": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          },
+          "customer": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "phoneMasked": {
+                    "type": "string"
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "vehicle": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer"
+                  },
+                  "plate": {
+                    "type": "string"
+                  },
+                  "vin": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "make": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "model": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "year": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "integer"
+                },
+                "stepId": {
+                  "type": "integer"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "isStop": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "stops": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "jobStepId": {
+                  "type": "integer"
+                },
+                "attempt": {
+                  "type": "integer"
+                },
+                "status": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "openBlockingRiskIds": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        }
+      },
+      "SignableSummary": {
+        "type": "object",
+        "required": [
+          "schemaVersion",
+          "cycle",
+          "digest",
+          "summary"
+        ],
+        "properties": {
+          "schemaVersion": {
+            "type": "string"
+          },
+          "cycle": {
+            "type": "integer"
+          },
+          "digest": {
+            "type": "string",
+            "description": "Server-computed content digest; bind the signature to this value."
+          },
+          "summary": {
+            "$ref": "#/components/schemas/SignableSummaryContent"
+          }
+        }
+      },
+      "CompletionSnapshot": {
+        "type": "object",
+        "description": "Immutable per-cycle completion snapshot. content is open-ended; key sub-objects are described.",
+        "required": [
+          "cycle",
+          "digest",
+          "schemaVersion",
+          "provenance",
+          "content"
+        ],
+        "properties": {
+          "cycle": {
+            "type": "integer"
+          },
+          "digest": {
+            "type": "string"
+          },
+          "schemaVersion": {
+            "type": "string"
+          },
+          "provenance": {
+            "type": "string"
+          },
+          "content": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "schemaVersion": {
+                "type": "string"
+              },
+              "provenance": {
+                "type": "string"
+              },
+              "summary": {
+                "$ref": "#/components/schemas/SignableSummaryContent"
+              },
+              "summaryDigest": {
+                "type": "string"
+              },
+              "assignment": {
+                "type": "object",
+                "properties": {
+                  "technicianId": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "status": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                }
+              },
+              "signature": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "integer"
+                      },
+                      "sha256": {
+                        "type": "string"
+                      },
+                      "sizeBytes": {
+                        "type": "integer"
+                      },
+                      "summaryDigest": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "risks": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "integer"
+                    },
+                    "level": {
+                      "type": "string"
+                    },
+                    "blocking": {
+                      "type": "boolean"
+                    },
+                    "status": {
+                      "type": "string"
+                    },
+                    "source": {
+                      "type": "string"
+                    },
+                    "matrixVersion": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "MatrixDefinition": {
+        "type": "object",
+        "description": "Risk-matrix definition: score thresholds and the levels that block completion.",
+        "additionalProperties": true,
+        "properties": {
+          "thresholds": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "min",
+                "level"
+              ],
+              "properties": {
+                "min": {
+                  "type": "integer"
+                },
+                "level": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "blockingLevels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "MatrixVersion": {
+        "type": "object",
+        "required": [
+          "version",
+          "status",
+          "createdAt",
+          "definition"
+        ],
+        "properties": {
+          "version": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "DRAFT",
+              "ACTIVE",
+              "RETIRED"
+            ]
+          },
+          "approvedBy": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "approvedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "rationale": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/MatrixDefinition"
+          }
+        }
+      },
+      "Readiness": {
+        "type": "object",
+        "required": [
+          "status",
+          "checks"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unavailable"
+            ]
+          },
+          "checks": {
+            "type": "object",
+            "required": [
+              "db",
+              "redis",
+              "storage",
+              "sms",
+              "riskPolicy",
+              "shuttingDown"
+            ],
+            "properties": {
+              "db": {
+                "type": "boolean"
+              },
+              "redis": {
+                "type": "boolean"
+              },
+              "storage": {
+                "type": "boolean"
+              },
+              "sms": {
+                "type": "boolean"
+              },
+              "riskPolicy": {
+                "type": "boolean"
+              },
+              "shuttingDown": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "ClassicListMeta": {
+        "type": "object",
+        "description": "Classic CRUD list envelope metadata: { total, page, limit }.",
+        "required": [
+          "total",
+          "page",
+          "limit"
+        ],
+        "properties": {
+          "total": {
+            "type": "integer"
+          },
+          "page": {
+            "type": "integer"
+          },
+          "limit": {
+            "type": "integer"
+          }
+        }
+      },
+      "ItemsListMeta": {
+        "type": "object",
+        "description": "Safety/assignment list envelope metadata: { total, page, pageSize }.",
+        "required": [
+          "total",
+          "page",
+          "pageSize"
+        ],
+        "properties": {
+          "total": {
+            "type": "integer"
+          },
+          "page": {
+            "type": "integer"
+          },
+          "pageSize": {
+            "type": "integer"
+          }
+        }
+      },
+      "UsersListResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ClassicListMeta"
+          },
+          {
+            "type": "object",
+            "required": [
+              "users"
+            ],
+            "properties": {
+              "users": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/UserDetail"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "CustomersListResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ClassicListMeta"
+          },
+          {
+            "type": "object",
+            "required": [
+              "customers"
+            ],
+            "properties": {
+              "customers": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Customer"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "VehiclesListResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ClassicListMeta"
+          },
+          {
+            "type": "object",
+            "required": [
+              "vehicles"
+            ],
+            "properties": {
+              "vehicles": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Vehicle"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "JobsListResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ClassicListMeta"
+          },
+          {
+            "type": "object",
+            "required": [
+              "jobs"
+            ],
+            "properties": {
+              "jobs": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "MyJobsResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ItemsListMeta"
+          },
+          {
+            "type": "object",
+            "required": [
+              "items"
+            ],
+            "properties": {
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "RiskListResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ItemsListMeta"
+          },
+          {
+            "type": "object",
+            "required": [
+              "items"
+            ],
+            "properties": {
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/RiskListItem"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "GpsListResponse": {
+        "type": "object",
+        "description": "GPS list envelope: { items, total } (no page/pageSize).",
+        "required": [
+          "items",
+          "total"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GpsEvent"
+            }
+          },
+          "total": {
+            "type": "integer"
+          }
+        }
+      }
+    }
+  }
+}

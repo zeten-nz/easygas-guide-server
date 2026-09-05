@@ -1,6 +1,7 @@
 import type { Knex } from 'knex';
 import type { Request } from 'express';
 import { db } from '../../config/database';
+import { computeEntryHash, genesisHash, utcChainId } from './audit-chain';
 
 export type AuditAction =
   | 'LOGIN'
@@ -87,20 +88,69 @@ export interface AuditEntry {
 }
 
 /**
- * Writes an audit record. Pass `trx` to make the record part of a business
- * transaction (approval/rejection must be atomic with their audit entry).
+ * Writes a tamper-evident audit record (Phase 10F). The row is linked into the
+ * current UTC-day hash chain: the per-day head row is locked FOR UPDATE (so
+ * concurrent appends serialize WITHIN the day only), the entry's `prev_hash`,
+ * `chain_seq` and `entry_hash` are derived deterministically, and the head is
+ * advanced — all in one transaction.
+ *
+ * Pass `trx` to make the record part of a business transaction (approval must be
+ * atomic with its audit entry). When `trx` is given, the head lock is taken as
+ * the LAST lock of that transaction; when omitted, logAudit runs its own short
+ * transaction. `audit:verify` re-derives and checks the whole chain offline.
  */
 export async function logAudit(entry: AuditEntry, trx?: Knex.Transaction): Promise<void> {
-  await (trx ?? db)('audit_logs').insert({
+  if (trx) {
+    await appendChained(trx, entry);
+  } else {
+    await db.transaction((t) => appendChained(t, entry));
+  }
+}
+
+async function appendChained(trx: Knex.Transaction, entry: AuditEntry): Promise<void> {
+  const chainId = utcChainId();
+  // Ensure the per-day head row exists, then lock it (serializes same-day appends).
+  await trx.raw(
+    'INSERT INTO audit_chain_heads (chain_id, head_hash, head_seq) VALUES (?, ?, 0) ON DUPLICATE KEY UPDATE chain_id = chain_id',
+    [chainId, genesisHash(chainId)],
+  );
+  const head = (await trx('audit_chain_heads').where({ chain_id: chainId }).forUpdate().first()) as {
+    head_hash: string;
+    head_seq: number | string;
+  };
+  const prevHash = head.head_hash;
+  const chainSeq = Number(head.head_seq) + 1;
+  const entityId = entry.entityId != null ? String(entry.entityId) : null;
+  const entryHash = computeEntryHash({
+    chainId,
+    chainSeq,
+    prevHash,
+    userId: entry.userId ?? null,
+    action: entry.action,
+    entityType: entry.entityType ?? null,
+    entityId,
+    oldValue: entry.oldValue ?? null,
+    newValue: entry.newValue ?? null,
+    ip: entry.ip ?? null,
+    userAgent: entry.userAgent ?? null,
+  });
+  await trx('audit_logs').insert({
     user_id: entry.userId ?? null,
     action: entry.action,
     entity_type: entry.entityType ?? null,
-    entity_id: entry.entityId != null ? String(entry.entityId) : null,
+    entity_id: entityId,
     old_value: entry.oldValue != null ? JSON.stringify(entry.oldValue) : null,
     new_value: entry.newValue != null ? JSON.stringify(entry.newValue) : null,
     ip: entry.ip ?? null,
     user_agent: entry.userAgent ?? null,
+    chain_id: chainId,
+    chain_seq: chainSeq,
+    prev_hash: prevHash,
+    entry_hash: entryHash,
   });
+  await trx('audit_chain_heads')
+    .where({ chain_id: chainId })
+    .update({ head_hash: entryHash, head_seq: chainSeq, updated_at: trx.raw('CURRENT_TIMESTAMP(6)') });
 }
 
 export function requestMeta(req: Request): { ip: string | null; userAgent: string | null } {

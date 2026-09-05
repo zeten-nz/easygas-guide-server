@@ -10,6 +10,7 @@ import { apiLimiter } from './middleware/rate-limit.middleware';
 import { csrfProtection } from './middleware/csrf.middleware';
 import { errorHandler, notFoundHandler } from './middleware/error.middleware';
 import { readiness } from './modules/health/health.service';
+import { genReqId, httpMetricsMiddleware, metricsHandler, normalizeRoute } from './observability/runtime';
 import { authRouter } from './modules/auth/auth.routes';
 import { branchesRouter } from './modules/branches/branches.routes';
 import { registrationAdminRouter } from './modules/users/registration.admin.routes';
@@ -59,14 +60,28 @@ export function createApp(options: CreateAppOptions = {}) {
   app.use(
     pinoHttp({
       logger,
-      autoLogging: { ignore: (req) => req.url === '/api/v1/health' || req.url === '/api/v1/ready' },
+      // Phase 10F: stable correlation id (echoed as x-request-id) + low-cardinality
+      // route template and actor id on every completed request log. No phone/PII.
+      genReqId,
+      customProps: (req) => ({
+        route: normalizeRoute(req.originalUrl),
+        actorId: (req as unknown as { user?: { id?: number } }).user?.id,
+      }),
+      autoLogging: { ignore: (req) => req.url === '/api/v1/health' || req.url === '/api/v1/ready' || req.url === '/api/v1/metrics' },
     }),
   );
+
+  // Phase 10F: HTTP request/duration metrics (route template + status class).
+  app.use(httpMetricsMiddleware);
 
   // Liveness (Phase 10C): minimal, no external dependencies. Used by PM2/orchestrator.
   app.get('/api/v1/health', (_req, res) => {
     res.json({ status: 'ok' });
   });
+
+  // Phase 10F: token-gated Prometheus metrics. Placed before the rate limiter and
+  // CSRF (GET, no cookie mutation). Never public in production without METRICS_TOKEN.
+  app.get('/api/v1/metrics', metricsHandler);
 
   // Readiness (Phase 10C): checks DB/Redis/storage/SMS-config with strict
   // timeouts and flips to 503 during graceful shutdown. Used by Nginx to decide
