@@ -24,6 +24,7 @@
     "test:quality": "tsx tests/quality.e2e.ts",
     "test:hardening": "tsx tests/hardening.e2e.ts",
     "test:setup": "tsx tests/setup-test-db.ts",
+  "test:e2e:serve": "npm run test:setup && tsx tests/e2e-server.ts",
     "test:storage": "tsx tests/storage-contract.e2e.ts",
     "test:evidence": "tsx tests/evidence.e2e.ts",
     "test:reconcile": "tsx tests/reconcile.e2e.ts",

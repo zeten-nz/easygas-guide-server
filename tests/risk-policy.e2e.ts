@@ -180,16 +180,125 @@ async function run(): Promise<void> {
     assert.equal(row2.level, 'CRITICAL');
   });
 
-  // ---- concurrent activation → exactly one ACTIVE ----
-  await test('concurrent activation of two versions leaves exactly one ACTIVE', async () => {
-    await setMatrix('ACTIVE'); // v1 active, others deleted
-    await http('POST', '/api/v1/risk-policy/versions', { cookie: sifat, body: { version: 'v2', definition: V1_DEF } });
+  // ---- concurrency: exactly one ACTIVE after every race, no crash/deadlock ----
+  // Fixtures use UNIQUE version identifiers per case so no state can leak between
+  // tests or runs. Races target DRAFT versions (activating a DRAFT is always a
+  // valid transition) so the outcome is deterministic: both succeed and exactly
+  // one ends ACTIVE — regardless of which transaction the singleton lock admits
+  // first. (Re-activating a version another racer just RETIRED is a correct 409,
+  // MATRIX_RETIRED — never weakened; that scenario is asserted explicitly below.)
+  let vseq = 0;
+  const uniqueVersion = (tag: string) => `rc-${Date.now().toString(36)}-${tag}-${++vseq}`;
+  const mkVersion = async (v: string, def: unknown = V1_DEF) =>
+    http('POST', '/api/v1/risk-policy/versions', { cookie: sifat, body: { version: v, definition: def } });
+  const activeVersions = async (): Promise<string[]> =>
+    (await db('risk_matrix_versions').where({ status: 'ACTIVE' }).select('version')).map((r: { version: string }) => r.version);
+
+  await test('concurrent activation of two DRAFT versions (no current ACTIVE) leaves exactly one ACTIVE', async () => {
+    await setMatrix('DRAFT'); // no ACTIVE matrix
+    const va = uniqueVersion('a'), vb = uniqueVersion('b');
+    assert.equal((await mkVersion(va)).status, 201);
+    assert.equal((await mkVersion(vb)).status, 201);
+    const [a, bb] = await Promise.all([
+      http('POST', `/api/v1/risk-policy/${va}/activate`, { cookie: sifat, body: { rationale: 'race a' } }),
+      http('POST', `/api/v1/risk-policy/${vb}/activate`, { cookie: admin, body: { rationale: 'race b' } }),
+    ]);
+    // Activating a DRAFT is always valid — both succeed regardless of order.
+    assert.equal(a.status, 200, JSON.stringify(a.body));
+    assert.equal(bb.status, 200, JSON.stringify(bb.body));
+    const active = await activeVersions();
+    assert.equal(active.length, 1, `exactly one ACTIVE, got ${JSON.stringify(active)}`);
+    assert.ok(active[0] === va || active[0] === vb);
+  });
+
+  await test('concurrent activation of two DRAFT versions while another is ACTIVE leaves exactly one ACTIVE (prior retired)', async () => {
+    await setMatrix('ACTIVE'); // v1 ACTIVE
+    const va = uniqueVersion('a'), vb = uniqueVersion('b');
+    await mkVersion(va);
+    await mkVersion(vb);
+    const [a, bb] = await Promise.all([
+      http('POST', `/api/v1/risk-policy/${va}/activate`, { cookie: sifat, body: { rationale: 'race a' } }),
+      http('POST', `/api/v1/risk-policy/${vb}/activate`, { cookie: admin, body: { rationale: 'race b' } }),
+    ]);
+    assert.equal(a.status, 200, JSON.stringify(a.body));
+    assert.equal(bb.status, 200, JSON.stringify(bb.body));
+    const active = await activeVersions();
+    assert.equal(active.length, 1, `exactly one ACTIVE, got ${JSON.stringify(active)}`);
+    assert.ok(active[0] === va || active[0] === vb);
+    assert.equal((await db('risk_matrix_versions').where({ version: 'v1' }).first()).status, 'RETIRED');
+  });
+
+  await test('re-activating a version a concurrent activation just RETIRED is a clean 409 (invariant preserved)', async () => {
+    // v1 ACTIVE + one DRAFT challenger. Racing activate(v1) vs activate(challenger)
+    // can retire v1 first; re-activating a RETIRED matrix must be a deterministic
+    // 409 MATRIX_RETIRED (never a 500/deadlock, never two ACTIVE, never weakened).
+    await setMatrix('ACTIVE');
+    const vb = uniqueVersion('chal');
+    await mkVersion(vb);
     const [a, bb] = await Promise.all([
       http('POST', '/api/v1/risk-policy/v1/activate', { cookie: sifat, body: { rationale: 'keep v1' } }),
-      http('POST', '/api/v1/risk-policy/v2/activate', { cookie: admin, body: { rationale: 'switch v2' } }),
+      http('POST', `/api/v1/risk-policy/${vb}/activate`, { cookie: admin, body: { rationale: 'switch' } }),
     ]);
-    assert.ok(a.status === 200 && bb.status === 200);
-    assert.equal((await db('risk_matrix_versions').where({ status: 'ACTIVE' })).length, 1, 'exactly one ACTIVE after concurrent activation');
+    for (const r of [a, bb]) {
+      assert.ok(r.status === 200 || (r.status === 409 && r.body?.error?.code === 'MATRIX_RETIRED'), `unexpected ${r.status} ${JSON.stringify(r.body)}`);
+    }
+    assert.ok(a.status === 200 || bb.status === 200, 'at least one activation succeeds');
+    const active = await activeVersions();
+    assert.equal(active.length, 1, `exactly one ACTIVE, got ${JSON.stringify(active)}`);
+  });
+
+  await test('activate vs retire race leaves exactly one ACTIVE (no deadlock)', async () => {
+    await setMatrix('ACTIVE'); // v1 ACTIVE
+    const vb = uniqueVersion('b');
+    await mkVersion(vb);
+    const [act, ret] = await Promise.all([
+      http('POST', `/api/v1/risk-policy/${vb}/activate`, { cookie: sifat, body: { rationale: 'activate b' } }),
+      http('POST', '/api/v1/risk-policy/v1/retire', { cookie: admin }),
+    ]);
+    assert.equal(act.status, 200, JSON.stringify(act.body));
+    assert.equal(ret.status, 200, JSON.stringify(ret.body));
+    const active = await activeVersions();
+    assert.equal(active.length, 1, `exactly one ACTIVE (the activated version), got ${JSON.stringify(active)}`);
+    assert.equal(active[0], vb);
+  });
+
+  await test('activate vs risk creation race: no deadlock, risk scored under a valid matrix, exactly one ACTIVE', async () => {
+    await setMatrix('ACTIVE'); // v1 ACTIVE (2×2 → MEDIUM)
+    const jobId = await mkDraftJob();
+    assert.equal((await http('POST', `/api/v1/jobs/${jobId}/start`, { cookie: usta })).status, 200);
+    const vb = uniqueVersion('b');
+    await mkVersion(vb, { ...V1_DEF, thresholds: [{ min: 0, level: 'CRITICAL' }] }); // everything CRITICAL
+    const [act, rk] = await Promise.all([
+      http('POST', `/api/v1/risk-policy/${vb}/activate`, { cookie: sifat, body: { rationale: 'switch mid-risk' } }),
+      http('POST', `/api/v1/jobs/${jobId}/risks`, { cookie: usta, body: { hazard: 'Gaz', description: 'race', severity: 2, likelihood: 2 } }),
+    ]);
+    assert.equal(act.status, 200, JSON.stringify(act.body));
+    assert.equal(rk.status, 201, JSON.stringify(rk.body)); // risk creation never deadlocks with activation
+    const row = await db('risk_events').where({ id: rk.body.risk.id }).first();
+    // Scored under whichever matrix the read saw — both are valid, immutable choices.
+    assert.ok(row.matrix_version === 'v1' || row.matrix_version === vb, `matrix ${row.matrix_version}`);
+    const active = await activeVersions();
+    assert.equal(active.length, 1, `exactly one ACTIVE, got ${JSON.stringify(active)}`);
+    assert.equal(active[0], vb);
+  });
+
+  await test('failed activations do not leak DB connections/transactions', async () => {
+    await setMatrix('ACTIVE');
+    // Retire a version, then hammer activation of the RETIRED version (all 409).
+    const vb = uniqueVersion('leak');
+    await mkVersion(vb);
+    await http('POST', `/api/v1/risk-policy/${vb}/retire`, { cookie: sifat }); // ensure RETIRED
+    const pool = (db.client as unknown as { pool: { numUsed(): number; numFree(): number; numPendingAcquires(): number; numPendingCreates(): number } }).pool;
+    const before = pool.numUsed();
+    const results = await Promise.all(
+      Array.from({ length: 20 }, () => http('POST', `/api/v1/risk-policy/${vb}/activate`, { cookie: sifat, body: { rationale: 'retry retired' } })),
+    );
+    assert.ok(results.every((r) => r.status === 409 && r.body?.error?.code === 'MATRIX_RETIRED'), 'every activation of a RETIRED matrix is a clean 409');
+    // Let the pool settle, then confirm nothing is stuck acquiring/holding.
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(pool.numPendingAcquires(), 0, 'no pending acquires after failures');
+    assert.ok(pool.numUsed() <= before + 1, `connections returned to the pool (before=${before}, after=${pool.numUsed()})`);
+    assert.equal((await activeVersions()).length, 1, 'still exactly one ACTIVE after the failure burst');
   });
 
   // ---- retirement without replacement fails safely ----

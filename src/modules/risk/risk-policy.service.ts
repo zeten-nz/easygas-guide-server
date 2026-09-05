@@ -149,30 +149,55 @@ export async function createMatrixVersion(actor: AuthUser, version: string, defi
   if (problems.length > 0) throw new ApiError(422, 'INVALID_MATRIX', 'Matritsa notogri', problems.map((p) => ({ code: 'INVALID', field: 'definition', message: p })));
   const existing = await db('risk_matrix_versions').where({ version }).first();
   if (existing) throw ApiError.conflict('Bu versiya allaqachon mavjud', 'VERSION_EXISTS');
-  await db('risk_matrix_versions').insert({ version, definition: JSON.stringify(definition), status: 'DRAFT' });
+  try {
+    await db('risk_matrix_versions').insert({ version, definition: JSON.stringify(definition), status: 'DRAFT' });
+  } catch (err) {
+    // A concurrent create of the same version loses the race on the UNIQUE(version)
+    // constraint — surface it as a clean conflict, not a 500.
+    if ((err as { code?: string }).code === 'ER_DUP_ENTRY') throw ApiError.conflict('Bu versiya allaqachon mavjud', 'VERSION_EXISTS');
+    throw err;
+  }
   await logAudit({ userId: actor.id, action: 'RISK_MATRIX_CREATED', entityType: 'risk_matrix', entityId: version, newValue: { version, status: 'DRAFT' }, ...meta });
   return { version };
 }
 
 /**
+ * Serialization point for every activate/retire. Locks a PERMANENT singleton row
+ * (`risk_policy_control` id=1) FOR UPDATE, so concurrent governance operations run
+ * one at a time on a single always-present row — no full-table scan, no gap locks,
+ * no deadlock cycle, and never "locking a row that may not exist". The row is
+ * created by migration; the idempotent upsert self-heals if it was ever removed.
+ */
+async function lockPolicyControl(trx: Knex.Transaction): Promise<void> {
+  await trx.raw('INSERT INTO risk_policy_control (id, note) VALUES (1, ?) ON DUPLICATE KEY UPDATE id = id', ['risk-policy activate/retire serialization singleton']);
+  await trx('risk_policy_control').where({ id: 1 }).forUpdate().first();
+}
+
+/**
  * Activates a DRAFT (or currently-ACTIVE) matrix with a mandatory rationale.
- * Serializes concurrent activations via a table row lock so exactly one matrix
- * is ACTIVE afterward; the previous ACTIVE is RETIRED (superseded). An ACTIVE
- * definition is never edited — a change requires a new version.
+ * Concurrent activations are serialized by the singleton control lock, and the DB
+ * additionally enforces at most one ACTIVE via a UNIQUE index (defense in depth),
+ * so exactly one matrix is ACTIVE afterward; the previous ACTIVE is RETIRED
+ * (superseded). An ACTIVE definition is never edited — a change requires a new
+ * version.
  */
 export async function activateMatrix(actor: AuthUser, version: string, rationale: string, meta: RequestMeta): Promise<void> {
   if (!can(actor.role, 'risk.matrix.approve')) throw ApiError.forbidden();
   if (!rationale?.trim()) throw ApiError.badRequest('Tasdiqlash asosini (rationale) kiriting', 'RATIONALE_REQUIRED');
 
   await db.transaction(async (trx) => {
-    const rows = await trx('risk_matrix_versions').forUpdate(); // lock all rows → serialize activations
-    const target = rows.find((r: any) => r.version === version);
+    await lockPolicyControl(trx); // serialize all activations/retirements
+    // Now exclusive: plain reads see committed state.
+    const target = await trx('risk_matrix_versions').where({ version }).first();
     if (!target) throw ApiError.notFound('Matritsa versiyasi topilmadi');
     if (target.status === 'RETIRED') throw ApiError.conflict('Chiqarib tashlangan matritsani faollashtirib bolmaydi', 'MATRIX_RETIRED');
     const problems = validateDefinition(JSON.parse(target.definition));
     if (problems.length > 0) throw new ApiError(422, 'INVALID_MATRIX', 'Matritsa notogri', problems.map((p) => ({ code: 'INVALID', field: 'definition', message: p })));
 
-    for (const r of rows.filter((x: any) => x.status === 'ACTIVE' && x.version !== version)) {
+    // Retire the current ACTIVE (if any and not the target) BEFORE activating the
+    // target, so the one-ACTIVE unique index is never transiently violated.
+    const others = await trx('risk_matrix_versions').where({ status: 'ACTIVE' }).whereNot({ version });
+    for (const r of others) {
       await trx('risk_matrix_versions').where({ id: r.id }).update({ status: 'RETIRED', superseded_by: target.id });
       await logAudit({ userId: actor.id, action: 'RISK_MATRIX_RETIRED', entityType: 'risk_matrix', entityId: r.version, oldValue: { status: 'ACTIVE' }, newValue: { status: 'RETIRED', supersededBy: version }, ...meta }, trx);
     }
@@ -184,7 +209,8 @@ export async function activateMatrix(actor: AuthUser, version: string, rationale
 export async function retireMatrix(actor: AuthUser, version: string, meta: RequestMeta): Promise<void> {
   if (!can(actor.role, 'risk.matrix.approve')) throw ApiError.forbidden();
   await db.transaction(async (trx) => {
-    const row = await trx('risk_matrix_versions').where({ version }).forUpdate().first();
+    await lockPolicyControl(trx); // serialize against concurrent activations
+    const row = await trx('risk_matrix_versions').where({ version }).first();
     if (!row) throw ApiError.notFound('Matritsa versiyasi topilmadi');
     if (row.status === 'RETIRED') return;
     // Retiring the only ACTIVE matrix leaves the domain fail-closed — that is a
