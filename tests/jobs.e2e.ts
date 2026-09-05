@@ -91,6 +91,9 @@ async function cleanup(): Promise<void> {
   ).map((j: { id: number }) => j.id);
   if (jobIds.length > 0) {
     await db('audit_logs').where('entity_type', 'job').whereIn('entity_id', jobIds.map(String)).del();
+    await db('risk_events').whereIn('job_id', jobIds).del();
+    await db('completion_snapshots').whereIn('job_id', jobIds).del();
+    await db('job_assignments').whereIn('job_id', jobIds).del();
     await db('jobs').whereIn('id', jobIds).del();
   }
 

@@ -2,6 +2,7 @@ import { db } from '../../config/database';
 import { getRedis } from '../../redis/redis';
 import { getStorageProvider } from '../../storage';
 import { smsCapability } from '../../sms';
+import { riskPolicyActive } from '../risk/risk-policy.service';
 
 /**
  * Phase 10C liveness/readiness.
@@ -74,26 +75,40 @@ function checkSmsConfig(): boolean {
   }
 }
 
+async function checkRiskPolicy(): Promise<boolean> {
+  try {
+    return await withTimeout(riskPolicyActive(), PER_CHECK_MS);
+  } catch {
+    return false;
+  }
+}
+
 export interface Readiness {
   ready: boolean;
-  checks: { db: boolean; redis: boolean; storage: boolean; sms: boolean; shuttingDown: boolean };
+  checks: { db: boolean; redis: boolean; storage: boolean; sms: boolean; riskPolicy: boolean; shuttingDown: boolean };
 }
 
 export async function readiness(): Promise<Readiness> {
   if (shuttingDown) {
-    return { ready: false, checks: { db: false, redis: false, storage: false, sms: false, shuttingDown: true } };
+    return { ready: false, checks: { db: false, redis: false, storage: false, sms: false, riskPolicy: false, shuttingDown: true } };
   }
   let db_ = false;
   let redis_ = false;
   let storage_ = false;
   let sms_ = false;
+  let riskPolicy_ = false;
   try {
-    [db_, redis_, storage_] = await withTimeout(Promise.all([checkDb(), checkRedis(), checkStorage()]), OVERALL_MS);
+    [db_, redis_, storage_, riskPolicy_] = await withTimeout(
+      Promise.all([checkDb(), checkRedis(), checkStorage(), checkRiskPolicy()]),
+      OVERALL_MS,
+    );
     sms_ = checkSmsConfig();
   } catch {
     // Overall timeout — leave failed checks false.
     sms_ = checkSmsConfig();
   }
-  const ready = db_ && redis_ && storage_ && sms_;
-  return { ready, checks: { db: db_, redis: redis_, storage: storage_, sms: sms_, shuttingDown: false } };
+  // Phase 10D: the safety domain is NOT reported healthy without an approved risk
+  // policy — riskPolicy=false surfaces here (and completion/job-start fail closed).
+  const ready = db_ && redis_ && storage_ && sms_ && riskPolicy_;
+  return { ready, checks: { db: db_, redis: redis_, storage: storage_, sms: sms_, riskPolicy: riskPolicy_, shuttingDown: false } };
 }

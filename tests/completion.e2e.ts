@@ -141,6 +141,9 @@ async function cleanup(): Promise<void> {
       await db('job_checklists').whereIn('id', checklistIds).del();
     }
     await db('audit_logs').where('entity_type', 'job').whereIn('entity_id', jobIds.map(String)).del();
+    await db('risk_events').whereIn('job_id', jobIds).del();
+    await db('completion_snapshots').whereIn('job_id', jobIds).del();
+    await db('job_assignments').whereIn('job_id', jobIds).del();
     await db('jobs').whereIn('id', jobIds).del();
   }
 
@@ -529,7 +532,7 @@ async function run(): Promise<void> {
     assert.equal((await uploadFile(`/api/v1/jobs/${job.jobId}/signature`, 'signature', PNG_BYTES, ustaACookie)).status, 201);
     const readiness = (await http('GET', `/api/v1/jobs/${job.jobId}/completion`, { cookie: masterACookie })).body.readiness;
     assert.equal(readiness.canComplete, true);
-    assert.deepEqual(readiness.conditions, { checklist: true, stops: true, photos: true, measurements: true, signature: true });
+    assert.deepEqual(readiness.conditions, { checklist: true, stops: true, photos: true, measurements: true, risks: true, signature: true });
 
     assert.equal((await closeJob(job.jobId, masterACookie)).status, 200);
     assert.equal((await db('jobs').where({ id: job.jobId }).first()).status, 'COMPLETED');

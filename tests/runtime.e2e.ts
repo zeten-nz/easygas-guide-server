@@ -86,7 +86,7 @@ async function run(): Promise<void> {
     const r = await get('/api/v1/ready');
     assert.equal(r.status, 200, JSON.stringify(r.body));
     assert.equal(r.body.status, 'ready');
-    assert.deepEqual(r.body.checks, { db: true, redis: true, storage: true, sms: true, shuttingDown: false });
+    assert.deepEqual(r.body.checks, { db: true, redis: true, storage: true, sms: true, riskPolicy: true, shuttingDown: false });
   });
 
   // ---- Readiness: a failed dependency (Redis) → 503 ----

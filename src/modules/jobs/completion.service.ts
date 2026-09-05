@@ -9,7 +9,19 @@ import { getStorageProvider } from '../../storage';
 import { StorageError } from '../../storage/storage.provider';
 import { inspectImage } from '../../utils/image';
 import { logger } from '../../utils/logger';
+import { countOpenBlockingRisks } from '../risk/risk.service';
+import { assertRiskPolicyApproved } from '../risk/risk-policy.service';
+import { currentSummaryDigest, buildCompletionSnapshot, buildSignableSummary, getCompletionSnapshot, SUMMARY_SCHEMA_VERSION, SNAPSHOT_SCHEMA_VERSION } from '../completion/summary.service';
 import type { AuthUser } from '../../types/auth';
+
+/** Phase 10D: exposes the server-built signable summary + digest to routes. */
+export async function getSignableSummary(jobId: number) {
+  return buildSignableSummary(jobId);
+}
+/** Phase 10D: exposes a stored immutable completion snapshot (latest cycle if omitted). */
+export async function getCompletionSnapshotFor(jobId: number, cycle?: number) {
+  return getCompletionSnapshot(jobId, cycle);
+}
 
 interface RequestMeta {
   ip: string | null;
@@ -32,6 +44,7 @@ export interface CompletionReason {
     | 'STOP_REJECTED'
     | 'REQUIRED_PHOTOS_MISSING'
     | 'INVALID_MEASUREMENT'
+    | 'CRITICAL_RISK_UNRESOLVED'
     | 'CUSTOMER_SIGNATURE_REQUIRED';
   message: string;
 }
@@ -45,6 +58,7 @@ export interface CompletionReadiness {
     stops: boolean;
     photos: boolean;
     measurements: boolean;
+    risks: boolean;
     signature: boolean;
   };
 }
@@ -70,14 +84,14 @@ function toThousandths(v: number): number {
 export async function validateJobCompletion(jobId: number, trx?: Knex.Transaction): Promise<CompletionReadiness> {
   const conn = trx ?? db;
   const reasons: CompletionReason[] = [];
-  const conditions = { checklist: true, stops: true, photos: true, measurements: true, signature: true };
+  const conditions = { checklist: true, stops: true, photos: true, measurements: true, risks: true, signature: true };
 
   const checklist = await conn('job_checklists').where({ job_id: jobId }).first();
   if (!checklist) {
     return {
       canComplete: false,
       reasons: [{ code: 'CHECKLIST_NOT_ASSIGNED', message: 'Ishga checklist biriktirilmagan' }],
-      conditions: { checklist: false, stops: false, photos: false, measurements: false, signature: false },
+      conditions: { checklist: false, stops: false, photos: false, measurements: false, risks: false, signature: false },
     };
   }
 
@@ -188,14 +202,27 @@ export async function validateJobCompletion(jobId: number, trx?: Knex.Transactio
     }
   }
 
-  // 4. §22–23 customer confirmation: a READY signature bound to the CURRENT
+  const jobForSig = await conn('jobs').where({ id: jobId }).first();
+  const currentCycle = jobForSig?.cycle ?? 1;
+
+  // 4. §22 "no unresolved critical issue" (Phase 10D risk engine): a BLOCKING
+  //    (CRITICAL) risk of the CURRENT cycle that is still OPEN/MITIGATION
+  //    prevents completion. Prior-cycle risks stay visible but do not gate the
+  //    current close. The count is recomputed from risk_events under the same
+  //    transaction as the close (job row locked), so a blocking risk cannot be
+  //    raised concurrently with a successful completion.
+  const openBlocking = await countOpenBlockingRisks(conn, jobId, currentCycle);
+  if (openBlocking > 0) {
+    conditions.risks = false;
+    reasons.push({ code: 'CRITICAL_RISK_UNRESOLVED', message: `Hal qilinmagan kritik xavf(lar): ${openBlocking} ta` });
+  }
+
+  // 5. §22–23 customer confirmation: a READY signature bound to the CURRENT
   //    completion cycle (Phase 10B). After a reopen the job's cycle advances,
   //    so a pre-reopen signature (older cycle) no longer authorizes the
   //    corrected work — a fresh signature is required.
-  const jobForSig = await conn('jobs').where({ id: jobId }).first();
-  const currentCycle = jobForSig?.cycle ?? 1;
   const signature = await conn('customer_signatures')
-    .where({ job_id: jobId, cycle: currentCycle, status: 'READY' })
+    .where({ job_id: jobId, cycle: currentCycle, status: 'READY' }).whereNull('superseded_at')
     .first();
   if (!signature) {
     conditions.signature = false;
@@ -254,7 +281,7 @@ export async function assertReadyEvidenceObjects(jobId: number): Promise<void> {
   const job = await db('jobs').where({ id: jobId }).first();
   const currentCycle = job?.cycle ?? 1;
   const sig = await db('customer_signatures')
-    .where({ job_id: jobId, cycle: currentCycle, status: 'READY' })
+    .where({ job_id: jobId, cycle: currentCycle, status: 'READY' }).whereNull('superseded_at')
     .orderBy('id', 'desc')
     .first();
   if (sig) targets.push({ storageKey: sig.storage_key, size: sig.size_bytes });
@@ -300,7 +327,7 @@ export interface SignatureDetail {
 export async function getSignature(actor: AuthUser, jobId: number): Promise<SignatureDetail | null> {
   const job = await loadScopedJob(actor, jobId);
   const row = await db('customer_signatures')
-    .where({ job_id: jobId, cycle: job.cycle, status: 'READY' })
+    .where({ job_id: jobId, cycle: job.cycle, status: 'READY' }).whereNull('superseded_at')
     .orderBy('id', 'desc')
     .first();
   if (!row) return null;
@@ -313,7 +340,7 @@ export async function getSignatureStream(
 ): Promise<{ stream: import('node:stream').Readable; mimeType: string; sizeBytes: number }> {
   const job = await loadScopedJob(actor, jobId);
   const row = await db('customer_signatures')
-    .where({ job_id: jobId, cycle: job.cycle, status: 'READY' })
+    .where({ job_id: jobId, cycle: job.cycle, status: 'READY' }).whereNull('superseded_at')
     .orderBy('id', 'desc')
     .first();
   if (!row) throw ApiError.notFound('Imzo topilmadi');
@@ -338,6 +365,7 @@ export async function saveSignature(
   jobId: number,
   file: { buffer: Buffer },
   meta: RequestMeta,
+  summaryDigest?: string,
 ): Promise<SignatureDetail> {
   const info = inspectImage(file.buffer);
   if ('error' in info) {
@@ -367,13 +395,34 @@ export async function saveSignature(
     if (!checklist || !checklist.completed_at) {
       throw ApiError.conflict("Imzo olishdan avval checklist to'liq yakunlanishi kerak", 'CHECKLIST_INCOMPLETE');
     }
-    // At most one READY (or in-flight PENDING) signature for the current cycle.
+    // Phase 10D (§23): bind the signature to the EXACT signable work summary.
+    // The server recomputes the authoritative digest under the lock; if the
+    // client submitted the digest it displayed and it no longer matches (the
+    // work changed after the summary was shown), reject as stale.
+    const boundDigest = await currentSummaryDigest(jobId, trx);
+    if (summaryDigest && boundDigest && summaryDigest !== boundDigest) {
+      throw ApiError.conflict('Ish tafsiloti o\'zgardi — yangilangan xulosani qayta ko\'ring va imzolang', 'SUMMARY_STALE');
+    }
+    // At most one ACTIVE (non-superseded) READY/PENDING signature per cycle.
+    // Phase 10D re-sign: if the active READY signature no longer matches the
+    // current summary (something material changed), supersede it (kept in
+    // history, never overwritten) and allow a fresh signature. A still-matching
+    // signature blocks a needless duplicate.
     const existing = await trx('customer_signatures')
       .where({ job_id: jobId, cycle: job.cycle })
       .whereIn('status', ['PENDING', 'READY'])
+      .whereNull('superseded_at')
+      .orderBy('id', 'desc')
       .first();
     if (existing) {
-      throw ApiError.conflict('Bu ish uchun mijoz imzosi allaqachon olingan', 'SIGNATURE_EXISTS');
+      if (existing.status === 'PENDING' || existing.summary_digest === boundDigest) {
+        throw ApiError.conflict('Bu ish uchun mijoz imzosi allaqachon olingan', 'SIGNATURE_EXISTS');
+      }
+      await trx('customer_signatures').where({ id: existing.id }).update({ superseded_at: trx.fn.now() });
+      await logAudit(
+        { userId: actor.id, action: 'SIGNATURE_INVALIDATED', entityType: 'job', entityId: jobId, oldValue: { signatureId: existing.id }, newValue: { reason: 'SUMMARY_CHANGED', cycle: job.cycle }, ...meta },
+        trx,
+      );
     }
 
     const [newId] = await trx('customer_signatures').insert({
@@ -386,6 +435,8 @@ export async function saveSignature(
       content_type: mime,
       size_bytes: size,
       hash,
+      summary_digest: boundDigest,
+      summary_schema_version: SUMMARY_SCHEMA_VERSION,
     });
 
     await logAudit(
@@ -474,6 +525,52 @@ async function markSignatureFailed(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 10D: signable-summary freshness + immutable completion snapshot
+// ---------------------------------------------------------------------------
+
+/**
+ * A READY signature must still match the CURRENT work summary at completion
+ * time. If anything material changed after the customer signed (installation,
+ * checklist attempt/evidence, STOP/risk state, assignee, identity, cycle,
+ * checklist version), the digest differs → the signature is stale and a fresh
+ * one is required. Runs under the job lock inside the close transaction.
+ */
+async function assertSignatureFresh(trx: Knex.Transaction, jobId: number, cycle: number): Promise<void> {
+  const sig = await trx('customer_signatures').where({ job_id: jobId, cycle, status: 'READY' }).whereNull('superseded_at').orderBy('id', 'desc').first();
+  if (!sig) return; // the gate already requires a signature; nothing to compare
+  const current = await currentSummaryDigest(jobId, trx);
+  if (sig.summary_digest && current && sig.summary_digest !== current) {
+    throw new ApiError(409, 'SIGNATURE_STALE', 'Imzo eskirgan — ish tafsiloti o\'zgardi, mijoz qayta imzolashi kerak');
+  }
+}
+
+/**
+ * Finalizes the immutable completion snapshot for a cycle inside the close
+ * transaction. Idempotent (unique job_id+cycle); server-built from authoritative
+ * rows; the digest binds the summary + the accepted signature.
+ */
+async function finalizeSnapshot(trx: Knex.Transaction, jobId: number, cycle: number, actorId: number, meta: RequestMeta): Promise<void> {
+  const existing = await trx('completion_snapshots').where({ job_id: jobId, cycle }).first();
+  if (existing) return;
+  const built = await buildCompletionSnapshot(trx, jobId, cycle, actorId);
+  await trx('completion_snapshots').insert({
+    job_id: jobId,
+    cycle,
+    schema_version: SNAPSHOT_SCHEMA_VERSION,
+    provenance: 'FINALIZED',
+    content: JSON.stringify(built.content),
+    digest: built.digest,
+    summary_digest: built.summaryDigest,
+    signature_hash: built.signatureHash,
+    finalized_by: actorId,
+  });
+  await logAudit(
+    { userId: actorId, action: 'COMPLETION_SNAPSHOT_FINALIZED', entityType: 'job', entityId: jobId, newValue: { cycle, digest: built.digest, schemaVersion: SNAPSHOT_SCHEMA_VERSION }, ...meta },
+    trx,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Master close (§22)
 // ---------------------------------------------------------------------------
 
@@ -511,6 +608,11 @@ export async function closeJob(actor: AuthUser, jobId: number, meta: RequestMeta
     if (!readiness.canComplete) {
       throw new ApiError(422, 'COMPLETION_BLOCKED', "Ishni yopish shartlari to'liq bajarilmagan", readiness.reasons);
     }
+    // Phase 10D governance: completion fails closed under an unapproved risk policy.
+    await assertRiskPolicyApproved(trx);
+    // Phase 10D: the accepted signature must still match the current summary.
+    const cycle = job.cycle ?? 1;
+    await assertSignatureFresh(trx, jobId, cycle);
 
     if (reopenCycle) {
       await trx('jobs').where({ id: jobId }).update({ status: 'QUALITY_REVIEW', updated_at: trx.fn.now() });
@@ -545,6 +647,8 @@ export async function closeJob(actor: AuthUser, jobId: number, meta: RequestMeta
       },
       trx,
     );
+    // Phase 10D: immutable completion snapshot for this cycle (idempotent).
+    await finalizeSnapshot(trx, jobId, cycle, actor.id, meta);
   });
 }
 
@@ -643,6 +747,9 @@ export async function confirmQuality(actor: AuthUser, jobId: number, meta: Reque
     if (!readiness.canComplete) {
       throw new ApiError(422, 'COMPLETION_BLOCKED', "Ishni yopish shartlari to'liq bajarilmagan", readiness.reasons);
     }
+    const cycle = job.cycle ?? 1;
+    await assertRiskPolicyApproved(trx);
+    await assertSignatureFresh(trx, jobId, cycle);
 
     await trx('jobs')
       .where({ id: jobId })
@@ -660,5 +767,7 @@ export async function confirmQuality(actor: AuthUser, jobId: number, meta: Reque
       },
       trx,
     );
+    // Phase 10D: immutable completion snapshot for the reopened cycle.
+    await finalizeSnapshot(trx, jobId, cycle, actor.id, meta);
   });
 }

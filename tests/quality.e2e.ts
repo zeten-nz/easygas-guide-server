@@ -140,6 +140,9 @@ async function cleanup(): Promise<void> {
       await db('job_checklists').whereIn('id', checklistIds).del();
     }
     await db('audit_logs').where('entity_type', 'job').whereIn('entity_id', jobIds.map(String)).del();
+    await db('risk_events').whereIn('job_id', jobIds).del();
+    await db('completion_snapshots').whereIn('job_id', jobIds).del();
+    await db('job_assignments').whereIn('job_id', jobIds).del();
     await db('jobs').whereIn('id', jobIds).del();
   }
 

@@ -33,9 +33,15 @@
     "test:encryption": "tsx tests/encryption.e2e.ts",
     "test:runtime": "tsx tests/runtime.e2e.ts",
     "test:maintenance": "tsx tests/maintenance.e2e.ts",
+    "test:risk": "tsx tests/risk.e2e.ts",
+    "test:assignment": "tsx tests/assignment.e2e.ts",
+    "test:snapshot": "tsx tests/snapshot.e2e.ts",
+    "test:gps": "tsx tests/gps.e2e.ts",
+    "test:riskpolicy": "tsx tests/risk-policy.e2e.ts",
     "reconcile": "tsx src/modules/evidence/reconcile.cli.ts",
     "cleanup": "tsx src/maintenance/cleanup.cli.ts",
-    "test:all": "npm run test:auth && npm run test:rbac && npm run test:demo-seed && npm run test:cv && npm run test:jobs && npm run test:checklist && npm run test:stop && npm run test:rework && npm run test:completion && npm run test:quality && npm run test:hardening && npm run test:storage && npm run test:evidence && npm run test:reconcile && npm run test:session && npm run test:ratelimit && npm run test:sms && npm run test:encryption && npm run test:runtime && npm run test:maintenance"
+    "risk-policy": "tsx src/modules/risk/risk-policy.cli.ts",
+    "test:all": "npm run test:auth && npm run test:rbac && npm run test:demo-seed && npm run test:cv && npm run test:jobs && npm run test:checklist && npm run test:stop && npm run test:rework && npm run test:completion && npm run test:quality && npm run test:hardening && npm run test:storage && npm run test:evidence && npm run test:reconcile && npm run test:session && npm run test:ratelimit && npm run test:sms && npm run test:encryption && npm run test:runtime && npm run test:maintenance && npm run test:risk && npm run test:assignment && npm run test:snapshot && npm run test:gps && npm run test:riskpolicy"
   },
   "keywords": [],
   "author": "",
