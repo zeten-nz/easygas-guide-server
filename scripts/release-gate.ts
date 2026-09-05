@@ -34,7 +34,11 @@ const ATTESTED = [
   { id: 'db_migrations_verified', description: 'DB migrations verified (down/up) in CI' },
   { id: 'test_restore_succeeded', description: 'A test restore from backup succeeded' },
   { id: 'prod_npm_audit_meets_policy', description: 'Production npm audits meet policy (prod deps 0)' },
-  { id: 'fullstack_playwright_passed', description: 'Full-stack Playwright E2E passed' },
+  {
+    id: 'fullstack_playwright_passed',
+    description:
+      'COMPLETE full-stack SAFETY browser E2E passed on GitHub-hosted Actions (e2e-fullstack workflow: workflow.spec happy/blocking/reopen/assignment/GPS on desktop + Pixel 5, no skips) — the local Playwright smoke and the visual/responsive spec do NOT satisfy this',
+  },
   { id: 'backup_configured_and_restore_tested', description: 'Backups configured AND restore tested' },
   { id: 'nginx_firewall_trustproxy_verified', description: 'Nginx/firewall/TRUST_PROXY_HOPS verified' },
   { id: 'production_secrets_distinct_strong', description: 'Production secrets are distinct and strong' },

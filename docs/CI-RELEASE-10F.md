@@ -8,6 +8,13 @@ settings to configure by hand in GitHub.
 > `.github/workflows/`. Phase 10F adds/derives no GitHub *settings*; §E lists recommendations to
 > apply manually in the GitHub UI.
 
+> **GitHub CI status:** the workflows are **locally validated** (YAML parses via the editor language
+> server; step commands, npm scripts, service ports, env-var names, artifact paths and the tokenless
+> public checkout were reviewed against a clean Linux runner) but this branch is **unpushed**, so no
+> GitHub Actions run exists yet. GitHub CI **cannot be claimed as passed before pushing** —
+> _locally validated, awaiting first GitHub run._ The full-stack browser suite itself has been run
+> end-to-end locally (see §C and `FRONTEND-E2E-10F.md`).
+
 ---
 
 ## A. Server CI — `server/.github/workflows/ci.yml` (`server-ci`)
@@ -67,29 +74,55 @@ Self-lints the workflow files.
 
 Self-lints the workflow files.
 
-> The client's blocking gate runs **unit + component** tests and *discovers* (does not execute)
-> the Playwright specs. Full browser E2E is a **separate** workflow — see §C.
+> The client's per-repo gate runs **unit + component** tests and *discovers* (does not execute)
+> the Playwright specs — keeping it fast and hermetic. The full browser E2E **executes** in the
+> separate `e2e-fullstack` workflow, which is a **blocking check on PRs** — see §C.
 
 ---
 
-## C. Cross-repo full-stack E2E — `client/.github/workflows/e2e-fullstack.yml`
+## C. Cross-repo full-stack browser E2E — `e2e-fullstack` (both repos)
 
-- **Not part of the blocking gate.** Triggers: `workflow_dispatch` + a **weekly schedule**.
-- Checks out **client + server**, spins up MySQL + Redis, builds the server, installs Chromium, and
-  runs `npm run test:e2e` — the client's Playwright `webServer` starts the `../server` harness and
-  Vite together for a real full-stack browser run.
-- The server checkout needs repo variable **`SERVER_REPO`** + a **read-only** secret
-  **`SERVER_REPO_TOKEN`** (or public repos).
-- **Fails loudly if `SERVER_REPO` is not configured** — it is never silently skipped.
+Both GitHub repositories are **PUBLIC** — `zeten-nz/easygas-guide` (client) and
+`zeten-nz/easygas-guide-server` (server) — so the cross-repo checkout needs **no credential of any
+kind**: no `SERVER_REPO_TOKEN`, no PAT, no deploy key, no org secret. The "other" repo is fetched
+with a **tokenless, read-only, shallow HTTPS clone** (`git clone --depth 1 --branch <ref>
+https://github.com/…`), and the `actions/checkout` of the current repo uses
+`persist-credentials: false` so nothing is left on disk.
 
-### Why cross-repo E2E must be separate
+Each repo carries a **symmetric mirror** of the same workflow:
 
-The default `GITHUB_TOKEN` **cannot check out a *different* private repository**. So a full-stack
-browser E2E that needs both repos **cannot** be a blocking check on the client gate without an
-explicitly configured, read-only cross-repo credential. Rather than weaken the client gate (or bake
-in a broad token), full-stack E2E is isolated to an opt-in / scheduled workflow that fails visibly
-when its cross-repo credential is missing. The per-repo CI gates stay fast, hermetic, and
-self-contained.
+| Workflow | Tests |
+|---|---|
+| `client/.github/workflows/e2e-fullstack.yml` | **client PR branch × server `main`** |
+| `server/.github/workflows/e2e-fullstack.yml` | **server PR branch × client `main`** |
+
+- **Triggers:** `pull_request` (a **blocking check** on relevant PRs), `push` to `main`, and
+  `workflow_dispatch` (optional `client_ref` / `server_ref` inputs for coordinated PR testing).
+- **No `repository_dispatch`** is used in either direction, so there is **no cross-repo trigger
+  loop**. `concurrency` cancels superseded runs.
+- Least-privilege `permissions: contents: read`; actions pinned to release tags; per-job timeout.
+- Spins up **MySQL 8 + Redis 7** service containers, builds the server, installs Playwright
+  Chromium, then runs `npm run test:e2e` — the client's Playwright `webServer` starts the
+  `../server` harness (isolated `easygas_test` DB, fake SMS, in-memory storage, **ACTIVE** test risk
+  matrix, seeded published template + per-(flow × project) DRAFT jobs) and Vite together.
+- **Executes the complete browser safety journeys** (`e2e/workflow.spec.ts`): happy path, blocking
+  risk, reopen, assignment, and GPS states — on **desktop Chrome + Pixel 5** — plus the
+  visual/responsive spec. Every status transition is driven through the real UI/API.
+
+### The workflow fails loudly (never a silent green)
+
+- **Zero specs discovered** → fails (`--list` count guard).
+- **Any spec skipped, or zero specs executed** → fails (`scripts/assert-e2e-complete.mjs` reads the
+  Playwright JSON report after the run with `if: always()`; reopen now runs on **both** profiles, so
+  there are no sanctioned skips to whitelist).
+- **Backend not ready** → the Playwright `webServer` health gate on `/api/v1/health` must pass
+  before specs run; **migrations that fail** or an **inactive risk policy** abort the harness at
+  boot, so the run fails.
+- **Unexpected severe browser console errors / unexpected failed API requests** during a clean
+  journey → fail the run (`guardPage` on the happy path; the visual spec guards the primary routes).
+
+> Backend HTTP e2e (`server/tests/*.e2e.ts`) and the client component tests are **not** counted as
+> browser E2E — only `workflow.spec.ts` / `visual.spec.ts` run in a real browser here.
 
 ---
 
@@ -118,12 +151,18 @@ excluded** from the contract.
 - `server-ci / secret scan`
 - `server-ci / actionlint`
 
+- `e2e-fullstack / browser E2E (server PR × client main)` — **add after its first successful run**
+
 **Client repo** — require:
 
 - `client-ci / lint · types · tests · build`
 - `client-ci / actionlint`
+- `e2e-fullstack / browser E2E (client PR × server main)` — **add after its first successful run**
 
-> The cross-repo `e2e-fullstack` workflow is **not** a required check (it cannot be — see §C).
+> The cross-repo `e2e-fullstack` workflow **is** intended as a required check now that both repos
+> are public and the checkout needs no credential (see §C). GitHub only offers a check as
+> "required" once it has reported at least once, so **add it to branch protection after its first
+> successful GitHub Actions run** (a name cannot be pre-required before it has ever executed).
 
 ### Recommended rule settings (both repos, `main`)
 

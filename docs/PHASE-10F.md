@@ -36,6 +36,14 @@ Migration `20260907000001_event_timestamp_precision` upgraded event-ordering col
 `stop_approvals.submitted_at`/`decided_at`, `job_steps.completed_at`). Ordering authority remains the
 monotonic numeric id (+ attempt/sort_order); timestamps are never the sole race authority.
 
+### Audit timestamp now hashed (10F correction)
+The audit `entry_hash` now covers **`created_at`** (hash schema bumped to **`v2`**), closing a gap
+where a row's event time could be changed undetected. `logAudit` takes **one** canonical
+`UTC_TIMESTAMP(6)` inside the append transaction and uses that exact value for **both** the persisted
+`created_at` and the hash input; verification re-formats the stored value identically and never
+re-derives "now". Corrected **in place** on the existing migration set (unpushed; migrations never
+left an isolated `*_test` DB). → `AUDIT-INTEGRITY-10F.md`
+
 ### OpenAPI contract
 OpenAPI 3.1 single source of truth (`src/openapi/spec.ts`, 88 operations / 72 paths / 18 tags) →
 `docs/openapi.json` via `npm run openapi:gen`; `npm run openapi:check` validates structure, unique
@@ -47,8 +55,12 @@ pagination shapes, per-operation RBAC, and readiness/liveness.
 `server-ci` (build & test on MySQL+Redis services, typecheck/build/openapi:check, migration down/up,
 audit smoke, full `test:all`, focused concurrency, prod `npm audit` GATE; + secret scan + actionlint)
 and `client-ci` (lint/types/tests/build, bundle-size budget, prod `npm audit` GATE, Playwright spec
-discovery; + actionlint). Cross-repo full-stack E2E is a separate, non-blocking workflow (default
-`GITHUB_TOKEN` cannot check out a second private repo). → `CI-RELEASE-10F.md`
+discovery; + actionlint). **Cross-repo full-stack browser E2E (`e2e-fullstack`)** is a **symmetric,
+blocking** PR check in **both PUBLIC repos** — a tokenless read-only HTTPS clone of the other repo
+(no `SERVER_REPO_TOKEN`/PAT/deploy-key), `pull_request` + `push main` + `workflow_dispatch`, no
+`repository_dispatch` loop; it executes the complete browser safety journeys and fails on zero
+specs / any skip / not-ready backend / severe console or API errors. → `CI-RELEASE-10F.md`,
+`FRONTEND-E2E-10F.md`
 
 ### Release gate
 `npm run release:gate` — LIVE blockers (migrations, ACTIVE+approved risk matrix, SMS ready, audit
@@ -67,11 +79,11 @@ with split `easygas-api` + `easygas-sms-worker`, `nginx.example.conf`, `.env.pro
 
 | Suite | Result |
 |---|---|
-| Server `npm run test:all` | **27 suites, 361 tests, 0 failed** (incl. observability 5, audit 6) |
-| `npm run test:audit` | 6/6 (chaining, concurrency 15→15, append-only block, verify clean, content tamper, deletion gap) |
+| Server `npm run test:all` | **27 suites, 0 failed** (incl. observability 5, audit **11**) |
+| `npm run test:audit` | **11/11** (chaining w/ created_at, concurrency 15→15, append-only block, verify clean, per-field tamper: content·**created_at**·actor·action·entity·prev_hash, deletion gap) |
 | `npm run test:observability` | 5/5 (redaction, 404/404/200 metrics gating, low-cardinality labels) |
 | Client `npm test` | **51 tests** (7 unit + 44 component) |
-| Client e2e (Playwright) | **8** (safety + visual), executed on system Edge in dev |
+| Client full-stack browser E2E (`workflow.spec` + `visual`) | **12** per pass (happy·blocking·reopen·assignment·GPS × desktop Chrome + Pixel 5, + visual), **run twice** (no fixture leakage), executed on system Edge in dev. GitHub `e2e-fullstack`: _locally validated, awaiting first GitHub run._ |
 | Server `npm audit` | prod **0**, full **0** |
 | Client `npm audit` | prod **0**, full **5** (dev-only Vitest/Vite/esbuild; fixable only by a Vitest major — deferred, never shipped) |
 
@@ -105,7 +117,8 @@ Both cause `npm run release:gate` to exit **3 (BLOCKED)** — as intended.
 |---|---|
 | `AUDIT-INTEGRITY-10F.md` | Audit hash chain, verification, off-server anchoring, GRANTs |
 | `OBSERVABILITY-10F.md` | Logging/request-id, redaction, metrics, `/metrics` gating, cardinality |
-| `CI-RELEASE-10F.md` | CI workflows, cross-repo E2E, action pinning, branch protection |
+| `CI-RELEASE-10F.md` | CI workflows, tokenless public cross-repo E2E, action pinning, branch protection |
+| `client/docs/FRONTEND-E2E-10F.md` | Full-stack browser safety journeys, harness, running twice, CI gate |
 | `RELEASE-CHECKLIST-10F.md` | Release gate checks, known blockers, attestation |
 | `OPERATIONS-RUNBOOK-10F.md` | PM2, rollout, migrations, scheduled jobs, metrics, shutdown, readiness |
 | `INCIDENT-RESPONSE-10F.md` | Severity levels, per-scenario playbooks |

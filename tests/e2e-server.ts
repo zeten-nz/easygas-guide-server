@@ -89,40 +89,55 @@ async function ensurePublishedTemplate(): Promise<void> {
 }
 
 /**
- * One deterministic assigned job for the demo USTA so /app/my-jobs is not empty.
- * Best-effort: a seeding hiccup must never prevent the API from starting, so any
- * error is logged and swallowed.
+ * A deterministic POOL of DRAFT jobs assigned to the demo USTA — one per browser
+ * workflow so the flows never contend on shared state. Each has a stable plate
+ * (E2E-HAPPY / E2E-BLOCK / E2E-ASSIGN / E2E-GPS / E2E-REOPEN) the specs claim by
+ * name. Prerequisites only (customer/vehicle/DRAFT job + self-assignment); the
+ * tested behavior runs through the real UI. Best-effort: never blocks startup.
  */
-async function ensureSeedJob(): Promise<void> {
+// One DRAFT job per (flow × browser project) so destructive flows never contend
+// across the shared backend — including reopen, which now runs on BOTH profiles
+// (no skipped specs, so CI can fail on any skip). Plates are the stable keys the
+// specs claim (E2E-<FLOW>-<cr|mo>). Short codes fit vehicles.plate_number(12):
+// HAP=happy BLK=blocking ASG=assignment GPS=gps VIW=visual RE=reopen.
+function buildPlates(): string[] {
+  const flows = ['HAP', 'BLK', 'ASG', 'GPS', 'VIW', 'RE'];
+  const projects = ['cr', 'mo'];
+  const plates: string[] = [];
+  for (const f of flows) for (const p of projects) plates.push(`E2E-${f}-${p}`);
+  return plates;
+}
+const E2E_PLATES = buildPlates();
+
+async function ensureSeedJobs(): Promise<void> {
   try {
     const usta = await db('users').where({ phone: '+998901000001' }).first();
+    const master = await db('users').where({ phone: '+998901000002' }).first();
     if (!usta) return;
-    if (await db('jobs').where({ assigned_technician_id: usta.id }).first()) return;
-
     let customer = await db('customers').where({ name: 'E2E Demo Mijoz' }).first();
     if (!customer) {
       const [cid] = await db('customers').insert({ name: 'E2E Demo Mijoz', phone: '+998900009999', created_by: usta.id });
       customer = await db('customers').where({ id: cid }).first();
     }
-    let vehicle = await db('vehicles').where({ plate_number: 'E2E001' }).first();
-    if (!vehicle) {
-      const [vid] = await db('vehicles').insert({ customer_id: customer.id, plate_number: 'E2E001', make: 'Chevrolet', model: 'Cobalt', created_by: usta.id });
-      vehicle = await db('vehicles').where({ id: vid }).first();
+    // A second eligible technician (MASTER, same branch) so reassignment has a target.
+    for (const plate of E2E_PLATES) {
+      if (await db('vehicles').where({ plate_number: plate }).first()) continue;
+      const [vid] = await db('vehicles').insert({ customer_id: customer.id, plate_number: plate, make: 'Chevrolet', model: 'Cobalt', created_by: usta.id });
+      const [jobId] = await db('jobs').insert({
+        customer_id: customer.id,
+        vehicle_id: vid,
+        branch_id: usta.branch_id,
+        status: 'DRAFT',
+        created_by: usta.id,
+        assigned_technician_id: usta.id,
+        assignment_status: 'ASSIGNED',
+        cycle: 1,
+      });
+      await db('job_assignments').insert({ job_id: jobId, cycle: 1, technician_id: usta.id, assigned_by: usta.id, provenance: 'SELF_AT_CREATION' });
     }
-    const [jobId] = await db('jobs').insert({
-      customer_id: customer.id,
-      vehicle_id: vehicle.id,
-      branch_id: usta.branch_id,
-      status: 'DRAFT',
-      created_by: usta.id,
-      assigned_technician_id: usta.id,
-      assignment_status: 'ASSIGNED',
-      cycle: 1,
-    });
-    await db('job_assignments').insert({ job_id: jobId, cycle: 1, technician_id: usta.id, assigned_by: usta.id, provenance: 'SELF_AT_CREATION' });
-    console.log(`[e2e-server] seeded assigned job #${jobId} for demo USTA`);
+    console.log(`[e2e-server] seeded ${E2E_PLATES.length} DRAFT jobs for demo USTA (master target: ${master ? 'yes' : 'no'})`);
   } catch (err) {
-    console.warn('[e2e-server] seed job skipped:', err instanceof Error ? err.message : err);
+    console.warn('[e2e-server] seed jobs skipped:', err instanceof Error ? err.message : err);
   }
 }
 
@@ -138,7 +153,7 @@ async function main(): Promise<void> {
   setStorageProviderForTesting(new MemoryStorageProvider());
   await ensureActivePolicy();
   await ensurePublishedTemplate();
-  await ensureSeedJob();
+  await ensureSeedJobs();
 
   const app = createApp();
   const server = app.listen(PORT, () => {

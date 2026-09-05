@@ -121,6 +121,11 @@ async function appendChained(trx: Knex.Transaction, entry: AuditEntry): Promise<
   const prevHash = head.head_hash;
   const chainSeq = Number(head.head_seq) + 1;
   const entityId = entry.entityId != null ? String(entry.entityId) : null;
+  // ONE canonical UTC microsecond timestamp, taken inside this transaction, used
+  // for BOTH the persisted created_at and the hash input — never re-derived at
+  // verify time (so the event time is covered by the chain).
+  const tsRes = (await trx.raw("SELECT DATE_FORMAT(UTC_TIMESTAMP(6), '%Y-%m-%d %H:%i:%s.%f') AS ts")) as [{ ts: string }[], unknown];
+  const createdAt = tsRes[0][0].ts;
   const entryHash = computeEntryHash({
     chainId,
     chainSeq,
@@ -133,6 +138,7 @@ async function appendChained(trx: Knex.Transaction, entry: AuditEntry): Promise<
     newValue: entry.newValue ?? null,
     ip: entry.ip ?? null,
     userAgent: entry.userAgent ?? null,
+    createdAt,
   });
   await trx('audit_logs').insert({
     user_id: entry.userId ?? null,
@@ -143,6 +149,7 @@ async function appendChained(trx: Knex.Transaction, entry: AuditEntry): Promise<
     new_value: entry.newValue != null ? JSON.stringify(entry.newValue) : null,
     ip: entry.ip ?? null,
     user_agent: entry.userAgent ?? null,
+    created_at: createdAt,
     chain_id: chainId,
     chain_seq: chainSeq,
     prev_hash: prevHash,

@@ -54,6 +54,7 @@ interface AuditRow {
   new_value: unknown;
   ip: string | null;
   user_agent: string | null;
+  created_at_fmt: string; // canonical 'YYYY-MM-DD HH:MM:SS.ffffff' (never re-derived)
 }
 
 async function verifyChain(conn: Knex, chainId: string, pageSize: number): Promise<ChainResult> {
@@ -66,7 +67,8 @@ async function verifyChain(conn: Knex, chainId: string, pageSize: number): Promi
       .where({ chain_id: chainId })
       .andWhere('chain_seq', '>', after)
       .orderBy('chain_seq', 'asc')
-      .limit(pageSize)) as AuditRow[];
+      .limit(pageSize)
+      .select('*', conn.raw("DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s.%f') as created_at_fmt"))) as AuditRow[];
     if (rows.length === 0) break;
     for (const r of rows) {
       const seq = Number(r.chain_seq);
@@ -88,6 +90,7 @@ async function verifyChain(conn: Knex, chainId: string, pageSize: number): Promi
         newValue: parseMaybeJson(r.new_value),
         ip: r.ip,
         userAgent: r.user_agent,
+        createdAt: r.created_at_fmt,
       });
       if (recomputed !== r.entry_hash) {
         return { chainId, entries, ok: false, error: `entry_hash mismatch at seq ${seq} (content tampered?)` };

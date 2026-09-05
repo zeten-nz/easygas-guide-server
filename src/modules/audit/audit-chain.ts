@@ -21,7 +21,11 @@ import { createHash } from 'node:crypto';
  * audit payloads by design; see gps/completion services).
  */
 
-export const CHAIN_VERSION = 'v1';
+// Hash schema version. v2 (Phase 10F acceptance) additionally hashes the event
+// timestamp (created_at) so an audit row's apparent time cannot be changed
+// without breaking the chain. Bumped from v1; a version change re-anchors the
+// canonical form, so v1 and v2 hashes are intentionally not interchangeable.
+export const CHAIN_VERSION = 'v2';
 
 /** Deterministic serialization: object keys sorted, stable across the round-trip
  *  through MySQL JSON storage (which may reorder keys). */
@@ -47,6 +51,15 @@ export interface ChainFields {
   newValue: unknown; // parsed object / null
   ip: string | null;
   userAgent: string | null;
+  /**
+   * Canonical event timestamp as an exact string 'YYYY-MM-DD HH:MM:SS.ffffff'
+   * (UTC, microsecond). The SAME string is used for the persisted created_at and
+   * for this hash input — never re-derived at verify time — so changing a row's
+   * apparent time breaks the chain. (audit_logs has no branch/scope column, so
+   * scope is not a persisted audit field; every other persisted semantic field
+   * IS hashed.)
+   */
+  createdAt: string;
 }
 
 /** The exact string that is hashed for an entry (write- and verify-time identical). */
@@ -64,6 +77,7 @@ export function buildCanonical(f: ChainFields): string {
     newValue: f.newValue ?? null,
     ip: f.ip ?? null,
     userAgent: f.userAgent ?? null,
+    createdAt: f.createdAt,
   });
 }
 

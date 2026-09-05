@@ -28,8 +28,10 @@ Full detail: `PHASE-10F.md` and the topic docs listed at the bottom.
 ### Audit integrity — IMPLEMENTED + TESTED
 - Tamper-evident **per-UTC-day hash chain** over `audit_logs` (`chain_id`, `chain_seq`, `prev_hash`,
   `entry_hash`); `audit_chain_heads` lock table serializes same-day appends (deadlock-free, audit is
-  the last lock); deterministic canonical `entry_hash` (`created_at` intentionally not hashed).
-  Migration `20260907000002_audit_log_integrity` (reversible).
+  the last lock); deterministic canonical `entry_hash` covering **every semantically-meaningful
+  field including `created_at`** (hash schema **v2**; one canonical `UTC_TIMESTAMP(6)` used for both
+  the persisted timestamp and the hash). Migration `20260907000002_audit_log_integrity` (reversible;
+  v2 corrected in place — unpushed, migrations never left an isolated `*_test` DB).
 - Append-only `BEFORE UPDATE` trigger (`audit_logs_no_update`); deletion is **detected** via a
   `chain_seq` gap (blocked in prod via restricted GRANTs, not at DB level in tests).
 - **Legacy honesty:** pre-migration rows are NOT retro-chained (`chain_id` NULL); boundary recorded
@@ -68,11 +70,18 @@ Full detail: `PHASE-10F.md` and the topic docs listed at the bottom.
   timeouts, actions pinned to release tags (note: pin to SHAs in-org).
 - `client-ci`: lint · types · tests · build, bundle-size budget (main gz ≤175 KB / total gz ≤320 KB;
   current ~121/~210), prod `npm audit` GATE, Playwright spec discovery + actionlint.
-- `e2e-fullstack` (client): **separate, non-blocking** cross-repo browser E2E — the default
-  `GITHUB_TOKEN` cannot check out a second private repo, so it needs `SERVER_REPO` + read-only
-  `SERVER_REPO_TOKEN`; fails loudly if unconfigured.
+- `e2e-fullstack` (**both PUBLIC repos**, symmetric mirror): cross-repo full-stack **browser** E2E,
+  intended as a **blocking PR check**. Both repos are public → the other repo is fetched by a
+  **tokenless, read-only, shallow HTTPS clone** (NO `SERVER_REPO_TOKEN`/PAT/deploy-key/org-secret;
+  `persist-credentials: false`). Client PR × server main; server PR × client main. Triggers
+  `pull_request` + `push main` + `workflow_dispatch` (optional refs); **no `repository_dispatch`
+  loop**. Executes the complete browser safety journeys and **fails on** zero specs, **any skip** or
+  zero executed (`assert-e2e-complete.mjs` over the Playwright JSON report), not-ready backend,
+  failed migrations, inactive risk policy, or severe console/API errors. _Locally validated; awaiting
+  first GitHub run._ → `FRONTEND-E2E-10F.md`
 - **Branch protection = RECOMMENDATION only** (configure in GitHub manually): see `CI-RELEASE-10F.md`
-  §E for required checks and PR/force-push/environment rules.
+  §E for required checks (add the `e2e-fullstack` check **after its first successful GitHub run**) and
+  PR/force-push/environment rules.
 
 ### Release gate — IMPLEMENTED
 - `npm run release:gate` (`--json` + human): LIVE blockers (migrations, ACTIVE+approved risk matrix,
@@ -94,9 +103,13 @@ Full detail: `PHASE-10F.md` and the topic docs listed at the bottom.
 2. **Risk matrix v1 is DRAFT** until an EasyGas safety specialist approves it.
 
 ### Test summary (executed this phase)
-- Server `test:all`: **27 suites, 361 tests, 0 failed** (incl. observability 5, audit 6).
-- Client: **51 tests** (7 unit + 44 component) — **TESTED**; **8** Playwright (safety + visual) —
-  **MANUALLY-VERIFIED** on system Edge in dev.
+- Server `test:all`: **27 suites, 0 failed** (incl. observability 5, audit **11** — per-field tamper
+  incl. `created_at`/actor).
+- Client: **51 tests** (7 unit + 44 component) — **TESTED**; full-stack **browser** E2E
+  (`workflow.spec` happy·blocking·reopen·assignment·GPS × desktop + Pixel 5, + `visual`) — **12 per
+  pass, run twice, all green** — **MANUALLY-VERIFIED** on system Edge in dev. GitHub `e2e-fullstack`:
+  _locally validated, awaiting first GitHub run._ (The old 8 smoke specs are superseded; they do NOT
+  satisfy the complete full-stack requirement.)
 - Audits: server prod 0 / full 0; client prod 0 / full 5 (dev-only Vitest/Vite/esbuild — **DEFERRED**,
   fixable only by a Vitest major, never shipped).
 
@@ -123,6 +136,7 @@ All phases below are **IMPLEMENTED + TESTED** unless noted. Full history remains
 | **10C** | Session lifecycle, Redis abstraction, atomic rate limiting (fail-closed auth), durable encrypted SMS outbox + worker, readiness/liveness, graceful shutdown, prod config validation, cleanup CLI. **Eskiz adapter deferred** (fail-closed stub) | `PRODUCTION-RUNTIME-10C.md` |
 | **10D** | Safety domain: server-authoritative risk engine + versioned matrix governance (DRAFT→ACTIVE→RETIRED, one-ACTIVE singleton), §22 critical-completion gate, assignment/responsibility, immutable snapshots (SHA-256), GPS evidence. **Risk matrix v1 DRAFT/provisional** | `SAFETY-DOMAIN-10D.md` |
 | **10E** | Frontend integration & branding: real EASY GAS branding, light-first token system, safety widgets wired into routed job-detail, route code-splitting, error boundaries; risk-policy concurrency made race-proof; Playwright reproducible (8/8 on Edge) | `client/docs/FRONTEND-UX-10E.md` |
+| **10F** | CI (both repos) + tokenless symmetric cross-repo **full-stack browser E2E** (5 safety journeys × desktop + Pixel 5, run twice); dependency-free token-gated metrics + expanded redaction; OpenAPI 3.1 SoT + drift check; **audit hash chain now covers `created_at`** (v2, 11 tamper tests); production release gate (live + attested, no bypass); ops docs & deploy artifacts | `PHASE-10F.md`, `CI-RELEASE-10F.md`, `AUDIT-INTEGRITY-10F.md`, `FRONTEND-E2E-10F.md` |
 
 ---
 
@@ -133,7 +147,8 @@ All phases below are **IMPLEMENTED + TESTED** unless noted. Full history remains
 | `PHASE-10F.md` | Phase summary |
 | `AUDIT-INTEGRITY-10F.md` | Audit hash chain, verification, off-server anchoring, GRANTs |
 | `OBSERVABILITY-10F.md` | Logging/request-id, redaction, metrics, `/metrics` gating, cardinality |
-| `CI-RELEASE-10F.md` | CI workflows, cross-repo E2E, action pinning, branch protection |
+| `CI-RELEASE-10F.md` | CI workflows, tokenless public cross-repo E2E, action pinning, branch protection |
+| `client/docs/FRONTEND-E2E-10F.md` | Full-stack browser safety journeys, the harness, running twice, CI gate |
 | `RELEASE-CHECKLIST-10F.md` | Release gate checks, known blockers, attestation |
 | `OPERATIONS-RUNBOOK-10F.md` | PM2, rollout, migrations, scheduled jobs, metrics, shutdown, readiness |
 | `INCIDENT-RESPONSE-10F.md` | Severity levels, per-scenario playbooks |

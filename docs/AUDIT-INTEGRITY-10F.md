@@ -71,20 +71,32 @@ rolls back, no audit row and no head advance survive.
 ## 4. What `entry_hash` covers
 
 `entry_hash = sha256(canonical)` where `canonical` is a **deterministic, sorted-key**
-serialization of exactly these fields:
+serialization of **every semantically-meaningful persisted field** of the row:
 
 ```
-version, chain_id, chain_seq, prev_hash,
-user_id, action, entity_type, entity_id,
-old_value, new_value, ip, user_agent
+version (hash schema, "v2"), chain_id, chain_seq, prev_hash,
+user_id (actor), action, entity_type, entity_id,
+old_value, new_value, ip, user_agent,
+created_at (canonical UTC-microsecond event time)
 ```
+
+Only `entry_hash` itself and the row's surrogate `id` are excluded — `id` is a storage detail, not
+security-relevant, and `entry_hash` is the output. (`audit_logs` has no branch/scope column; branch
+context, when relevant, is inside `old_value`/`new_value`, which are hashed.)
 
 Notes:
 
-- **`created_at` is intentionally NOT hashed.** The ordering authority is `chain_seq`, not the
-  timestamp; `created_at` is informational. (Its precision was independently upgraded to
-  microseconds — see `TIMESTAMP-PRECISION` in the Phase 10F migration set — but it remains a
-  non-authoritative field.)
+- **`created_at` IS hashed (Phase 10F correction).** Earlier the timestamp was left out, which let a
+  row's event time be changed without detection. It is now covered. To keep insert and re-verify
+  bit-identical, `logAudit` obtains **one** canonical timestamp — `SELECT UTC_TIMESTAMP(6)`
+  formatted to `YYYY-MM-DD HH:MM:SS.ffffff` **inside the append transaction** — and uses that exact
+  string for **both** the persisted `created_at` **and** the hash input. Verification re-formats the
+  stored `created_at` the same way and never re-derives "now", so a change to `created_at` breaks the
+  hash. `chain_seq` remains the ordering authority; hashing `created_at` additionally makes the
+  recorded time itself tamper-evident.
+- **Hash schema is explicitly versioned:** `version` is the first canonical field and is bumped to
+  **`v2`** for the created_at-inclusive layout. A `v1` hash and a `v2` hash of the same logical row
+  are deliberately **not** interchangeable, so the schema change can never be silently confused.
 - **No secrets are in the payload by existing design.** Audit rows already never contain a raw
   signature, OTP, token, GPS coordinate, or other secret: GPS rows store only accuracy/purpose,
   signatures store only a SHA-256 hash. The chain hashes only what the row already holds — it
@@ -129,7 +141,7 @@ hash and checks three independent properties, **per chain**, bounded/paginated:
 
 | Check | Detects |
 |---|---|
-| `entry_hash` recomputes and matches | Content tampering (any hashed field changed) |
+| `entry_hash` recomputes and matches | Content tampering of **any** hashed field — actor, action, entity type/id, `old_value`/`new_value`, ip/user-agent, and **`created_at` (event time)** |
 | `prev_hash` links to the prior entry's `entry_hash` | Reordering / substitution |
 | `chain_seq` is contiguous from 1 | Deletion (a gap) |
 
@@ -209,11 +221,18 @@ State this limitation honestly in any compliance conversation: the system is
 
 ## 11. Tests — `npm run test:audit`
 
-`tests/audit-integrity.e2e.ts`, 6 tests, all passing:
+`tests/audit-integrity.e2e.ts`, **11 tests, all passing**:
 
-1. New entries are chained and their hashes recompute correctly.
+1. A real audited action produces a chained entry whose hash recomputes correctly (**with
+   `created_at` hashed**).
 2. Concurrency: 15 concurrent audited actions → head advances by exactly 15, no duplicate seq.
 3. Append-only: an UPDATE to an audit row is blocked by the trigger.
-4. A good chain verifies clean (exit 0).
-5. Content tamper is detected (exit 2).
-6. Deletion (a `chain_seq` gap) is detected (exit 2).
+4. A correctly-built chain verifies clean (exit 0).
+5.–10. **Per-field tamper detection** — each of `new_value` (content), **`created_at`**, actor
+   (`user_id`), `action`, `entity_id`, and `prev_hash` is modified in isolation and detected
+   (exit 2). This proves the hash covers the timestamp and the actor, not just the payload.
+11. Deletion (a `chain_seq` gap) is detected (exit 2).
+
+> Because 10F is unpushed and its migrations have not escaped an isolated `*_test` database, the
+> created_at-inclusive (`v2`) hashing was corrected **in place** on the same migration set (the test
+> DB is dropped/recreated by `npm run test:e2e:reset`), rather than adding a second migration.
