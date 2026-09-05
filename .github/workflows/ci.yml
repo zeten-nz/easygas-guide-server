@@ -6,9 +6,11 @@
 # migration down/up verification, dependency audits, and secret scanning.
 #
 # No real secrets are used: APP_KEY is generated at runtime; DB/Redis creds are
-# throwaway service-container values; no production hostnames. Action versions are
-# pinned to stable release tags — pin to a commit SHA in your org for
-# supply-chain hardening (see docs/CI-RELEASE-10F.md).
+# throwaway service-container values; no production hostnames. Official actions are
+# SHA-PINNED to their verified latest release (the `# vX.Y.Z` comment documents the
+# tag) so a re-pointed tag cannot change what runs and no deprecated runtime remains
+# (see docs/CI-RELEASE-10F.md). Third-party actions (gitleaks, actionlint) are kept
+# at their reviewed major tag and are intentionally NOT version-bumped here.
 name: server-ci
 
 on:
@@ -64,8 +66,8 @@ jobs:
       CLIENT_ORIGIN: http://localhost:5173
       TRUST_PROXY_HOPS: "0"
     steps:
-      - uses: actions/checkout@v4.2.2
-      - uses: actions/setup-node@v4.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
           cache: npm
@@ -113,7 +115,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: gitleaks
@@ -128,6 +130,6 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: actionlint (self-validate workflows)
         uses: raven-actions/actionlint@v2

@@ -23,6 +23,7 @@ import './helpers/test-env';
 // strictly non-production, never set by the `test:all` ratelimit suite).
 process.env.E2E_DISABLE_RATE_LIMIT = '1';
 import { assertTestDatabase } from './helpers/test-env';
+import express from 'express';
 import { db } from '../src/config/database';
 import { createApp } from '../src/app';
 import { setSmsProviderForTesting } from '../src/sms';
@@ -141,6 +142,33 @@ async function ensureSeedJobs(): Promise<void> {
   }
 }
 
+/**
+ * Non-sensitive fixture readiness for the browser E2E harness. Reports ONLY
+ * booleans/counts and the SHORT plate codes (E2E-*) the specs claim — never PII,
+ * cookies, tokens, OTPs, GPS coordinates or signatures. Used by the preflight
+ * endpoint and the boot self-check so a seeding failure is caught BEFORE Playwright
+ * opens a browser (instead of surfacing as 12 confusing "job not found" failures).
+ */
+async function fixtureReadiness(): Promise<{
+  ready: boolean;
+  expectedPlates: number;
+  seededPlates: number;
+  missingPlates: string[];
+  publishedTemplate: boolean;
+  activeRiskPolicy: boolean;
+}> {
+  const jobRows = await db('jobs')
+    .join('vehicles', 'vehicles.id', 'jobs.vehicle_id')
+    .whereIn('vehicles.plate_number', E2E_PLATES)
+    .distinct('vehicles.plate_number as plate');
+  const seeded = new Set(jobRows.map((r: { plate: string }) => r.plate));
+  const missingPlates = E2E_PLATES.filter((p) => !seeded.has(p));
+  const publishedTemplate = (await listAssignableTemplates()).some((t) => t.name === 'E2E Checklist');
+  const activeRiskPolicy = (await db('risk_matrix_versions').where({ status: 'ACTIVE' }).first()) != null;
+  const ready = missingPlates.length === 0 && publishedTemplate && activeRiskPolicy;
+  return { ready, expectedPlates: E2E_PLATES.length, seededPlates: seeded.size, missingPlates, publishedTemplate, activeRiskPolicy };
+}
+
 async function main(): Promise<void> {
   await assertTestDatabase(db); // fail-closed: refuse any non-*_test database
   setSmsProviderForTesting({
@@ -155,9 +183,42 @@ async function main(): Promise<void> {
   await ensurePublishedTemplate();
   await ensureSeedJobs();
 
-  const app = createApp();
-  const server = app.listen(PORT, () => {
-    console.log(`[e2e-server] API listening on http://127.0.0.1:${PORT} (DB=${process.env.DB_NAME}) — fake SMS, memory storage, policy ACTIVE`);
+  // Boot self-check: refuse to start if the fixtures the browser specs depend on
+  // are incomplete — a clear, early error instead of 12 opaque "job not found"
+  // Playwright failures. Playwright's webServer health gate then never opens.
+  const readiness = await fixtureReadiness();
+  if (!readiness.ready) {
+    console.error(
+      `[e2e-server] FIXTURE PREFLIGHT FAILED — refusing to start. ` +
+        `plates ${readiness.seededPlates}/${readiness.expectedPlates}` +
+        (readiness.missingPlates.length ? ` missing=[${readiness.missingPlates.join(', ')}]` : '') +
+        ` publishedTemplate=${readiness.publishedTemplate} activeRiskPolicy=${readiness.activeRiskPolicy}. ` +
+        `Is the server on the Phase 10F harness (reset-test-db + per-flow seeds)?`,
+    );
+    await db.destroy();
+    process.exit(1);
+  }
+
+  // Preflight-first wrapper: an UNAUTHENTICATED, non-sensitive readiness endpoint
+  // mounted BEFORE the real app (so it sits ahead of the app's 404), then the real
+  // app handles everything else. Lets Playwright's global setup verify fixtures
+  // before opening any browser.
+  const wrapper = express();
+  wrapper.get('/api/v1/e2e/preflight', async (_req, res) => {
+    try {
+      const r = await fixtureReadiness();
+      res.status(r.ready ? 200 : 503).json(r);
+    } catch (err) {
+      res.status(500).json({ ready: false, error: err instanceof Error ? err.message : 'preflight error' });
+    }
+  });
+  wrapper.use(createApp());
+
+  const server = wrapper.listen(PORT, () => {
+    console.log(
+      `[e2e-server] API listening on http://127.0.0.1:${PORT} (DB=${process.env.DB_NAME}) — fake SMS, memory storage, policy ACTIVE; ` +
+        `fixtures READY (${readiness.seededPlates}/${readiness.expectedPlates} plates, template=${readiness.publishedTemplate}, policy=${readiness.activeRiskPolicy})`,
+    );
   });
 
   const shutdown = () => { server.close(() => db.destroy().finally(() => process.exit(0))); };

@@ -3,6 +3,7 @@ import { db } from '../../config/database';
 import { ApiError } from '../../utils/errors';
 import { logAudit } from '../audit/audit.service';
 import { can, jobsBranchScope } from '../../rbac/permissions';
+import { safePage, safePageSize } from '../../utils/pagination';
 import type { AuthUser, RoleCode } from '../../types/auth';
 
 /**
@@ -94,8 +95,10 @@ export async function getAssignmentHistory(actor: AuthUser, jobId: number): Prom
 }
 
 export async function listMyJobs(actor: AuthUser, opts: { page?: number; pageSize?: number } = {}): Promise<{ items: any[]; page: number; pageSize: number; total: number }> {
-  const page = Math.max(1, opts.page ?? 1);
-  const pageSize = Math.min(100, Math.max(1, opts.pageSize ?? 20));
+  // safePage/safePageSize (not `?? default`) so a NaN from Number('abc') can never
+  // reach .offset() — nullish coalescing does not catch NaN.
+  const page = safePage(opts.page);
+  const pageSize = safePageSize(opts.pageSize);
   const q = db('jobs').where({ assigned_technician_id: actor.id });
   const [{ c }] = (await q.clone().count({ c: '*' })) as [{ c: number | string }];
   const rows = await q

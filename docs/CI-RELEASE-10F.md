@@ -186,8 +186,39 @@ approval** (required reviewers) so deploys are gated independently of merges to 
 
 ## F. Action-pinning posture
 
-Action versions are pinned to **stable release tags** — `actions/checkout@v4.2.2`,
-`actions/setup-node@v4.1.0`.
+**Official GitHub actions are pinned to a verified commit SHA** (with a `# vX.Y.Z` comment recording
+the tag), so a re-pointed tag cannot silently change what runs, and no deprecated action runtime
+remains. The first GitHub run rejected `actions/cache@v4.1.2` as deprecated; the fix updated every
+official action to its latest release, SHA-pinned:
 
-> **Supply-chain hardening note:** for in-org use, pin actions to **commit SHAs** rather than tags,
-> so a re-pointed tag cannot silently change what runs in CI.
+| Action | Tag | Pinned commit |
+|---|---|---|
+| `actions/checkout` | `v7.0.1` | `3d3c42e5aac5ba805825da76410c181273ba90b1` |
+| `actions/setup-node` | `v7.0.0` | `820762786026740c76f36085b0efc47a31fe5020` |
+| `actions/cache` | `v6.1.0` | `55cc8345863c7cc4c66a329aec7e433d2d1c52a9` |
+| `actions/upload-artifact` | `v7.0.1` | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` |
+
+Each tag was confirmed as the current latest release on the action's official GitHub releases page,
+and each SHA resolved with `git ls-remote`. **Third-party** actions (`gitleaks/gitleaks-action@v2`,
+`raven-actions/actionlint@v2`) are deliberately **left at their reviewed major tag** — they are not
+version-bumped blind.
+
+## G. Full-stack E2E robustness (first-run hardening)
+
+- **Logs the exact refs/SHAs** it is testing at the start of the job (client SHA + server SHA), so a
+  coordinated run's inputs are unambiguous. Refs default to `main` and are overridable via
+  `workflow_dispatch` — no stale commit is ever hard-coded.
+- **Fixture preflight** — the harness exposes an unauthenticated, non-sensitive
+  `GET /api/v1/e2e/preflight` (booleans/counts + short plate codes only), and the client's Playwright
+  `global-setup` calls it **before opening any browser**. If the wrong/old server was cloned (e.g. a
+  pre-10F `main` with no preflight route → 404), the run fails fast with a clear message instead of 12
+  opaque "job not found" failures. The harness also self-checks fixtures at boot and refuses to start
+  if they are incomplete.
+- **Accurate result gate** — `scripts/assert-e2e-complete.mjs` reads the Playwright JSON report and
+  reports discovered / executed / passed / failed / flaky / skipped / interrupted / global-errors,
+  failing with the *real* reason (e.g. "12 spec(s) failed", not a misleading "zero executed"). It has
+  its own unit-test suite (`npm run test:ci-assert`).
+- **Failure artifacts** — on `failure() || cancelled()` it uploads the HTML report, `test-results/`
+  (traces/screenshots/error-context), the JSON report, and a **redacted** harness log (SMS/OTP lines
+  dropped; phones/coordinates scrubbed — never DB dumps, cookies, tokens, OTPs, GPS or signatures).
+  `if-no-files-found: warn` so a missing report never masks the original test failure.

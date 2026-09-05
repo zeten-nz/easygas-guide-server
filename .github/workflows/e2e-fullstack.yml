@@ -74,13 +74,19 @@ jobs:
       E2E_API_PORT: "4000"
     steps:
       - name: Checkout server (this repo)
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: server
           persist-credentials: false
       - name: Clone client (public, tokenless, read-only)
         run: git clone --depth 1 --branch "$CLIENT_REF" "$CLIENT_REPO_URL" client
-      - uses: actions/setup-node@v4.1.0
+      - name: Log the exact client + server refs/SHAs under test
+        run: |
+          echo "server ref : ${{ github.ref }} (event: ${{ github.event_name }})"
+          echo "server SHA : $(git -C server rev-parse HEAD)"
+          echo "client ref : $CLIENT_REF"
+          echo "client SHA : $(git -C client rev-parse HEAD)"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
       - name: Generate a throwaway APP_KEY
@@ -101,17 +107,35 @@ jobs:
           COUNT=$(npx playwright test --list 2>/dev/null | grep -c '›' || true)
           echo "discovered $COUNT tests"
           if [ "$COUNT" -eq 0 ]; then echo "::error::no Playwright tests discovered"; exit 1; fi
-      - name: Run full-stack Playwright (client webServer starts ../server harness + Vite)
+      - name: Run full-stack Playwright (webServer starts ../server harness + Vite; global-setup preflights fixtures)
         working-directory: client
-        run: npm run test:e2e
-      - name: Assert every spec ran (no skips, non-empty)
+        run: |
+          set -o pipefail
+          npm run test:e2e 2>&1 | tee playwright-e2e.log
+      - name: Assert every spec ran AND passed (no skips / failures / empties)
         if: always()
         working-directory: client
         run: node scripts/assert-e2e-complete.mjs test-results.json
-      - name: Upload Playwright report on failure
-        if: failure()
-        uses: actions/upload-artifact@v4.4.3
+      - name: Redact harness logs (drop SMS/OTP lines; scrub phones/coords)
+        if: failure() || cancelled()
+        working-directory: client
+        run: |
+          if [ -f playwright-e2e.log ]; then
+            sed -E -e '/\[e2e-sms\]/d' \
+                   -e 's/\+998[0-9]{9}/+998*********/g' \
+                   -e 's/[0-9]{1,3}\.[0-9]{4,}/<coord>/g' \
+                   playwright-e2e.log > playwright-e2e.redacted.log || true
+            rm -f playwright-e2e.log
+          fi
+      - name: Upload E2E artifacts (HTML report, traces/screenshots/error-context, JSON, redacted log)
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: playwright-report-server-pr
-          path: client/playwright-report
+          name: e2e-artifacts-server-pr
+          path: |
+            client/playwright-report
+            client/test-results
+            client/test-results.json
+            client/playwright-e2e.redacted.log
+          if-no-files-found: warn
           retention-days: 7

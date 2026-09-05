@@ -4,6 +4,7 @@ import { ApiError } from '../../utils/errors';
 import { logAudit } from '../audit/audit.service';
 import { can } from '../../rbac/permissions';
 import { jobsBranchScope } from '../../rbac/permissions';
+import { safePage, safePageSize } from '../../utils/pagination';
 import { type RiskSource } from './risk-matrix';
 import { assessRisk } from './risk-policy.service';
 import type { AuthUser } from '../../types/auth';
@@ -325,8 +326,9 @@ export async function listRisks(
   const job = await db('jobs').where({ id: jobId }).first();
   if (!job || (scope !== null && job.branch_id !== scope)) throw ApiError.notFound('Ish topilmadi');
 
-  const page = Math.max(1, opts.page ?? 1);
-  const pageSize = Math.min(100, Math.max(1, opts.pageSize ?? 50));
+  // safePage/safePageSize (not `?? default`) so a NaN offset can never reach Knex.
+  const page = safePage(opts.page);
+  const pageSize = safePageSize(opts.pageSize, 50);
   const base = db('risk_events').where({ job_id: jobId });
   if (opts.cycle != null) base.where({ cycle: opts.cycle });
   const [{ c }] = (await base.clone().count({ c: '*' })) as [{ c: number | string }];
