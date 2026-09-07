@@ -21,6 +21,7 @@ import { setStorageProviderForTesting } from '../src/storage';
 import { StorageError } from '../src/storage/storage.provider';
 import { MemoryStorageProvider } from './helpers/memory-storage';
 import { reconcileEvidence } from '../src/modules/evidence/reconcile.service';
+import { MAX_PHOTOS_PER_ATTEMPT } from '../src/modules/photos/photos.service';
 
 const USERS = {
   admin: '+998990008701',
@@ -343,6 +344,43 @@ async function run(): Promise<void> {
     assert.equal(b.status, 201, `b: ${JSON.stringify(b.body)}`);
     const ready = await db('job_photos').where({ job_step_id: job.steps[1].id, status: 'READY' });
     assert.equal(ready.length, 2);
+  });
+
+  // ---- 7b. Overlapping TX1/TX2 regression (job-first locking, no deadlock) ----
+  // Higher, uncontrolled concurrency reliably interleaves one upload's TX1 with
+  // another's TX2 — the ABBA that used to deadlock (job_steps FOR UPDATE in TX1 vs
+  // jobs FOR UPDATE in TX2). Every valid upload within the limit must become READY;
+  // a 409 CONFLICT_RETRY (deadlock) is a failure, not an accepted outcome.
+  await test('many concurrent uploads within the limit ALL become READY (no deadlock)', async () => {
+    const job = await mkJob('TEV0C1AA');
+    await complete(job.jobId, job.steps[0].id);
+    const N = 8; // < MAX_PHOTOS_PER_ATTEMPT
+    const results = await Promise.all(
+      Array.from({ length: N }, (_, i) => upload(stepPath(job.jobId, job.steps[1].id), i % 2 ? PNG : PNG2, usta, `c1-${i}.png`)),
+    );
+    const codes = results.map((r) => r.body?.error?.code).filter(Boolean);
+    assert.equal(results.filter((r) => r.body?.error?.code === 'CONFLICT_RETRY').length, 0, `deadlock (CONFLICT_RETRY) must never occur; codes=${codes}`);
+    assert.ok(results.every((r) => r.status === 201), `all ${N} must be 201; got statuses=${results.map((r) => r.status)} codes=${codes}`);
+    const ready = await db('job_photos').where({ job_step_id: job.steps[1].id, status: 'READY' });
+    assert.equal(ready.length, N, 'exactly N READY rows');
+  });
+
+  // ---- 7c. Per-attempt limit under concurrency (exactly MAX, rest PHOTO_LIMIT) ----
+  await test('concurrent uploads at the per-attempt limit: exactly MAX READY, excess PHOTO_LIMIT, never a deadlock', async () => {
+    const job = await mkJob('TEV0C2BB');
+    await complete(job.jobId, job.steps[0].id);
+    const N = MAX_PHOTOS_PER_ATTEMPT + 4; // over the limit
+    const results = await Promise.all(
+      Array.from({ length: N }, (_, i) => upload(stepPath(job.jobId, job.steps[1].id), PNG, usta, `c2-${i}.png`)),
+    );
+    const ok = results.filter((r) => r.status === 201).length;
+    const limited = results.filter((r) => r.status === 409 && r.body?.error?.code === 'PHOTO_LIMIT').length;
+    const conflictRetry = results.filter((r) => r.body?.error?.code === 'CONFLICT_RETRY').length;
+    assert.equal(conflictRetry, 0, 'a deadlock (CONFLICT_RETRY) must never occur under concurrency');
+    assert.equal(ok, MAX_PHOTOS_PER_ATTEMPT, `exactly ${MAX_PHOTOS_PER_ATTEMPT} succeed (got ${ok}); statuses=${results.map((r) => r.status)}`);
+    assert.equal(limited, N - MAX_PHOTOS_PER_ATTEMPT, `the ${N - MAX_PHOTOS_PER_ATTEMPT} over the limit are cleanly rejected PHOTO_LIMIT`);
+    const ready = await db('job_photos').where({ job_step_id: job.steps[1].id, status: 'READY' });
+    assert.equal(ready.length, MAX_PHOTOS_PER_ATTEMPT, 'the limit is enforced atomically — never exceeded');
   });
 
   // ---- 16. Path traversal / fake type / oversize / high-dimension ----

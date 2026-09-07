@@ -73,11 +73,19 @@ function assertImage(buffer: Buffer): { mime: ImageMime } {
  * storage write BETWEEN the transactions (a DB transaction can never span
  * object storage):
  *
- *   TX1: lock job+step, re-validate workable state / step PENDING / attempt /
- *        count limit, INSERT the row as PENDING, audit PHOTO_UPLOAD_STARTED.
+ *   TX1: lock JOB then step (job-first — the canonical order used across the
+ *        codebase), re-validate workable state / step PENDING / attempt / count
+ *        limit, INSERT the row as PENDING, audit PHOTO_UPLOAD_STARTED.
  *   PUT: write the object, then stat() it and verify the stored size.
- *   TX2: lock job+step again, re-validate the SAME attempt still PENDING, then
- *        flip PENDING→READY (+ready_at) and audit PHOTO_UPLOAD_READY.
+ *   TX2: lock JOB then step again (same job-first order), re-validate the SAME
+ *        attempt still PENDING, then flip PENDING→READY (+ready_at) and audit
+ *        PHOTO_UPLOAD_READY.
+ *
+ * Both transactions acquire locks in the SAME order — jobs → job_steps → the
+ * photo row — and audit (audit_chain_heads) is always last, so concurrent uploads
+ * can never form a lock cycle. (An earlier version locked job_steps first in TX1
+ * and only took the jobs lock implicitly via the INSERT's FK, the opposite of
+ * TX2's jobs→job_steps, which deadlocked under concurrency.)
  *
  * Invariants:
  *  - The completion gate counts only READY rows, so a crash between TX1 and TX2
@@ -108,8 +116,21 @@ export async function uploadStepPhoto(
   const storageKey = `photos/${jobId}/${jobStepId}/${crypto.randomUUID()}.${EXT_BY_MIME[mime]}`;
   const size = file.buffer.length;
 
-  // ---- TX1: register PENDING under the job+step lock ----
+  // ---- TX1: register PENDING under the job+step lock (JOB FIRST) ----
   const registered = await db.transaction(async (trx) => {
+    // Lock the JOB row FIRST — the canonical job→step order used everywhere else
+    // (completion, checklist, stop). Previously TX1 locked job_steps first and
+    // only acquired the jobs lock implicitly (and later) via the job_photos
+    // INSERT's foreign key (S on jobs). That is the OPPOSITE order from TX2
+    // (jobs→job_steps), so two concurrent uploads deadlocked: TX1 held X job_steps
+    // and waited S jobs while TX2 held X jobs and waited X job_steps. Locking the
+    // job first makes both paths job→step and removes the cycle. Re-validate the
+    // job is workable UNDER the lock (not only via the pre-transaction read).
+    const jobRow = await trx('jobs').where({ id: jobId }).forUpdate().first();
+    if (!jobRow || !isWorkable(jobRow)) {
+      throw ApiError.conflict("Foto yuklash uchun ish ish jarayonida bo'lishi kerak", 'JOB_NOT_IN_PROGRESS');
+    }
+
     const checklist = await trx('job_checklists').where({ job_id: jobId }).first();
     if (!checklist) throw ApiError.notFound('Bu ishga checklist biriktirilmagan');
 
@@ -175,12 +196,15 @@ export async function uploadStepPhoto(
 
   // ---- TX2: finalize READY (or supersede if the workflow moved on) ----
   const finalized = await db.transaction(async (trx) => {
+    // Same job-first order as TX1 (jobs → job_steps → the photo row) so the two
+    // transactions can never form a lock cycle. Re-validate job state, step,
+    // attempt and the PENDING photo row all under these locks.
+    const jobRow = await trx('jobs').where({ id: jobId }).forUpdate().first();
+    const jobStep = await trx('job_steps').where({ id: jobStepId }).forUpdate().first();
     const row = await trx('job_photos').where({ id: registered.id }).forUpdate().first();
     if (!row || row.status !== 'PENDING') {
       return { ok: false as const };
     }
-    const jobRow = await trx('jobs').where({ id: jobId }).forUpdate().first();
-    const jobStep = await trx('job_steps').where({ id: jobStepId }).forUpdate().first();
     const stillValid =
       jobRow && isWorkable(jobRow) && jobStep && jobStep.status === 'PENDING' && jobStep.attempt === registered.attempt;
 

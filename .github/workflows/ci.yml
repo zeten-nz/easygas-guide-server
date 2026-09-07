@@ -1,0 +1,155 @@
+# EASY GAS server CI (Phase 10F).
+#
+# Least-privilege, fail-closed CI: MySQL + Redis service containers, an isolated
+# *_test database, migrations, typecheck, build, OpenAPI contract check, the full
+# test suite (incl. audit-integrity + observability + concurrency suites),
+# migration down/up verification, dependency audits, and secret scanning.
+#
+# No real secrets are used: APP_KEY is generated at runtime; DB/Redis creds are
+# throwaway service-container values; no production hostnames. Official actions are
+# SHA-PINNED to their verified latest release (the `# vX.Y.Z` comment documents the
+# tag) so a re-pointed tag cannot change what runs and no deprecated runtime remains
+# (see docs/CI-RELEASE-10F.md). Third-party actions (gitleaks, actionlint) are kept
+# at their reviewed major tag and are intentionally NOT version-bumped here.
+name: server-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: read-only by default.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref (saves CI, avoids stale results).
+concurrency:
+  group: server-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build & test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: ci_only_throwaway_root
+          MYSQL_DATABASE: easygas
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci_only_throwaway_root"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      NODE_ENV: test
+      DB_HOST: 127.0.0.1
+      DB_PORT: "3306"
+      DB_USER: root
+      DB_PASSWORD: ci_only_throwaway_root
+      DB_NAME: easygas
+      TEST_DB_NAME: easygas_test
+      REDIS_URL: redis://127.0.0.1:6379
+      CLIENT_ORIGIN: http://localhost:5173
+      TRUST_PROXY_HOPS: "0"
+      # The dev/test SMS provider (console) — a healthy, functional provider so the
+      # readiness suite sees sms=ready. Locally this comes from .env; CI had no
+      # SMS_PROVIDER, so the default (unset) left the provider not-ready and
+      # runtime.e2e's "readiness is 200 when healthy" failed. validateProductionConfig
+      # still rejects console for a real production deploy (it is dev-only).
+      SMS_PROVIDER: console
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Generate a throwaway APP_KEY (never a real secret)
+        run: echo "APP_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: OpenAPI contract check (valid, unique opIds, refs resolve, no drift, up to date)
+        run: npm run openapi:check
+      - name: Set up isolated *_test database (migrate + seed)
+        run: npm run test:setup
+      - name: Migration down/up verification
+        env:
+          DB_NAME: easygas_test
+        run: |
+          npm run migrate:rollback
+          npm run migrate
+          npm run migrate:status
+      - name: Re-seed after rollback
+        run: npm run test:setup
+      - name: Audit chain verification (CLI smoke on a clean chain)
+        env:
+          DB_NAME: easygas_test
+        run: npm run audit:verify
+      - name: Full test suite (all e2e incl. audit-integrity + observability)
+        run: npm run test:all
+      - name: Focused concurrency tests (audit chain + risk policy)
+        run: |
+          npm run test:audit
+          npm run test:riskpolicy
+      - name: Real-Redis integration (actual RedisBackend + Lua rate limiter vs the CI Redis service)
+        # The ordinary suites run against the in-memory RedisLike; this suite
+        # exercises the REAL ioredis backend, connection readiness, the Lua rate
+        # limiter (atomicity/TTL/shared counters), bounded failure and the
+        # fail-closed policy against the live redis:7 service (REDIS_URL above).
+        # The redis:7 service is a fresh, throwaway container, so we explicitly
+        # opt in as a disposable target (the suite refuses to run otherwise and
+        # never FLUSHDBs — it deletes only its own namespaced keys).
+        env:
+          REDIS_TEST_DISPOSABLE: "1"
+        run: npm run test:redis-int
+      - name: Production dependency audit (GATE — fail on high/critical)
+        run: npm audit --omit=dev --audit-level=high
+      - name: Full dependency audit (report only, never gates)
+        run: npm audit || true
+
+  secret-scan:
+    name: secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          # The automatic, least-privilege workflow token (NOT a PAT/secret/deploy
+          # key). gitleaks-action@v2 requires it to scan pull requests.
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+
+  workflow-lint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: actionlint (self-validate workflows)
+        uses: raven-actions/actionlint@v2

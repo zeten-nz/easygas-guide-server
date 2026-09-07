@@ -125,6 +125,20 @@ const envSchema = z.object({
    * (tests/helpers/test-env.ts enforces this fail-closed).
    */
   TEST_DB_NAME: z.string().regex(/_test$/, 'TEST_DB_NAME must end with "_test"').optional(),
+
+  /**
+   * Phase 10F operational metrics (Prometheus text exposition at
+   * GET /api/v1/metrics). METRICS_ENABLED toggles the endpoint. METRICS_TOKEN,
+   * when set, is required as `Authorization: Bearer <token>` to scrape. In
+   * production the endpoint is NEVER open: it is refused unless a token is set
+   * and matched (and the deploy layer must keep it off the public vhost).
+   */
+  METRICS_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true' || v === '1') // OFF by default — opt-in, never public by accident
+    .pipe(z.boolean()),
+  METRICS_TOKEN: z.string().min(16, 'METRICS_TOKEN must be at least 16 characters').optional(),
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -142,6 +156,7 @@ if (!parsed.success) {
 export const env = parsed.data;
 
 export const isProduction = env.NODE_ENV === 'production';
+export const isTest = env.NODE_ENV === 'test';
 
 /**
  * Phase 10C production configuration validation. Structural parsing (above)
@@ -208,6 +223,10 @@ export function validateProductionConfig(e: typeof env): string[] {
   if (!(e.SESSION_ROTATE_MINUTES < idleMin)) problems.push('SESSION_ROTATE_MINUTES must be < SESSION_IDLE_MINUTES.');
   if (!(idleMin <= absMin)) problems.push('SESSION_IDLE_MINUTES must be <= SESSION_ABSOLUTE_DAYS.');
   if (e.SESSION_ROTATION_GRACE_SECONDS > 300) problems.push('SESSION_ROTATION_GRACE_SECONDS should be small (<=300).');
+  // Metrics must never be reachable without a strong token in production.
+  if (e.METRICS_ENABLED && !e.METRICS_TOKEN) {
+    problems.push('METRICS_TOKEN must be set when METRICS_ENABLED in production (or set METRICS_ENABLED=false).');
+  }
   return problems;
 }
 

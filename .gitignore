@@ -1,8 +1,12 @@
 node_modules/
 .env
 .env.*
+# Phase 10F: the committed deploy template is safe (placeholders only).
+!deploy/.env.production.example
 dist/
 build/
 coverage/
 *.log
 uploads/
+# Phase 10F: the real release attestation is operational, not source.
+release-attestation.json

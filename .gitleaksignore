@@ -1,0 +1,14 @@
+# gitleaks allowlist — one narrowly-scoped, documented exception (by fingerprint).
+#
+# Each line is a single finding fingerprint (commit:file:rule:startline). This is
+# the narrowest possible exception: it suppresses ONLY this exact finding in this
+# exact historical commit — not the file, not the tests directory, not the rule.
+# Because the fingerprint pins the commit, it also resolves the finding in the
+# commit-history scan (changing the current line would not).
+#
+# FALSE POSITIVE (rule: generic-api-key): a TEST-ONLY, invalid-login password used
+# by the real-Redis integration suite (tests/redis-integration.e2e.ts) inside a
+# login attempt that is DELIBERATELY expected to FAIL — the test asserts 401
+# bad-credentials / 429 fail-closed against a synthetic, non-existent phone. It is
+# not a real credential, is committed nowhere but tests, and authenticates nothing.
+e16e8c953a0f08368e2c73aa17e799164c1375ec:tests/redis-integration.e2e.ts:generic-api-key:214

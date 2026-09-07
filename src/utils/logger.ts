@@ -31,11 +31,25 @@ export const redactPaths = [
   'REDIS_URL',
   'ESKIZ_PASSWORD',
   'S3_SECRET_ACCESS_KEY',
+  'S3_ACCESS_KEY_ID',
+  'METRICS_TOKEN',
+  // Phase 10F: safety-sensitive payloads + PII must never reach logs.
+  'phone',
+  'signature',
+  'latitude',
+  'longitude',
+  'gps',
+  'coordinates',
   // Nested one level (e.g. { config: { password } })
   '*.password',
   '*.token',
   '*.otp',
   '*.authorization',
+  '*.phone',
+  '*.signature',
+  '*.latitude',
+  '*.longitude',
+  '*.coordinates',
 ];
 
 export const logger = pino({

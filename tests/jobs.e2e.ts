@@ -515,6 +515,28 @@ async function run(): Promise<void> {
     assert.ok(page2.body.jobs.length >= 7);
     const ids1 = new Set(page1.body.jobs.map((j: any) => j.id));
     assert.ok(page2.body.jobs.every((j: any) => !ids1.has(j.id)), 'pages must not overlap');
+
+    // Phase 10F regression — the validated `page` DEFAULT must reach the handler.
+    // Express 5's `req.query` is a re-parsing getter, so the old
+    // `Object.assign(req.query, parsed)` lost the default (page→1); the handler
+    // then computed a NaN offset (Knex: "A valid integer must be provided to
+    // offset"), which silently degraded every list to page 1. With ONLY `limit`
+    // (no page) the response must report page 1 and offset must still apply.
+    const noPage = await http('GET', '/api/v1/jobs?limit=5', { cookie: ustaACookie });
+    assert.equal(noPage.status, 200);
+    assert.equal(noPage.body.page, 1, 'omitted page must default to 1 (validated default must persist)');
+    assert.equal(noPage.body.limit, 5, 'omitted-page request must still honour the coerced limit');
+    assert.equal(noPage.body.jobs.length, 5);
+
+    const noPageP2 = await http('GET', '/api/v1/jobs?limit=5&page=2', { cookie: ustaACookie });
+    const firstFive = new Set(noPage.body.jobs.map((j: any) => j.id));
+    assert.ok(
+      noPageP2.body.jobs.every((j: any) => !firstFive.has(j.id)),
+      'offset must apply for a default-page request (no NaN offset)',
+    );
+
+    // A malformed page is rejected cleanly at validation (422), never reaching Knex.
+    assert.equal((await http('GET', '/api/v1/jobs?page=abc', { cookie: ustaACookie })).status, 422);
   });
 
   // 24. Audit completeness
