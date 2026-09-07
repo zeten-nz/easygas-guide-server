@@ -1,5 +1,5 @@
 import { Redis } from 'ioredis';
-import { env, isProduction } from '../config/env';
+import { env, isProduction, isTest } from '../config/env';
 import { logger } from '../utils/logger';
 
 /**
@@ -166,12 +166,23 @@ function buildRedisBackend(url: string): RedisBackend {
 
 /**
  * Returns the process-wide RedisLike. Production requires REDIS_URL (fail-closed
- * abuse controls depend on it); dev/test falls back to the in-memory impl unless
- * REDIS_URL is set.
+ * abuse controls depend on it). Development uses a real Redis when REDIS_URL is
+ * set, else the in-memory impl.
+ *
+ * Under NODE_ENV=test the in-memory impl is used UNCONDITIONALLY — even when a
+ * REDIS_URL is present (e.g. a CI Redis service container). This is the module's
+ * documented design ("no Redis server needed in CI") and it is what makes the
+ * e2e suites correct: the in-memory impl is always ready (no lazy-connect race
+ * that would make the first rate-limited request fail closed with a spurious 429)
+ * and holds no socket/reconnect timer (so a suite never leaves an open handle
+ * that keeps the process alive after it finishes). A suite that needs a specific
+ * impl still injects it explicitly via setRedisForTesting().
  */
 export function getRedis(): RedisLike {
   if (instance) return instance;
-  if (env.REDIS_URL) {
+  if (isTest) {
+    instance = new MemoryRedis();
+  } else if (env.REDIS_URL) {
     instance = buildRedisBackend(env.REDIS_URL);
   } else if (isProduction) {
     throw new Error('REDIS_URL is required in production');
