@@ -50,6 +50,14 @@ export const updateUserSchema = z
   })
   .refine((v) => Object.keys(v).length > 0, { message: "O'zgartirish uchun maydon berilmadi" });
 
+/** Admin manual password recovery: the admin re-confirms their own password and
+ *  gives a mandatory reason. The NEW (temporary) password is generated server-side. */
+export const resetUserPasswordSchema = z.object({
+  currentPassword: z.string().min(1, 'Joriy parolingizni kiriting').max(128),
+  reason: z.string().trim().min(5, "Sabab kamida 5 ta belgidan iborat bo'lishi kerak").max(500),
+});
+
 export type ListUsersQuery = z.infer<typeof listUsersQuerySchema>;
 export type CreateUserInput = z.infer<typeof createUserSchema>;
 export type UpdateUserInput = z.infer<typeof updateUserSchema>;
+export type ResetUserPasswordInput = z.infer<typeof resetUserPasswordSchema>;

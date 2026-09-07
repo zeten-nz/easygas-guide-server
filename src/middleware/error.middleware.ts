@@ -36,6 +36,21 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     return;
   }
 
+  // Any OTHER database driver error (unknown column, parse error, constraint,
+  // connection loss, …) must NEVER leak SQL / schema detail to the client — not
+  // even in development, where the generic handler below would otherwise echo
+  // err.message (which can carry a column/table name). The full error is logged
+  // server-side; the client gets a sanitized 500.
+  const looksLikeDbError =
+    typeof mysqlErrno === 'number' &&
+    (typeof (err as { sqlState?: unknown }).sqlState === 'string' ||
+      /^ER_/.test(String((err as { code?: unknown }).code ?? '')));
+  if (looksLikeDbError) {
+    logger.error({ err, path: req.path, method: req.method }, 'Unhandled database error');
+    res.status(500).json({ error: { code: 'DATABASE_ERROR', message: 'Ichki server xatosi' } });
+    return;
+  }
+
   // Storage failures never leak provider detail to the client.
   if (err instanceof StorageError) {
     logger.error({ err: { kind: err.kind, message: err.message } }, 'Storage error');

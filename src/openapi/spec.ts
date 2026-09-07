@@ -227,90 +227,41 @@ export const openapiSpec = {
         },
       },
     },
-    '/auth/forgot-password': {
+    '/auth/change-password': {
       post: {
         tags: ['Auth'],
-        operationId: 'authForgotPassword',
-        summary: 'Request a password-reset OTP',
-        description: 'Public. Sends a one-time password by SMS. Always responds success to avoid account enumeration.',
-        security: [],
-        requestBody: {
-          required: true,
-          content: {
-            'application/json': {
-              schema: { type: 'object', required: ['phone'], properties: { phone: { type: 'string', example: '+998900000000' } } },
-            },
-          },
-        },
-        responses: {
-          '200': { description: 'OTP dispatched if the account exists.' },
-          '422': { $ref: '#/components/responses/ValidationError' },
-          '429': { $ref: '#/components/responses/TooManyRequests' },
-        },
-      },
-    },
-    '/auth/verify-otp': {
-      post: {
-        tags: ['Auth'],
-        operationId: 'authVerifyOtp',
-        summary: 'Verify a reset OTP',
-        description: 'Public. Exchanges a valid 6-digit OTP for a single-use reset token.',
-        security: [],
+        operationId: 'authChangePassword',
+        summary: 'Change own password',
+        description:
+          'Authenticated. Changes the caller\'s own password. Required to clear the first-login restriction imposed after an admin issues a temporary password (a temporary-password session may reach ONLY this and /auth/me until it succeeds). Verifies the current password, rejects reuse, then revokes all existing sessions and rotates to a fresh session + CSRF token (returned in the x-csrf-token header and body). SMS/OTP self-service recovery has been removed — recovery is performed manually by an admin.',
         requestBody: {
           required: true,
           content: {
             'application/json': {
               schema: {
                 type: 'object',
-                required: ['phone', 'otp'],
+                required: ['currentPassword', 'newPassword'],
                 properties: {
-                  phone: { type: 'string', example: '+998900000000' },
-                  otp: { type: 'string', pattern: '^[0-9]{6}$', example: '000000' },
+                  currentPassword: { type: 'string', format: 'password' },
+                  newPassword: { type: 'string', format: 'password', minLength: 8, maxLength: 128 },
                 },
               },
             },
           },
         },
+        parameters: [{ $ref: '#/components/parameters/CsrfTokenHeader' }],
         responses: {
           '200': {
-            description: 'OTP accepted; reset token returned.',
-            content: {
-              'application/json': {
-                schema: { type: 'object', properties: { resetToken: { type: 'string' } }, required: ['resetToken'] },
-              },
+            description: 'Password changed; a fresh session + CSRF token are issued.',
+            headers: {
+              'x-csrf-token': { $ref: '#/components/headers/XCsrfToken' },
+              'x-session-rotation': { $ref: '#/components/headers/XSessionRotation' },
             },
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/AuthSession' } } },
           },
+          '400': { description: 'Current password wrong, temp password expired, or new password reused / invalid.' },
           '401': { $ref: '#/components/responses/Unauthorized' },
-          '422': { $ref: '#/components/responses/ValidationError' },
-          '429': { $ref: '#/components/responses/TooManyRequests' },
-        },
-      },
-    },
-    '/auth/reset-password': {
-      post: {
-        tags: ['Auth'],
-        operationId: 'authResetPassword',
-        summary: 'Reset password',
-        description: 'Public. Sets a new password using a single-use reset token.',
-        security: [],
-        requestBody: {
-          required: true,
-          content: {
-            'application/json': {
-              schema: {
-                type: 'object',
-                required: ['resetToken', 'password'],
-                properties: {
-                  resetToken: { type: 'string', pattern: '^[0-9a-f]{64}$' },
-                  password: { type: 'string', format: 'password' },
-                },
-              },
-            },
-          },
-        },
-        responses: {
-          '200': { description: 'Password updated.' },
-          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
           '422': { $ref: '#/components/responses/ValidationError' },
           '429': { $ref: '#/components/responses/TooManyRequests' },
         },
@@ -462,6 +413,57 @@ export const openapiSpec = {
           '401': { $ref: '#/components/responses/Unauthorized' },
           '403': { $ref: '#/components/responses/Forbidden' },
           '404': { $ref: '#/components/responses/NotFound' },
+        },
+      },
+    },
+    '/users/{id}/reset-password': {
+      parameters: [{ $ref: '#/components/parameters/IdPath' }],
+      post: {
+        tags: ['Users'],
+        operationId: 'usersResetPassword',
+        summary: 'Issue a temporary password (manual admin recovery)',
+        description:
+          'ADMIN only — requires permission: users.reset_password. Manual employee password recovery: after verifying the employee OUT OF BAND (an admin sends a support request to @EasygasGarantbot; the bot is NOT an automated auth channel), the admin issues a one-time temporary password for a specific employee. The admin re-confirms their OWN current password and gives a mandatory reason. The server generates a cryptographically-random temporary password, atomically sets it (hashed) with must_change_password + a configurable expiry, revokes ALL the employee\'s sessions, and invalidates any prior recovery credentials. A repeated reset invalidates the previous temporary password. The temporary password is returned ONCE in the response (Cache-Control: no-store) and is NEVER logged, cached, put in a URL, or recorded in the audit chain — the audit records only actor/target/reason/timestamp. An admin cannot reset their OWN password here. Blocked / inactive-branch employees stay blocked.',
+        parameters: [{ $ref: '#/components/parameters/CsrfTokenHeader' }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['currentPassword', 'reason'],
+                properties: {
+                  currentPassword: { type: 'string', format: 'password', description: "The admin's own current password (re-auth)." },
+                  reason: { type: 'string', minLength: 5, maxLength: 500 },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '200': {
+            description: 'Temporary password issued (returned once).',
+            headers: { 'Cache-Control': { schema: { type: 'string', example: 'no-store' } } },
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    user: { $ref: '#/components/schemas/UserDetail' },
+                    temporaryPassword: { type: 'string', description: 'One-time secret — display to the admin once; never persisted client-side.' },
+                    expiresAt: { type: 'string', format: 'date-time' },
+                    message: { type: 'string' },
+                  },
+                },
+              },
+            },
+          },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+          '409': { $ref: '#/components/responses/Conflict' },
+          '422': { $ref: '#/components/responses/ValidationError' },
+          '429': { $ref: '#/components/responses/TooManyRequests' },
         },
       },
     },

@@ -38,17 +38,23 @@ export async function register(req: Request, res: Response): Promise<void> {
   });
 }
 
-export async function forgotPassword(req: Request, res: Response): Promise<void> {
-  const result = await authService.requestPasswordReset(req.body.phone, requestMeta(req));
-  res.json(result);
-}
-
-export async function verifyOtp(req: Request, res: Response): Promise<void> {
-  const result = await authService.verifyOtp(req.body.phone, req.body.otp);
-  res.json(result);
-}
-
-export async function resetPassword(req: Request, res: Response): Promise<void> {
-  await authService.resetPassword(req.body.resetToken, req.body.password, requestMeta(req));
-  res.json({ message: "Parol muvaffaqiyatli o'zgartirildi" });
+export async function changePassword(req: Request, res: Response): Promise<void> {
+  const result = await authService.changePassword(
+    req.user!,
+    req.body.currentPassword,
+    req.body.newPassword,
+    requestMeta(req),
+  );
+  // The service revoked the old session and minted a fresh family — rotate the
+  // cookie + session-bound CSRF token so the SPA continues on the new session.
+  setSessionCookie(res, result.token, result.rememberMe, result.expiresAt);
+  res.setHeader('x-csrf-token', csrfTokenFor(result.token));
+  res.setHeader('x-session-rotation', String(result.rotationSeq));
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    user: result.user,
+    csrfToken: csrfTokenFor(result.token),
+    rotationSeq: result.rotationSeq,
+    message: "Parol muvaffaqiyatli o'zgartirildi",
+  });
 }

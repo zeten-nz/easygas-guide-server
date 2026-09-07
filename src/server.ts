@@ -1,5 +1,5 @@
 import type { Server } from 'node:http';
-import { env, isProduction, assertProductionConfig } from './config/env';
+import { env, isProduction, assertProductionConfig, smsFeatureEnabled } from './config/env';
 import { logger } from './utils/logger';
 import { db } from './config/database';
 import { getSmsProvider, smsCapability, smsStartupProblem } from './sms';
@@ -14,25 +14,35 @@ const SHUTDOWN_TIMEOUT_MS = 25_000; // must be < the PM2 kill timeout (see docs)
 async function main(): Promise<void> {
   // Fail fast on misconfiguration.
   if (isProduction) assertProductionConfig();
-  // Phase 10C: a production instance must never boot on a non-functional SMS
-  // provider (e.g. the Eskiz stub) or console — sanitized error, no credentials.
-  const smsProblem = smsStartupProblem(smsCapability(), isProduction);
-  if (smsProblem) throw new Error(smsProblem);
+  // §E — SMS is now an OPT-IN feature (no enabled feature uses it after manual
+  // admin recovery replaced OTP). Only when a real provider is explicitly selected
+  // do we enforce that it is functional at startup (never boot on the Eskiz stub /
+  // console-in-prod). With SMS disabled the provider is never constructed and the
+  // outbox worker never starts, so pending legacy messages cannot be delivered
+  // (they are cancelled by migration; see 20260908000002_cancel_pending_recovery_sms).
+  const smsEnabled = smsFeatureEnabled();
+  if (smsEnabled) {
+    const smsProblem = smsStartupProblem(smsCapability(), isProduction);
+    if (smsProblem) throw new Error(smsProblem);
+  }
   await db.raw('SELECT 1');
   await connectRedis();
-  const sms = getSmsProvider();
+  const sms = smsEnabled ? getSmsProvider() : null;
   const storage = getStorageProvider();
-  logger.info({ smsProvider: sms.name, storageProvider: storage.name, env: env.NODE_ENV }, 'Configuration OK');
+  logger.info(
+    { smsProvider: sms?.name ?? 'disabled', storageProvider: storage.name, env: env.NODE_ENV },
+    'Configuration OK',
+  );
 
   const app = createApp();
   const server: Server = app.listen(env.PORT, () => {
     logger.info(`EASY GAS API listening on http://localhost:${env.PORT} (${isProduction ? 'production' : env.NODE_ENV})`);
   });
 
-  // The SMS worker runs in-process here. In a multi-process PM2 deployment it is
-  // safe (DB-leased claims), but prefer a single dedicated worker process — see
-  // docs/PRODUCTION-RUNTIME-10C.md.
-  startWorker();
+  // The SMS worker only runs when SMS is enabled. In a multi-process PM2
+  // deployment it is safe (DB-leased claims), but prefer a single dedicated worker
+  // process — see docs/PRODUCTION-RUNTIME-10C.md.
+  if (smsEnabled) startWorker();
 
   installShutdown(server);
 }

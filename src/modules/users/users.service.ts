@@ -6,8 +6,9 @@ import { ApiError } from '../../utils/errors';
 import { logAudit } from '../audit/audit.service';
 import { revokeAllSessions } from '../auth/auth.service';
 import { BRANCH_REQUIRED_ROLES, getAssignableRoles, isBranchScoped } from '../../rbac/permissions';
+import { generateTemporaryPassword } from '../../utils/password';
 import { toUserDetail, type UserDetail, type UserWithRoleBranch } from './user.mapper';
-import type { AuthUser, RoleCode } from '../../types/auth';
+import type { AuthUser, RoleCode, UserRow } from '../../types/auth';
 import type { CreateUserInput, ListUsersQuery, UpdateUserInput } from './users.validators';
 
 interface RequestMeta {
@@ -390,6 +391,103 @@ export async function unblockUser(actor: AuthUser, id: number, meta: RequestMeta
   });
 
   return (await findDetail(id).then((r) => r && toUserDetail(r))) as UserDetail;
+}
+
+// ---------------------------------------------------------------------------
+// Manual admin password recovery (§C) — issue a one-time temporary password.
+// ---------------------------------------------------------------------------
+
+export interface AdminResetResult {
+  user: UserDetail;
+  /** The cryptographically-random temporary password — returned ONCE, never
+   *  stored in plaintext, logged, put in a URL, or included in any audit row. */
+  temporaryPassword: string;
+  expiresAt: Date;
+}
+
+/**
+ * ADMIN-only (`users.reset_password`): after verifying the employee out of band,
+ * an admin resets that employee's password. Requires the admin's CURRENT password
+ * (recent-auth confirmation) and a mandatory reason. Atomically, under a target
+ * row lock (so concurrent/double resets serialize to one final state):
+ *   - sets a fresh bcrypt-hashed temporary password;
+ *   - sets must_change_password + a configurable temp-password expiry;
+ *   - revokes ALL of the employee's sessions/families (a repeated reset thereby
+ *     invalidates the previous temporary password and its sessions);
+ *   - invalidates any outstanding legacy OTP/reset credentials;
+ *   - audits actor/target/reason/timestamp — NEVER the password or its hash.
+ * Status is untouched: a BLOCKED / inactive-branch employee stays blocked (they
+ * still cannot log in). An admin cannot reset THEIR OWN password here (they use
+ * the change-password flow) — so this is not a self-service recovery path and
+ * adds no last-admin backdoor.
+ */
+export async function resetUserPassword(
+  actor: AuthUser,
+  targetId: number,
+  currentPassword: string,
+  reason: string,
+  meta: RequestMeta,
+): Promise<AdminResetResult> {
+  if (targetId === actor.id) {
+    throw ApiError.conflict(
+      "O'z parolingizni bu yerdan tiklab bo'lmaydi — parolni almashtirish sahifasidan foydalaning",
+      'SELF_RESET_FORBIDDEN',
+    );
+  }
+
+  // Recent-auth: re-verify the admin's current password. The actor's hash is
+  // loaded fresh (AuthUser never carries it). Constant-time bcrypt compare.
+  const actorRow = (await db('users').where({ id: actor.id }).whereNull('deleted_at').first()) as UserRow | undefined;
+  if (!actorRow || !(await bcrypt.compare(currentPassword, actorRow.password_hash))) {
+    throw ApiError.unauthorized("Joriy parolingiz noto'g'ri", 'ADMIN_REAUTH_FAILED');
+  }
+
+  const temporaryPassword = generateTemporaryPassword();
+  const passwordHash = await bcrypt.hash(temporaryPassword, env.BCRYPT_ROUNDS);
+  const expiresAt = new Date(Date.now() + env.TEMP_PASSWORD_TTL_MINUTES * 60_000);
+
+  await db.transaction(async (trx) => {
+    const target = (await trx('users').where({ id: targetId }).whereNull('deleted_at').forUpdate().first()) as
+      | UserRow
+      | undefined;
+    if (!target) throw ApiError.notFound('Foydalanuvchi topilmadi');
+
+    await trx('users').where({ id: targetId }).update({
+      password_hash: passwordHash,
+      must_change_password: true,
+      temp_password_expires_at: expiresAt,
+      updated_at: trx.fn.now(),
+    });
+    // Revoke every session/family — no existing access survives the reset.
+    await trx('sessions').where({ user_id: targetId }).whereNull('revoked_at').update({ revoked_at: trx.fn.now() });
+    // Invalidate any outstanding legacy OTP/reset credentials for this user.
+    await trx('password_resets')
+      .where({ user_id: targetId })
+      .where((q) => q.whereNull('consumed_at').orWhereNull('reset_used_at'))
+      .update({ consumed_at: trx.fn.now(), reset_used_at: trx.fn.now() });
+
+    await logAudit(
+      {
+        userId: actor.id,
+        action: 'PASSWORD_RESET_BY_ADMIN',
+        entityType: 'user',
+        entityId: targetId,
+        // Reason + non-secret metadata only. The temporary password and its hash
+        // are DELIBERATELY absent.
+        newValue: {
+          reason: reason.slice(0, 500),
+          tempPasswordExpiresAt: expiresAt.toISOString(),
+          sessionsRevoked: true,
+          mustChangePassword: true,
+        },
+        ...meta,
+      },
+      trx,
+    );
+  });
+
+  const detail = (await findDetail(targetId).then((r) => r && toUserDetail(r))) as UserDetail;
+  return { user: detail, temporaryPassword, expiresAt };
 }
 
 // Re-export so future admin flows (e.g. manual session revocation UI) have one entry point.

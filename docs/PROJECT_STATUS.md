@@ -3,11 +3,77 @@
 > This is the **canonical, git-tracked** project status. The copy at the repo-root
 > (`../../PROJECT_STATUS.md`, outside both git repos) is now **non-authoritative**.
 
-**Current phase:** Phase 10F — Integrity, Observability & Release Readiness — **implemented +
-tested**. Two production blockers remain (by design), enforced by the live release gate.
+**Current phase:** Manual employee password recovery (product decision: EasyGas Guide is
+employee-only; SMS/OTP self-service recovery removed, Eskiz integration retired from the recovery
+path) — **implemented + tested** on branch `phase/manual-employee-recovery` in both repos.
+Built on Phase 10F. **Not pushed / not merged / not deployed** — awaiting review.
 
 **Repos:** two separate git repositories — `server/` and `client/`. Project-root files (like the old
 `PROJECT_STATUS.md`) live **outside** both repos.
+
+---
+
+## Manual employee password recovery — IMPLEMENTED + TESTED
+
+Product decision: the Guide is for EASY GAS employees only. Password recovery is now **manual**:
+an employee contacts an admin via Telegram (**@EasygasGarantbot** — a support-request channel, NOT
+an automated auth/OTP provider); the admin verifies them **out of band**, then issues a one-time
+temporary password from the admin UI. There is **no** automatic Telegram OTP, account linking, or
+self-service reset.
+
+**Server (`phase/manual-employee-recovery`):**
+- Admin reset endpoint `POST /users/:id/reset-password` — ADMIN-only permission `users.reset_password`;
+  requires the admin's **own** password (recent-auth) + a mandatory reason; CSRF + a fail-closed
+  per-admin rate limit; generates a cryptographically-random temporary password (returned **once**,
+  `Cache-Control: no-store`); atomically sets it (bcrypt), sets `must_change_password` + a configurable
+  expiry (`TEMP_PASSWORD_TTL_MINUTES`), **revokes all** the target's sessions and invalidates prior
+  recovery credentials. Self-reset is refused (no last-admin backdoor). Blocked/inactive users stay
+  blocked. The audit chain records actor/target/reason/timestamp and **never** the password or its hash.
+- First-login change `POST /auth/change-password` — authenticated; verifies current (temporary)
+  password, rejects reuse, re-checks temp expiry on the authoritative path, rotates the session + CSRF.
+- Server-side first-login **gate** in `requireAuth`: a temporary-password session may reach only
+  `/auth/me` + `/auth/change-password` (+ logout); every business API is refused with
+  `PASSWORD_CHANGE_REQUIRED` until the password is changed (optional-auth routes degrade it to anon).
+- SMS is now **opt-in** (`smsFeatureEnabled()` = `SMS_PROVIDER==='eskiz'`): startup, readiness and the
+  release gate demand a working SMS provider **only when SMS is enabled** — never faking a broken
+  provider as healthy. Production requires **no** Eskiz credentials by default. The OTP HTTP endpoints
+  are removed; the durable outbox/worker infra is **retained** (unchanged), and a migration
+  (`20260908000002_cancel_pending_recovery_sms`) safely CANCELS any queued recovery SMS (history
+  preserved; tables not dropped).
+- Migrations: `20260908000001_manual_recovery_password_fields` (adds `must_change_password`,
+  `temp_password_expires_at`; idempotent, reversible) + the cancel migration above. Applied only on an
+  isolated `*_test` DB; down/up verified in CI.
+- Tests: new `test:manual-recovery` suite (19 cases — authz, admin re-auth, one-time secret + no-store,
+  session revocation, forced-change gate on direct business APIs, expiry + repeated/concurrent resets,
+  blocked-stays-blocked, CSRF, rate limits, audit redaction, removed-endpoints-404, manual-recovery
+  config/readiness). `auth`/`hardening`/`sms-outbox`/`runtime` suites updated for the removal. **Full
+  `test:all` green (28 suites)**; typecheck + build + OpenAPI check clean.
+
+**Client (`phase/manual-employee-recovery`):**
+- "Parolni unutdingizmi?" now opens a **support page** (no OTP wizard): Uzbek instructions to contact
+  the admin via Telegram with name/branch/work-phone, an explicit "never send your current password"
+  warning, and a **Telegram orqali murojaat** button → `https://t.me/EasygasGarantbot`.
+- Forced first-login **"Yangi parol o'rnating"** screen + route guard (temp-password sessions are held
+  there until they change the password); admin **"Vaqtinchalik parol"** action in the Users page
+  (confirm admin password + reason → temporary password shown once, copy-to-clipboard, never persisted).
+- Lint + `tsc -b` clean.
+
+**Browser E2E — MANUALLY-VERIFIED:** new `e2e/manual-recovery.spec.ts` (admin UI reset → employee temp
+login → forced change → normal access → new-password login) **executed and passed** on system Edge
+(`PW_CHANNEL=msedge`, chromium project, against the full-stack harness).
+
+### Remaining production blockers (unchanged ownership)
+- **ACTIVE, approved risk matrix** — still DRAFT; approval belongs to an **authorized EASY GAS safety
+  specialist**, not this work. Enforced by the release gate (fail-closed). **PRODUCTION-BLOCKED.**
+- **Attested release inputs** (CI green, restore drill, full-stack safety Playwright on GitHub Actions,
+  backups, secrets, monitoring, manual smoke) — per `RELEASE-CHECKLIST-10F.md`.
+- SMS is **no longer a blocker** by default: the `sms_provider_functional` gate now applies only when
+  SMS is explicitly enabled (`SMS_PROVIDER=eskiz`).
+- Not pushed/merged/deployed; no production data touched; no real Telegram/SMS sent.
+
+**Missing integration dependency:** the Telegram bot **@EasygasGarantbot** is referenced only as a
+support link — no bot code/repo/webhook exists in either repository. Wiring the support inbox (routing
+employee requests to admins) is a separate integration owned outside this change.
 
 ---
 

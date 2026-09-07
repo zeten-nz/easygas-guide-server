@@ -37,10 +37,19 @@ const envSchema = z.object({
   SESSION_TTL_HOURS: z.coerce.number().int().positive().default(24),
   SESSION_REMEMBER_TTL_DAYS: z.coerce.number().int().positive().default(180),
 
+  // SMS is DISABLED unless a real provider is explicitly selected. EasyGas is
+  // employee-only and no enabled feature uses SMS after manual recovery replaced
+  // OTP, so production requires NO SMS provider by default (see smsFeatureEnabled
+  // + validateProductionConfig). 'console' is dev-only.
   SMS_PROVIDER: z.enum(['console', 'eskiz']).optional(),
   OTP_TTL_MINUTES: z.coerce.number().int().positive().default(5),
   OTP_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
   RESET_TOKEN_TTL_MINUTES: z.coerce.number().int().positive().default(10),
+
+  // --- Manual admin password recovery ---
+  // How long an admin-issued temporary password is accepted at login before the
+  // employee must ask for a new reset (checked on the authoritative login path).
+  TEMP_PASSWORD_TTL_MINUTES: z.coerce.number().int().positive().default(1_440), // 24h
 
   // --- Phase 10C Redis (shared rate limiting + coordination) ---
   // Required in production (fail-closed abuse controls depend on it). Optional
@@ -159,6 +168,17 @@ export const isProduction = env.NODE_ENV === 'production';
 export const isTest = env.NODE_ENV === 'test';
 
 /**
+ * Whether any enabled feature actually uses SMS. After manual admin recovery
+ * replaced OTP, nothing does — so SMS is enabled ONLY when a real provider is
+ * explicitly selected (a future opt-in). Startup, readiness and the release gate
+ * only demand a working SMS provider when this is true; otherwise SMS is retired
+ * (never faked as healthy). ('console' is dev-only and never counts as enabled.)
+ */
+export function smsFeatureEnabled(e: typeof env = env): boolean {
+  return e.SMS_PROVIDER === 'eskiz';
+}
+
+/**
  * Phase 10C production configuration validation. Structural parsing (above)
  * cannot express cross-field production rules, so they are checked here and the
  * process refuses to start in production if any fails. Returns the list of
@@ -195,9 +215,12 @@ export function validateProductionConfig(e: typeof env): string[] {
   if (e.STORAGE_PROVIDER === 's3' && (!e.S3_BUCKET || !e.S3_REGION)) {
     problems.push('STORAGE_PROVIDER=s3 requires S3_BUCKET and S3_REGION.');
   }
-  // SMS: console is dev-only; a real provider needs its credentials.
-  if (!e.SMS_PROVIDER || e.SMS_PROVIDER === 'console') {
-    problems.push('SMS_PROVIDER must be a real provider in production (console is dev-only).');
+  // SMS is DISABLED by default. EasyGas is employee-only and manual admin
+  // recovery replaced OTP, so NO enabled feature uses SMS — production requires no
+  // SMS provider or Eskiz credentials. console stays dev-only; a real provider is
+  // only required to have its credentials WHEN it is explicitly selected.
+  if (e.SMS_PROVIDER === 'console') {
+    problems.push('SMS_PROVIDER=console is a dev-only provider; leave it unset (SMS disabled) in production.');
   }
   if (e.SMS_PROVIDER === 'eskiz' && (!e.ESKIZ_EMAIL || !e.ESKIZ_PASSWORD || !e.ESKIZ_FROM)) {
     problems.push('SMS_PROVIDER=eskiz requires ESKIZ_EMAIL, ESKIZ_PASSWORD and ESKIZ_FROM (approved sender).');

@@ -82,11 +82,14 @@ async function run(): Promise<void> {
   });
 
   // ---- Readiness: all healthy ----
-  await test('readiness /ready is 200 when DB, Redis, storage and SMS config are healthy', async () => {
+  await test('readiness /ready is 200 when DB, Redis, storage and (opt-in) SMS config are healthy', async () => {
     const r = await get('/api/v1/ready');
     assert.equal(r.status, 200, JSON.stringify(r.body));
     assert.equal(r.body.status, 'ready');
-    assert.deepEqual(r.body.checks, { db: true, redis: true, storage: true, sms: true, riskPolicy: true, shuttingDown: false });
+    // SMS is opt-in (manual admin recovery replaced OTP): smsRequired is false by
+    // default, and sms reports the provider's actual capability (here the dev
+    // console provider is ready → true) without gating readiness.
+    assert.deepEqual(r.body.checks, { db: true, redis: true, storage: true, sms: true, smsRequired: false, riskPolicy: true, shuttingDown: false });
   });
 
   // ---- Readiness: a failed dependency (Redis) → 503 ----
@@ -137,17 +140,30 @@ async function run(): Promise<void> {
     assert.ok(validateProductionConfig({ ...goodProdEnv(), NODE_ENV: 'test', DB_NAME: 'easygas' } as any).some((p) => /_test/.test(p)));
   });
 
-  // ---- A. SMS provider fail-closed: readiness never 200 for a stub ----
-  await test('readiness is 503 when the selected SMS provider is a non-functional stub', async () => {
-    const cap0 = smsCapability();
-    assert.equal(cap0.ready, true, 'baseline (console in test) is ready');
+  // ---- A. SMS is opt-in: a stub gates readiness ONLY when SMS is enabled ----
+  await test('SMS gates readiness only when enabled: a stub is tolerated when disabled, but fails closed when enabled', async () => {
+    const originalProvider = env.SMS_PROVIDER;
     // Select an unimplemented (stub) provider.
     setSmsProviderForTesting({ name: 'eskiz-stub', implemented: false, send: async () => { throw new Error('stub'); } });
     assert.equal(smsCapability().ready, false, 'stub provider is not ready');
-    const r = await get('/api/v1/ready');
-    assert.equal(r.status, 503, 'readiness must not be 200 for a stub provider');
+
+    // SMS DISABLED (default manual-recovery config): the broken provider must NOT
+    // block readiness, and its capability is reported honestly (never faked).
+    env.SMS_PROVIDER = undefined;
+    let r = await get('/api/v1/ready');
+    assert.equal(r.status, 200, 'a broken SMS provider must NOT block readiness when SMS is disabled');
+    assert.equal(r.body.checks.sms, false, 'sms capability reported honestly, not faked healthy');
+    assert.equal(r.body.checks.smsRequired, false);
+
+    // SMS ENABLED (SMS_PROVIDER=eskiz): fail-closed — the stub blocks readiness.
+    env.SMS_PROVIDER = 'eskiz';
+    r = await get('/api/v1/ready');
+    assert.equal(r.status, 503, 'when SMS is enabled a stub provider must block readiness (fail-closed)');
     assert.equal(r.body.checks.sms, false);
-    // Restore a functional provider for the remaining tests.
+    assert.equal(r.body.checks.smsRequired, true);
+
+    // Restore the env + a functional provider for the remaining tests.
+    env.SMS_PROVIDER = originalProvider;
     setSmsProviderForTesting({ name: 'ok', implemented: true, send: async () => ({ providerMessageId: null, outcome: 'ACCEPTED' as const }) });
     assert.equal((await get('/api/v1/ready')).status, 200);
   });

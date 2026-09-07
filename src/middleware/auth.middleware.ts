@@ -49,6 +49,17 @@ async function resolveAuth(req: Request, res: Response): Promise<ResolvedAuth | 
   return { user: toAuthUser(user), session: outcome.session };
 }
 
+/**
+ * §D first-login restriction. A temporary-password session (must_change_password)
+ * may reach ONLY the minimum endpoints: change the password, inspect the
+ * restricted session (/auth/me), and log out (logout carries no requireAuth, so
+ * it is always reachable). Matched on the router mount + route path so it is
+ * independent of the API version prefix.
+ */
+function isTempPasswordAllowlisted(req: Request): boolean {
+  return req.baseUrl.endsWith('/auth') && (req.path === '/change-password' || req.path === '/me');
+}
+
 export async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   const resolved = await resolveAuth(req, res);
   if (!resolved) {
@@ -56,6 +67,17 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
   }
   req.user = resolved.user;
   req.authSession = resolved.session;
+
+  // §D — enforce the first-login password change SERVER-SIDE (a React redirect is
+  // not a control). Every business API is rejected until the password is changed.
+  if (resolved.user.mustChangePassword && !isTempPasswordAllowlisted(req)) {
+    throw new ApiError(
+      403,
+      'PASSWORD_CHANGE_REQUIRED',
+      "Vaqtinchalik parolni almashtiring: davom etish uchun yangi parol o'rnating",
+    );
+  }
+
   next();
 }
 
@@ -65,7 +87,10 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
  */
 export async function optionalAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   const resolved = await resolveAuth(req, res);
-  if (resolved) {
+  // §D — a temporary-password session is confined: on optional-auth routes it is
+  // treated as anonymous, so it never receives elevated (management) data. It can
+  // still only escape by changing the password on the allowlisted routes.
+  if (resolved && !resolved.user.mustChangePassword) {
     req.user = resolved.user;
     req.authSession = resolved.session;
   }

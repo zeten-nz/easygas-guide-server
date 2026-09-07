@@ -125,14 +125,28 @@ export const loginPhoneLimiter = createRateLimiter({ name: 'login-ph', windowMs:
 
 export const registerLimiter = createRateLimiter({ name: 'register', windowMs: 60 * M, limit: 10, failMode: 'closed', key: ipKey });
 
-/** OTP request: strict per phone, looser per IP — fail CLOSED (SMS costs money + abuse). */
-export const otpRequestPhoneLimiter = createRateLimiter({ name: 'otp-req-ph', windowMs: 15 * M, limit: 3, failMode: 'closed', key: phoneOrIp });
-export const otpRequestIpLimiter = createRateLimiter({ name: 'otp-req-ip', windowMs: 60 * M, limit: 15, failMode: 'closed', key: ipKey });
+/**
+ * Authenticated self password change — keyed by user, fail CLOSED so the
+ * current-password field cannot be brute-forced. (SMS-OTP recovery limiters were
+ * retired with the OTP endpoints; manual admin recovery replaces them.)
+ */
+export const changePasswordLimiter = createRateLimiter({
+  name: 'change-pw',
+  windowMs: 15 * M,
+  limit: 10,
+  failMode: 'closed',
+  key: (req) => (req.user ? `u:${req.user.id}` : ipKey(req)),
+});
 
-/** OTP verification attempts (DB attempt counter also applies per code) — fail CLOSED. */
-export const otpVerifyLimiter = createRateLimiter({ name: 'otp-verify', windowMs: 15 * M, limit: 15, failMode: 'closed', key: phoneOrIp });
-
-export const resetPasswordLimiter = createRateLimiter({ name: 'reset-pw', windowMs: 15 * M, limit: 10, failMode: 'closed', key: ipKey });
+/** Admin manual password reset — keyed by the admin, fail CLOSED (also guards
+ *  the admin's re-auth password field against brute force). */
+export const adminResetLimiter = createRateLimiter({
+  name: 'admin-reset-pw',
+  windowMs: 15 * M,
+  limit: 20,
+  failMode: 'closed',
+  key: (req) => (req.user ? `u:${req.user.id}` : ipKey(req)),
+});
 
 /** Authenticated upload throttle, keyed by user — fail OPEN. */
 export const uploadLimiter = createRateLimiter({
