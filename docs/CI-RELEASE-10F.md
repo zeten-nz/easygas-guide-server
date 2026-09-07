@@ -38,10 +38,28 @@ never a real secret).
 | Test DB setup | `npm run test:setup` (migrate + seed the isolated `*_test` DB) |
 | Migration down/up | rollback then re-migrate to verify reversibility, then re-seed |
 | Audit smoke | `npm run audit:verify` on a clean chain |
-| Full suite | `npm run test:all` (all e2e **incl. audit-integrity + observability**) |
+| Full suite | `npm run test:all` (all e2e **incl. audit-integrity + observability**) — **fake-backed**: in-memory RedisLike (see note), fake/console SMS, in-memory or local storage |
 | Focused concurrency | `npm run test:audit` + `npm run test:riskpolicy` |
+| **Real-Redis integration (required)** | `npm run test:redis-int` — the **actual** `RedisBackend` + Lua rate limiter against the live `redis:7` service (see note) |
 | **Prod dependency audit (GATE)** | `npm audit --omit=dev --audit-level=high` — fails on high/critical |
 | Full dependency audit | `npm audit` — **report-only**, never gates |
+
+> **Fake-backed vs real-Redis coverage.** Under `NODE_ENV=test`, `getRedis()` returns the
+> deterministic **in-memory** `RedisLike` (identical atomic semantics, always ready, no socket) even
+> when `REDIS_URL` is set — so the ~27 ordinary suites are fast and hermetic and never depend on a
+> live Redis being connected before the first request or leave an open handle. That intentionally
+> does **not** exercise the real client, so a dedicated **required** suite,
+> `tests/redis-integration.e2e.ts` (`npm run test:redis-int`), runs the **real** ioredis
+> `RedisBackend` against the CI `redis:7` service and verifies: explicit connection **readiness before
+> the first command** (the cold-start race that otherwise fails closed with a 429), the **real Lua**
+> rate limiter (concurrent-increment atomicity, TTL preservation + repair, counters shared across two
+> clients), **bounded failure** when Redis is down plus the **fail-closed** login policy, and clean
+> teardown (all resources closed in `finally`; the process exits naturally — a leaked handle surfaces
+> as a hang, never hidden by a forced exit). **Safety:** it **requires** `REDIS_URL` **and** an
+> explicit `REDIS_TEST_DISPOSABLE=1` opt-in (fail-closed; `NODE_ENV=test` alone is not sufficient), it
+> never `FLUSHDB`s, and it pins a **unique per-run key prefix** (`itest:<uuid>:`) for the app and all
+> its clients so cleanup deletes only that exact prefix — the shared `eg:*`/`eg:rl:*` namespace is
+> never touched (a regression test asserts an out-of-prefix rate-limit key survives cleanup).
 
 ### Job: `secret scan`
 

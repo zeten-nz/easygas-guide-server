@@ -103,6 +103,17 @@ jobs:
         run: |
           npm run test:audit
           npm run test:riskpolicy
+      - name: Real-Redis integration (actual RedisBackend + Lua rate limiter vs the CI Redis service)
+        # The ordinary suites run against the in-memory RedisLike; this suite
+        # exercises the REAL ioredis backend, connection readiness, the Lua rate
+        # limiter (atomicity/TTL/shared counters), bounded failure and the
+        # fail-closed policy against the live redis:7 service (REDIS_URL above).
+        # The redis:7 service is a fresh, throwaway container, so we explicitly
+        # opt in as a disposable target (the suite refuses to run otherwise and
+        # never FLUSHDBs — it deletes only its own namespaced keys).
+        env:
+          REDIS_TEST_DISPOSABLE: "1"
+        run: npm run test:redis-int
       - name: Production dependency audit (GATE — fail on high/critical)
         run: npm audit --omit=dev --audit-level=high
       - name: Full dependency audit (report only, never gates)

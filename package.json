@@ -42,6 +42,7 @@
     "test:riskpolicy": "tsx tests/risk-policy.e2e.ts",
     "test:observability": "tsx tests/observability.e2e.ts",
     "test:audit": "tsx tests/audit-integrity.e2e.ts",
+    "test:redis-int": "tsx tests/redis-integration.e2e.ts",
     "reconcile": "tsx src/modules/evidence/reconcile.cli.ts",
     "cleanup": "tsx src/maintenance/cleanup.cli.ts",
     "risk-policy": "tsx src/modules/risk/risk-policy.cli.ts",
