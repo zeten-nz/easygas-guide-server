@@ -121,6 +121,9 @@ jobs:
       - name: gitleaks
         uses: gitleaks/gitleaks-action@v2
         env:
+          # The automatic, least-privilege workflow token (NOT a PAT/secret/deploy
+          # key). gitleaks-action@v2 requires it to scan pull requests.
+          GITHUB_TOKEN: ${{ github.token }}
           GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
 
   workflow-lint:
