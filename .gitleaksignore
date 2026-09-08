@@ -32,3 +32,13 @@ e43dd4686082a6ca410749d8b3814441157f4492:tests/manual-recovery.e2e.ts:generic-ap
 e43dd4686082a6ca410749d8b3814441157f4492:tests/manual-recovery.e2e.ts:generic-api-key:465
 e43dd4686082a6ca410749d8b3814441157f4492:tests/manual-recovery.e2e.ts:generic-api-key:523
 c74ad004797e5dd19be2ff57e8042e9b4923af53:tests/manual-recovery.e2e.ts:generic-api-key:424
+
+# FALSE POSITIVE (rule: generic-api-key) — tests/admin-workspace.e2e.ts:38.
+# `const PASSWORD` — the admin-workspace e2e suite's fixed test-login password (its
+# Uzbek value literally means "test password"). The suite CREATES its own synthetic
+# users (a branch, ~55 employees, a second admin) in the isolated *_test DB with this
+# password and logs in as them; it is not a real credential, is committed nowhere but
+# tests, and authenticates nothing outside the test DB. Same fixture class as
+# tests/manual-recovery.e2e.ts:50 above. Pinned to its exact historical commit + line
+# — not the file, the tests directory, or the rule.
+1e6f51af7583507763538ee58486722db125c5d6:tests/admin-workspace.e2e.ts:generic-api-key:38
