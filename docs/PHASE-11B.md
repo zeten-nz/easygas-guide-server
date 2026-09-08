@@ -96,12 +96,39 @@ so nothing is silently remapped; compatibility is never inferred from a label.
 - **Safety guard:** `--apply` is refused unless `DB_NAME` ends with `_test` (fail-closed). No
   automatic production-price seed exists in any migration.
 
-### Import-source dependency (honest status)
-The owner HTML prototype (`EasyGas_Elektron_Cheklist*.html`) is **NOT present in the workspace**, so the
-previously-reported counts (PARTS 219 = EASY GAS 158 + EAST ENERGE 61; LABOR 63) **could not be
-re-verified against the file**. The import tool is fully implemented and verified against a synthetic
-JSON source (dry-run → apply → idempotent re-import → manual-edit preserved). When the real file is
-provided, run a dry-run first and reconcile the reported counts before any apply.
+### Owner prototype — verified against the REAL file
+The owner prototype `EasyGas_Elektron_Cheklist(2).html` was provided beside the repos and parsed AS DATA
+(never executed). Its data are JS object literals with unquoted keys, so `parseHtmlSource` extracts each
+`{...}` object's `key: "string" | number` pairs by regex (no eval/`new Function`) and maps them:
+
+- **PARTS `{c,co,cat,n,brand,price}` → product.** `price` is **VAT-inclusive** som (the prototype marks
+  products "QQS ichida", `QQS=0.12`) → `priceMinor = price*100`; `co`=company, `brand`=manufacturer
+  (kept DISTINCT).
+- **LABOR `{c,cat,n,base,min,t}` → service.** `base` is the **NET (QQSsiz)** som price → `priceMinor =
+  base*100`, `priceBasis=NET`, `taxRateBp=1200`, and the source's own `round(base*1.12)` (QQS bilan) is
+  preserved as `priceInclusiveMinor`. This 12% is the SOURCE's per-row service convention, recorded as
+  tax metadata — not applied globally.
+
+Dry-run + apply (isolated `easygas_test` only) results — **matching the expected source counts**:
+`products 219 (EASY GAS 158, EAST ENERGE 61)`, `services 63`, `companies 2`, `brands 13`,
+`service-categories 10`, `product-categories 22`. **0 missing required fields, 0 duplicate codes, 0
+rejected records.** Money mapped exactly (e.g. `EG-105` = `90 750 000` minor; `X01` NET `7 000 000` /
+inclusive `7 840 000` / bp 1200). Normalization finding: **23 distinct category strings, but `REDUKTOR`
+/ `Reduktor` differ only by case → they normalize to ONE category (22 total)**; the case-insensitive
+dedup merges case variants only — DIFFERENT spellings (e.g. `EMULATORLAR` vs `EMULYATOR`, `VARIYATOR`)
+are kept separate (no fuzzy matching) and left for human review. Some `brand` values coincide with a
+company name (e.g. `EASY GAS`, `UZBEKISTAN`) — that is the source data, kept in the separate brand field.
+
+Verified on `easygas_test`: dry-run writes nothing; apply persists the counts above with exact prices and
+company≠brand; **re-import inserts nothing (idempotent)**; a **manual price edit survives re-import**; a
+mid-apply DB failure **rolls the whole batch back (no partial writes)**.
+
+### Production-import restriction (honest status)
+The apply has been performed **only against the isolated `easygas_test` database**, and the CLI
+**refuses `--apply` unless `DB_NAME` ends with `_test`** (fail-closed). The production/developer
+`easygas` database has **not** been imported, seeded, or migrated with catalogue data — the production
+import is **not performed and not operationally complete**. Approving imported prices as real business
+prices, and running the production import, remain deliberate future operator steps.
 
 ## Verification (run locally, isolated `*_test` DB only)
 - Server: `npm run test:catalog` (21 cases) + `npm run test:all` (**30 suites / 417 / 0**); `typecheck`,
@@ -114,8 +141,20 @@ provided, run a dry-run first and reconcile the reported counts before any apply
   manual-recovery / safety suites.
 
 ## Cross-repo merge order
-Client needs the new server endpoints → **merge server first, then client.** The client 11B branch is
-stacked on the (still-open) 11A client PR, so **merge client 11A (#9) before client 11B**.
+Client 11A PR #9 is now **MERGED** (client `main` = `2157185`), and the 11B client branch has been
+integrated with `origin/main` via a normal merge (so it no longer trails the 11A merge commit).
+**Client 11A no longer needs merging.** Remaining order: **merge server 11B first** (the client needs
+its endpoints), **then client 11B**.
+
+## Reference selectors (search/pagination)
+Every reference picker (product/service form company/brand/category/unit + the list filters) is a
+`RefCombobox` — a bounded, server-backed searchable combobox (`useInfiniteQuery`, 20/page, debounced
+search, "load more"). It **never fetches the whole list**; the selected value is loaded BY ID so it
+displays even when archived or beyond the current page, while the search offers ACTIVE values only (an
+archived value is readable on edit but never newly selectable). Keyboard ↑/↓/Enter/Esc, and
+loading/empty/error states are handled. Regression (E2E): with >100 seeded brands, a value beyond the
+first page is found via search, saved, and shown on re-open; an archived selection displays with a
+marker.
 
 ## Out of scope (later phases / not begun)
 Inventory, stock ledger, orders, payments, invoices, procurement, job billing, photo-gallery redesign,

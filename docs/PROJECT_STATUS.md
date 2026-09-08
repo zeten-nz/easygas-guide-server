@@ -5,9 +5,10 @@
 
 **Current phase:** Phase 11B — Product & Service Catalogue + Reference Data — **implemented + tested
 locally** on branch `phase/11B-catalog-reference-data`. Server branched from `origin/main` (`04a888c`,
-after the Phase 11A **merge**); the client branch is **stacked on `phase/11A-admin-workspace`** (11A is
-merged on the server but the client 11A PR #9 is still open, so 11B reuses those components on top of it).
-**Not pushed / not merged / not deployed.** Phase 11A is retained below as prior-work reference.
+after the Phase 11A merge). Client 11A **PR #9 is now merged** (client `main` = `2157185`); the client
+11B branch has been **integrated with `origin/main` via a normal merge** (it originally only lacked that
+merge commit — no substantive divergence). **Not pushed / not merged / not deployed.** Phase 11A retained
+below as prior-work reference.
 
 **Repos:** two separate git repositories — `server/` and `client/`. Project-root files (like the old
 `PROJECT_STATUS.md`) live **outside** both repos.
@@ -41,8 +42,14 @@ Employee-only price base + reference-data management. Full details: `PHASE-11B.m
   archive/reactivate/delete, stale-edit + in-use conflict messages, mobile layouts.
 - **Import** (`npm run catalog:import`): parses source as DATA (no eval), **dry-run default**,
   insert-only + idempotent (preserves manual edits), provenance, one transaction; **`--apply` guarded to
-  `*_test` only**. Owner prototype file is **absent** → import verified against a synthetic source; the
-  219/158/61/63 counts are **unverified against the missing file** (import-source dependency).
+  `*_test` only**. The **real owner prototype** was provided and **verified on `easygas_test`**: dry-run +
+  apply reproduce the expected counts — **products 219 (EASY GAS 158, EAST ENERGE 61), services 63**,
+  companies 2 / brands 13 / product-categories 22 (REDUKTOR/Reduktor case-merged) / service-categories 10,
+  0 missing/duplicate/rejected; exact money (product `price` = VAT-inclusive, service `base` = NET + 12%
+  tax metadata); idempotent re-import; manual edits preserved; atomic rollback on failure. **Production
+  import NOT performed** (test DB only) — imported prices are provisional.
+- **Reference selectors** are bounded server-backed searchable comboboxes (`RefCombobox`, `useInfiniteQuery`,
+  20/page, debounced, load-more, select-by-id for archived/off-page values) — no first-page-of-100 truncation.
 - **Verification (local, isolated `*_test`):** server `test:catalog` 21/21 + `test:all` **30/417/0**,
   typecheck/build/openapi clean, prod+full audit **0**; client `npm test` (component + money unit),
   lint/tsc/build clean, prod audit **0** / full **5** (dev-only); browser E2E `catalog.spec` on

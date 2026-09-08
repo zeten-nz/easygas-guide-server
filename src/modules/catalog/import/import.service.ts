@@ -70,25 +70,82 @@ export function parseSource(text: string, format: 'json' | 'html'): RawSource {
 }
 
 /**
- * Extract the `PARTS`/`LABOR` array literals from the owner HTML prototype WITHOUT
- * executing it. Only strict JSON arrays are accepted; anything that is not valid
- * JSON is reported (never eval'd). Returns empty lists if the markers are absent.
+ * VAT rate the owner prototype uses for SERVICE prices (`QQS=0.12`). It is the
+ * source's own convention, NOT a universal tax policy — it is applied ONLY to the
+ * services it explicitly derives with it (`vat = round(base*(1+QQS))`), and is
+ * recorded per-row as tax metadata rather than assumed globally.
+ */
+const PROTOTYPE_SERVICE_VAT_BP = 1200;
+
+/**
+ * Extract the `PARTS`/`LABOR` data from the owner HTML prototype as DATA — the file
+ * is never executed (no eval/new Function). The arrays are JS object literals with
+ * UNQUOTED keys and double-quoted string values, so instead of JSON.parse we scan
+ * each `{...}` object for `key: "string" | number` pairs with a regex and map the
+ * prototype's fields onto our catalogue shape:
+ *
+ *   PARTS  {c,co,cat,n,brand,price}  → product; `price` is VAT-INCLUSIVE som (the
+ *          prototype marks products "QQS ichida") → priceMinor = price*100.
+ *   LABOR  {c,cat,n,base,min,t}      → service;  `base` is the NET (QQSsiz) som price
+ *          → priceMinor = base*100, priceBasis=NET, taxRateBp=1200, and the source's
+ *          tax-inclusive amount round(base*1.12) is preserved as priceInclusiveMinor.
+ *
+ * Company (`co`) and manufacturer brand (`brand`) are kept as DISTINCT fields.
  */
 export function parseHtmlSource(text: string): RawSource {
-  const grab = (marker: RegExp): unknown[] => {
-    const m = text.match(marker);
-    if (!m) return [];
-    try {
-      const parsed = JSON.parse(m[1]);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
-  };
-  // Match `const PARTS = [ ... ];` / `const LABOR = [ ... ];` capturing the array.
-  const products = grab(/\b(?:const|let|var)\s+PARTS\s*=\s*(\[[\s\S]*?\])\s*;/) as RawProduct[];
-  const services = grab(/\b(?:const|let|var)\s+LABOR\s*=\s*(\[[\s\S]*?\])\s*;/) as RawService[];
+  const products = extractObjects(text, 'PARTS').map((o) => ({
+    code: str(o.c),
+    name: str(o.n),
+    company: str(o.co),
+    category: str(o.cat),
+    brand: str(o.brand),
+    priceMinor: num(o.price) === null ? undefined : (num(o.price) as number) * 100,
+  })) as RawProduct[];
+
+  const services = extractObjects(text, 'LABOR').map((o) => {
+    const base = num(o.base);
+    return {
+      code: str(o.c),
+      name: str(o.n),
+      category: str(o.cat),
+      durationMinutes: num(o.min) ?? undefined,
+      priceMinor: base === null ? undefined : base * 100,
+      priceBasis: 'NET',
+      taxRateBp: PROTOTYPE_SERVICE_VAT_BP,
+      priceInclusiveMinor: base === null ? undefined : Math.round(base * 1.12) * 100,
+    };
+  }) as RawService[];
+
   return { products, services };
+}
+
+/** Capture the `const NAME=[ ... ]` array body (up to the line-starting `]`), then
+ *  return each flat `{...}` object's key/value pairs — as data, never executed. */
+function extractObjects(text: string, name: string): Record<string, string | number>[] {
+  const arr = text.match(new RegExp(`\\b(?:const|let|var)\\s+${name}\\s*=\\s*\\[([\\s\\S]*?)\\n\\s*\\]`));
+  if (!arr) return [];
+  const body = arr[1];
+  const objects: Record<string, string | number>[] = [];
+  for (const m of body.matchAll(/\{[^{}]*\}/g)) {
+    const obj: Record<string, string | number> = {};
+    // key: "string" (with escapes) | number
+    for (const kv of m[0].matchAll(/([A-Za-z_]\w*)\s*:\s*("(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?)/g)) {
+      const key = kv[1];
+      const raw = kv[2];
+      obj[key] = raw.startsWith('"') ? (JSON.parse(raw) as string) : Number(raw);
+    }
+    objects.push(obj);
+  }
+  return objects;
+}
+
+function str(v: string | number | undefined): string | undefined {
+  return v === undefined ? undefined : String(v);
+}
+function num(v: string | number | undefined): number | null {
+  if (v === undefined || v === '') return null;
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
 function asString(v: unknown): string | null {
@@ -135,6 +192,13 @@ interface Plan {
 }
 
 const key = (s: string) => s.toLocaleLowerCase('uz-UZ');
+
+/** Collapse values that differ only by case (keep the first display form). */
+function dedupeByKey(set: Set<string>): string[] {
+  const seen = new Map<string, string>();
+  for (const v of set) if (!seen.has(key(v))) seen.set(key(v), v);
+  return [...seen.values()];
+}
 
 async function buildPlan(source: RawSource, runner: Knex | Knex.Transaction): Promise<Plan> {
   const issues: ImportIssue[] = [];
@@ -243,12 +307,15 @@ function report(source: RawSource, plan: Plan, applied: boolean): ImportReport {
       existing: (source.services?.length ?? 0) - plan.services.length - plan.issues.filter((i) => i.kind === 'service' && !i.reason.includes('mavjud')).length,
       invalid: plan.issues.filter((i) => i.kind === 'service' && !i.reason.includes('mavjud')).length,
     },
+    // Case-normalized: values differing only by case (e.g. REDUKTOR / Reduktor)
+    // dedupe to one reference on apply, so the reported count matches what is
+    // created. Distinct SPELLINGS are never merged (no fuzzy matching).
     referencesToCreate: {
-      companies: [...plan.refs.companies],
-      brands: [...plan.refs.brands],
-      productCategories: [...plan.refs.productCategories],
-      serviceCategories: [...plan.refs.serviceCategories],
-      units: [...plan.refs.units],
+      companies: dedupeByKey(plan.refs.companies),
+      brands: dedupeByKey(plan.refs.brands),
+      productCategories: dedupeByKey(plan.refs.productCategories),
+      serviceCategories: dedupeByKey(plan.refs.serviceCategories),
+      units: dedupeByKey(plan.refs.units),
     },
     issues: plan.issues,
     applied,

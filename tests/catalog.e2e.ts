@@ -419,7 +419,28 @@ async function run(): Promise<void> {
     assert.equal(Number(after.price_minor), 99999, 'manual edit preserved (import is insert-only)');
   });
 
+  await test('import is ATOMIC: a mid-apply DB failure leaves NO partial writes', async () => {
+    const before = Number((await db('products').count({ c: '*' }).first() as any).c);
+    // Second product's code exceeds products.code varchar(60) → insert errors mid-apply
+    // (STRICT_TRANS_TABLES), so the whole transaction must roll back.
+    const bad = {
+      products: [
+        { code: 'TCAT-ATOM-OK', name: 'TEST CAT Atom OK', company: 'TEST CAT AtomCo', category: 'TEST CAT AtomCat', priceMinor: 100 },
+        { code: 'X'.repeat(100), name: 'TEST CAT Atom Bad', company: 'TEST CAT AtomCo', category: 'TEST CAT AtomCat', priceMinor: 200 },
+      ],
+      services: [],
+    };
+    await assert.rejects(applyImport(bad, ids.admin, db), 'apply rejects on the failing row');
+    const afterCount = Number((await db('products').count({ c: '*' }).first() as any).c);
+    assert.equal(afterCount, before, 'no partial products written — transaction rolled back');
+    assert.ok(!(await db('products').where({ code: 'TCAT-ATOM-OK' }).first()), 'the first (valid) product was rolled back too');
+    assert.ok(!(await db('catalog_companies').where({ name: 'TEST CAT AtomCo' }).first()), 'no partial reference rows written');
+  });
+
   // Cleanup import fixtures created above.
+  await db('products').where('code', 'like', 'TCAT-ATOM%').del();
+  await db('catalog_companies').where('name', 'like', 'TEST CAT Atom%').del();
+  await db('product_categories').where('name', 'like', 'TEST CAT Atom%').del();
   await db('products').where('code', 'like', 'TCAT-IMP%').del();
   await db('services').where('code', 'like', 'TSVC-IMP%').del();
   for (const t of ['catalog_companies', 'catalog_brands', 'product_categories', 'service_categories'])
