@@ -26,6 +26,10 @@ import { jobQualityRouter } from './modules/quality/quality.routes';
 import { jobRiskRouter } from './modules/risk/risk.routes';
 import { riskPolicyRouter } from './modules/risk/risk-policy.routes';
 import { jobGpsRouter } from './modules/gps/gps.routes';
+import { productsRouter } from './modules/catalog/products.routes';
+import { servicesRouter } from './modules/catalog/services.routes';
+import { referenceRouter } from './modules/reference/reference.routes';
+import { injectionRouter } from './modules/reference/injection.routes';
 
 export interface CreateAppOptions {
   /** Overrides env.TRUST_PROXY_HOPS (used by tests to exercise both modes). */
@@ -112,6 +116,11 @@ export function createApp(options: CreateAppOptions = {}) {
   app.use('/api/v1/checklist-templates', checklistTemplatesRouter);
   app.use('/api/v1/risk-policy', riskPolicyRouter);
   app.use('/api/v1/admin/registration-requests', registrationAdminRouter);
+  // Phase 11B — product & service catalogue + reference data
+  app.use('/api/v1/products', productsRouter);
+  app.use('/api/v1/services', servicesRouter);
+  app.use('/api/v1/reference', referenceRouter);
+  app.use('/api/v1/injection-reference', injectionRouter);
 
   app.use(notFoundHandler);
   app.use(errorHandler);

@@ -3,14 +3,53 @@
 > This is the **canonical, git-tracked** project status. The copy at the repo-root
 > (`../../PROJECT_STATUS.md`, outside both git repos) is now **non-authoritative**.
 
-**Current phase:** Phase 11A — Admin Workspace, Employee Profiles, Pagination UX & Safe Template
-Management — **implemented + tested** on branch `phase/11A-admin-workspace` in both repos (branched
-from `origin/main` after manual employee password recovery merged — server PR #7 / client PR #8).
-**Not pushed / not merged / not deployed** — awaiting review. (Manual recovery is now **merged to
-main** in both repos; its section below is retained as prior-work reference.)
+**Current phase:** Phase 11B — Product & Service Catalogue + Reference Data — **implemented + tested
+locally** on branch `phase/11B-catalog-reference-data`. Server branched from `origin/main` (`04a888c`,
+after the Phase 11A **merge**); the client branch is **stacked on `phase/11A-admin-workspace`** (11A is
+merged on the server but the client 11A PR #9 is still open, so 11B reuses those components on top of it).
+**Not pushed / not merged / not deployed.** Phase 11A is retained below as prior-work reference.
 
 **Repos:** two separate git repositories — `server/` and `client/`. Project-root files (like the old
 `PROJECT_STATUS.md`) live **outside** both repos.
+
+---
+
+## Phase 11B — Product & Service Catalogue + Reference Data
+
+Employee-only price base + reference-data management. Full details: `PHASE-11B.md`.
+
+- **Model (migration `20260908000003`):** `products` (code unique **per company**, brand≠company,
+  category, unit?, exact fixed-point `price_minor` minor units — **null=unknown, 0=free** — `version`
+  optimistic-concurrency, provenance), `services` (global code, duration in minutes, **explicit
+  `price_basis` NET/GROSS/UNKNOWN + optional tax bp — the prototype's 12% VAT is NOT assumed**),
+  reference tables (`catalog_companies`/`catalog_brands`/`product_categories`/`service_categories`/
+  `catalog_units`/`injection_reference`), polymorphic `catalog_price_history`. FKs RESTRICT throughout;
+  service centres reuse `branches`. Migration up→down→up verified on `easygas_test`.
+- **Injection** modelled cleanly (greenfield — no prior field): `technology` (port/multipoint vs direct)
+  is independent of `forced_induction` (Turbo is a separate attribute, never a technology); `designation`
+  is the manufacturer label; UNKNOWN supported; no legacy remap.
+- **Concurrency:** `version` optimistic-concurrency (`409 STALE_WRITE`); price change + history row +
+  audit are one atomic transaction; newly-assigned references are locked `FOR UPDATE` so a concurrent
+  reference delete never races a create into a raw FK error (→ clean `REFERENCE_IN_USE` / `INVALID_*`).
+- **Reference rules:** normalized (whitespace/case) duplicate detection, **no fuzzy merge**; archive
+  always; delete only when unused (`409 REFERENCE_IN_USE`), re-checked transactionally; FKs untouched.
+- **API/authz:** `catalog.view` = ADMIN/RAHBAR/SIFAT (read), `catalog.manage` = **ADMIN only**. Bounded
+  pagination 25/50, deterministic sort + id tie-breaker, filtered totals, allowlisted sort, indexed.
+  OpenAPI regenerated — **119 ops / 90 paths, no drift**.
+- **Client:** routes `/app/catalog/products|services(/:id)` (Narx bazasi, tabs) + `/app/reference`
+  (Ma'lumotnomalar), reusing the 11A shell/Pagination/DropdownMenu; URL table state, price-history,
+  archive/reactivate/delete, stale-edit + in-use conflict messages, mobile layouts.
+- **Import** (`npm run catalog:import`): parses source as DATA (no eval), **dry-run default**,
+  insert-only + idempotent (preserves manual edits), provenance, one transaction; **`--apply` guarded to
+  `*_test` only**. Owner prototype file is **absent** → import verified against a synthetic source; the
+  219/158/61/63 counts are **unverified against the missing file** (import-source dependency).
+- **Verification (local, isolated `*_test`):** server `test:catalog` 21/21 + `test:all` **30/417/0**,
+  typecheck/build/openapi clean, prod+full audit **0**; client `npm test` (component + money unit),
+  lint/tsc/build clean, prod audit **0** / full **5** (dev-only); browser E2E `catalog.spec` on
+  chromium + Pixel-5.
+
+**Out of scope / not begun:** inventory, stock, orders, payments, invoices, procurement, job billing,
+photo-gallery/risk-policy redesign, Telegram/SMS, 5 WHY, offline, deployment. **Phase 11C not started.**
 
 ---
 

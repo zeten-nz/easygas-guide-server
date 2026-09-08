@@ -35,6 +35,10 @@ const MOUNTS = [
   '/api/v1/checklist-templates',
   '/api/v1/risk-policy',
   '/api/v1/admin/registration-requests',
+  '/api/v1/products',
+  '/api/v1/services',
+  '/api/v1/reference',
+  '/api/v1/injection-reference',
 ];
 
 // Implemented routes that are intentionally NOT part of the public contract.
