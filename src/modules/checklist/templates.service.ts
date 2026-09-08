@@ -43,11 +43,29 @@ export interface VersionDetail {
   steps?: StepDetail[];
 }
 
+/** Why a template cannot be permanently deleted (null = eligible). */
+export type DeletableReason = 'HAS_PUBLISHED_OR_ARCHIVED_HISTORY';
+
 export interface TemplateDetail {
   id: number;
   name: string;
   description: string | null;
   versions: VersionDetail[];
+  /**
+   * §D deletion eligibility (ADVISORY — the DELETE endpoint re-checks under a lock).
+   * A template is permanently deletable ONLY when every version is still DRAFT, i.e.
+   * nothing was ever published: a DRAFT-only template can never have been assigned to
+   * a job (assignment requires a PUBLISHED version), so no history references it.
+   * A published/archived version means history must be preserved (archive, not delete).
+   */
+  deletable: boolean;
+  deletableReason: DeletableReason | null;
+}
+
+/** Advisory eligibility from a template's version statuses (see TemplateDetail). */
+function deletability(statuses: VersionStatus[]): { deletable: boolean; deletableReason: DeletableReason | null } {
+  const deletable = statuses.every((s) => s === 'DRAFT');
+  return { deletable, deletableReason: deletable ? null : 'HAS_PUBLISHED_OR_ARCHIVED_HISTORY' };
 }
 
 function toDecimal(v: unknown): number | null {
@@ -114,11 +132,8 @@ export async function listTemplates(): Promise<TemplateDetail[]> {
     .groupBy('checklist_template_versions.id')
     .orderBy('checklist_template_versions.version')) as Record<string, unknown>[];
 
-  return templates.map((t: Record<string, unknown>) => ({
-    id: t.id as number,
-    name: t.name as string,
-    description: t.description as string | null,
-    versions: versions
+  return templates.map((t: Record<string, unknown>) => {
+    const vs = versions
       .filter((v) => v.template_id === t.id)
       .map((v) => ({
         id: v.id as number,
@@ -126,8 +141,15 @@ export async function listTemplates(): Promise<TemplateDetail[]> {
         status: v.status as VersionStatus,
         publishedAt: v.published_at as Date | null,
         stepCount: Number(v.step_count ?? 0),
-      })),
-  }));
+      }));
+    return {
+      id: t.id as number,
+      name: t.name as string,
+      description: t.description as string | null,
+      versions: vs,
+      ...deletability(vs.map((v) => v.status)),
+    };
+  });
 }
 
 export async function getTemplate(id: number): Promise<TemplateDetail> {
@@ -137,21 +159,24 @@ export async function getTemplate(id: number): Promise<TemplateDetail> {
   const versions = await db('checklist_template_versions').where({ template_id: id }).orderBy('version');
   const stepsByVersion = await loadStepsWithMeasurements(versions.map((v: { id: number }) => v.id));
 
+  const mapped = versions.map((v: Record<string, unknown>) => {
+    const steps = stepsByVersion.get(v.id as number) ?? [];
+    return {
+      id: v.id as number,
+      version: v.version as number,
+      status: v.status as VersionStatus,
+      publishedAt: v.published_at as Date | null,
+      stepCount: steps.length,
+      steps,
+    };
+  });
+
   return {
     id: template.id,
     name: template.name,
     description: template.description,
-    versions: versions.map((v: Record<string, unknown>) => {
-      const steps = stepsByVersion.get(v.id as number) ?? [];
-      return {
-        id: v.id as number,
-        version: v.version as number,
-        status: v.status as VersionStatus,
-        publishedAt: v.published_at as Date | null,
-        stepCount: steps.length,
-        steps,
-      };
-    }),
+    versions: mapped,
+    ...deletability(mapped.map((v) => v.status)),
   };
 }
 
@@ -482,6 +507,14 @@ export async function publishVersion(
   meta: RequestMeta,
 ): Promise<TemplateDetail> {
   await db.transaction(async (trx) => {
+    // Lock the TEMPLATE row first — a consistent lock order (template row → version
+    // rows) shared with createVersion / archiveVersion / deleteTemplate, so
+    // concurrent template mutations serialize on the template row and can never
+    // deadlock on version-lock ordering (delete locks the version set in PK order;
+    // publish would otherwise lock target-then-previous — the opposite order).
+    const template = await trx('checklist_templates').where({ id: templateId }).forUpdate().first();
+    if (!template) throw ApiError.notFound('Shablon topilmadi');
+
     const version = await trx('checklist_template_versions')
       .where({ id: versionId, template_id: templateId })
       .forUpdate()
@@ -547,6 +580,10 @@ export async function archiveVersion(
   meta: RequestMeta,
 ): Promise<TemplateDetail> {
   await db.transaction(async (trx) => {
+    // Template row first — consistent lock order (see publishVersion/deleteTemplate).
+    const template = await trx('checklist_templates').where({ id: templateId }).forUpdate().first();
+    if (!template) throw ApiError.notFound('Shablon topilmadi');
+
     const version = await trx('checklist_template_versions')
       .where({ id: versionId, template_id: templateId })
       .forUpdate()
@@ -575,4 +612,89 @@ export async function archiveVersion(
   });
 
   return getTemplate(templateId);
+}
+
+/**
+ * §D permanently delete an UNUSED, DRAFT-only template.
+ *
+ * Eligibility is re-checked HERE inside the transaction (the list's `deletable`
+ * flag is only advisory), under a consistent lock order so a check-then-delete
+ * race cannot slip a publish/assignment in between:
+ *   1. lock the template row FOR UPDATE (serializes with createVersion + other deletes);
+ *   2. lock ALL its version rows FOR UPDATE (serializes with publishVersion/archiveVersion —
+ *      a concurrent publish either lands first, so we see PUBLISHED and refuse, or blocks
+ *      and then 404s on the now-deleted version);
+ *   3. refuse unless EVERY version is still DRAFT (a published/archived version is history
+ *      that must be preserved via the version-archive lifecycle, never destroyed);
+ *   4. defensively refuse if any job checklist/step still references it (a DRAFT-only
+ *      template can never have been assigned, but we assert it rather than trust the FK);
+ *   5. delete children→parent (steps [measurements cascade] → versions → template).
+ * The DB foreign keys are RESTRICT throughout, so they are the last-line backstop — the
+ * checks above turn a raw FK error into a stable business conflict. The audit records the
+ * template name + version count only (no step internals).
+ */
+export async function deleteTemplate(
+  actor: AuthUser,
+  templateId: number,
+  meta: RequestMeta,
+): Promise<{ id: number; name: string }> {
+  return db.transaction(async (trx) => {
+    const template = await trx('checklist_templates').where({ id: templateId }).forUpdate().first();
+    if (!template) throw ApiError.notFound('Shablon topilmadi');
+
+    const versions = (await trx('checklist_template_versions')
+      .where({ template_id: templateId })
+      .forUpdate()) as { id: number; status: VersionStatus }[];
+
+    if (versions.some((v) => v.status !== 'DRAFT')) {
+      throw ApiError.conflict(
+        "Nashr qilingan yoki arxivlangan versiyaga ega shablonni o'chirib bo'lmaydi — tarixni saqlash uchun uni arxivlang",
+        'TEMPLATE_HAS_HISTORY',
+      );
+    }
+
+    const versionIds = versions.map((v) => v.id);
+    const stepIds = versionIds.length
+      ? ((await trx('checklist_steps').whereIn('version_id', versionIds).select('id')) as { id: number }[]).map((s) => s.id)
+      : [];
+
+    // Defensive: a DRAFT-only template cannot have been assigned, but assert it so a
+    // stray reference becomes a clear business conflict rather than a raw FK error.
+    if (versionIds.length) {
+      const jc = (await trx('job_checklists').whereIn('version_id', versionIds).count({ c: '*' }).first()) as
+        | { c: number | string }
+        | undefined;
+      if (Number(jc?.c ?? 0) > 0) {
+        throw ApiError.conflict("Bu shablon ishlarga biriktirilgan — uni o'chirib bo'lmaydi", 'TEMPLATE_IN_USE');
+      }
+    }
+    if (stepIds.length) {
+      const js = (await trx('job_steps').whereIn('step_id', stepIds).count({ c: '*' }).first()) as
+        | { c: number | string }
+        | undefined;
+      if (Number(js?.c ?? 0) > 0) {
+        throw ApiError.conflict("Bu shablon ishlarga biriktirilgan — uni o'chirib bo'lmaydi", 'TEMPLATE_IN_USE');
+      }
+    }
+
+    // Children → parent. Measurements cascade when their step is deleted.
+    if (stepIds.length) await trx('checklist_steps').whereIn('id', stepIds).del();
+    if (versionIds.length) await trx('checklist_template_versions').whereIn('id', versionIds).del();
+    await trx('checklist_templates').where({ id: templateId }).del();
+
+    await logAudit(
+      {
+        userId: actor.id,
+        action: 'TEMPLATE_DELETED',
+        entityType: 'checklist_template',
+        entityId: templateId,
+        // Name + counts only — no step/measurement internals.
+        oldValue: { name: template.name, versionsDeleted: versions.length },
+        ...meta,
+      },
+      trx,
+    );
+
+    return { id: templateId, name: template.name as string };
+  });
 }

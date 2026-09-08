@@ -122,6 +122,13 @@ export interface ListUsersResult {
 export async function listUsers(actor: AuthUser, query: ListUsersQuery): Promise<ListUsersResult> {
   const build = () => {
     const q = baseSelect();
+    // Phase 11A employee directory (OPT-IN via excludeSelf): the current viewer
+    // never appears in their OWN directory — they manage their account via "Mening
+    // profilim". Applied to the SHARED builder so it is removed BEFORE both COUNT
+    // and the page (the filtered total stays accurate). Only the actor is hidden —
+    // every OTHER user, including other administrators, remains. Off by default, so
+    // GET /users is unchanged for any other consumer; only the directory opts in.
+    if (query.excludeSelf) q.whereNot('users.id', actor.id);
     // Branch-scoped actors (RAHBAR) only ever see their own branch.
     if (isBranchScoped(actor.role)) {
       q.where('users.branch_id', actor.branchId ?? -1);
@@ -149,11 +156,26 @@ export async function listUsers(actor: AuthUser, query: ListUsersQuery): Promise
   const total = Number(countRows[0]?.count ?? 0);
 
   const rows = (await build()
+    // Deterministic order with an id tie-breaker, so rows sharing a created_at
+    // cannot reshuffle across pages (stable LIMIT/OFFSET pagination).
     .orderBy('users.created_at', 'desc')
+    .orderBy('users.id', 'desc')
     .limit(query.limit)
     .offset((query.page - 1) * query.limit)) as UserWithRoleBranch[];
 
   return { users: rows.map(toUserDetail), total, page: query.page, limit: query.limit };
+}
+
+/**
+ * Phase 11A own-profile read. Returns the actor's OWN UserDetail (branch name,
+ * status, created/last-login) — self-scoped, so it needs no `users.view` (every
+ * employee can view their own profile). It never accepts a target id, so it
+ * cannot be used to read anyone else's account.
+ */
+export async function getOwnProfile(actor: AuthUser): Promise<UserDetail> {
+  const row = await findDetail(actor.id);
+  if (!row) throw ApiError.notFound('Foydalanuvchi topilmadi');
+  return toUserDetail(row);
 }
 
 export async function getUser(actor: AuthUser, id: number): Promise<UserDetail> {
