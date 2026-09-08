@@ -14,7 +14,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { db } from '../src/config/database';
-import { env, isProduction, validateProductionConfig } from '../src/config/env';
+import { env, isProduction, validateProductionConfig, smsFeatureEnabled } from '../src/config/env';
 import { smsCapability } from '../src/sms';
 import { riskPolicyActive } from '../src/modules/risk/risk-policy.service';
 import { readiness } from '../src/modules/health/health.service';
@@ -68,11 +68,25 @@ async function main(): Promise<void> {
     checks.push({ id: 'active_approved_risk_matrix', description: 'ACTIVE approved risk matrix', kind: 'live', blocker: true, status: 'unknown', detail: String((e as Error).message) });
   }
 
+  // §E — SMS is opt-in. When no enabled feature uses it (the default after manual
+  // admin recovery replaced OTP), a functional provider is NOT required and this is
+  // not a blocker; when SMS is explicitly enabled the original blocker applies.
+  const smsRequired = smsFeatureEnabled();
   try {
     const cap = smsCapability();
-    checks.push({ id: 'sms_provider_functional', description: 'A REAL functional SMS provider is ready (KNOWN BLOCKER: Eskiz adapter is a fail-closed stub until a verified spec exists)', kind: 'live', blocker: true, status: cap.ready ? 'pass' : 'fail', detail: `provider=${cap.provider} implemented=${cap.implemented} ready=${cap.ready}` });
+    checks.push({
+      id: 'sms_provider_functional',
+      description:
+        'A REAL functional SMS provider is ready — required ONLY when SMS is enabled (SMS_PROVIDER=eskiz). With manual admin recovery SMS is disabled and this is not a blocker.',
+      kind: 'live',
+      blocker: smsRequired,
+      status: smsRequired ? (cap.ready ? 'pass' : 'fail') : 'pass',
+      detail: smsRequired
+        ? `provider=${cap.provider} implemented=${cap.implemented} ready=${cap.ready}`
+        : 'SMS disabled (manual admin recovery) — no functional provider required',
+    });
   } catch (e) {
-    checks.push({ id: 'sms_provider_functional', description: 'Functional SMS provider', kind: 'live', blocker: true, status: 'fail', detail: String((e as Error).message) });
+    checks.push({ id: 'sms_provider_functional', description: 'Functional SMS provider', kind: 'live', blocker: smsRequired, status: smsRequired ? 'fail' : 'pass', detail: smsRequired ? String((e as Error).message) : 'SMS disabled (manual admin recovery)' });
   }
 
   try {
@@ -84,7 +98,7 @@ async function main(): Promise<void> {
 
   try {
     const r = await readiness();
-    checks.push({ id: 'readiness_ok', description: 'Readiness endpoint reports ready (db/redis/storage/sms/riskPolicy)', kind: 'live', blocker: true, status: r.ready ? 'pass' : 'fail', detail: JSON.stringify(r.checks) });
+    checks.push({ id: 'readiness_ok', description: 'Readiness endpoint reports ready (db/redis/storage/riskPolicy; sms only when enabled)', kind: 'live', blocker: true, status: r.ready ? 'pass' : 'fail', detail: JSON.stringify(r.checks) });
   } catch (e) {
     checks.push({ id: 'readiness_ok', description: 'Readiness', kind: 'live', blocker: true, status: 'unknown', detail: String((e as Error).message) });
   }

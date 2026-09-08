@@ -75,6 +75,7 @@ async function ensurePublishedTemplate(): Promise<void> {
       role: 'ADMIN',
       status: 'ACTIVE',
       avatarUrl: null,
+      mustChangePassword: Boolean(adminRow.must_change_password),
       permissions: ROLE_PERMISSIONS.ADMIN,
     };
     const meta = { ip: null, userAgent: null };

@@ -21,6 +21,8 @@ export function toAuthUser(row: UserWithRole): AuthUser {
     role: row.role_code,
     status: row.status,
     avatarUrl: row.avatar_url,
+    // MySQL returns tinyint(1) as 0/1 (or boolean under some drivers) — coerce.
+    mustChangePassword: Boolean(row.must_change_password),
     permissions: ROLE_PERMISSIONS[row.role_code],
   };
 }

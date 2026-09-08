@@ -20,6 +20,7 @@ export const PERMISSIONS = [
   'users.update',
   'users.block',
   'users.assign_role',
+  'users.reset_password', // ADMIN-only: issue a one-time temporary password (manual recovery)
   'branches.manage',
   'registration.review',
 
@@ -109,6 +110,7 @@ export const ROLE_PERMISSIONS: Record<RoleCode, readonly Permission[]> = {
     'users.update',
     'users.block',
     'users.assign_role',
+    'users.reset_password',
     'branches.manage',
     'registration.review',
     'customers.view',

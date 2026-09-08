@@ -18,6 +18,10 @@ export interface UserRow {
   branch_id: number | null;
   role_id: number;
   status: UserStatus;
+  /** Manual recovery: while true the account is a restricted (must-change) session. */
+  must_change_password: boolean;
+  /** When the admin-issued temporary password stops being accepted (NULL = normal). */
+  temp_password_expires_at: Date | null;
   created_at: Date;
   updated_at: Date;
   last_login_at: Date | null;
@@ -109,6 +113,12 @@ export interface AuthUser {
   role: RoleCode;
   status: UserStatus;
   avatarUrl: string | null;
+  /**
+   * True when this is a RESTRICTED session: the user logged in with an
+   * admin-issued temporary password and must change it before using the app.
+   * Enforced server-side (requireAuth gate), surfaced for the client redirect.
+   */
+  mustChangePassword: boolean;
   /** Derived from ROLE_PERMISSIONS — sent to the client for UX-only checks. */
   permissions: readonly Permission[];
 }

@@ -3,11 +3,121 @@
 > This is the **canonical, git-tracked** project status. The copy at the repo-root
 > (`../../PROJECT_STATUS.md`, outside both git repos) is now **non-authoritative**.
 
-**Current phase:** Phase 10F — Integrity, Observability & Release Readiness — **implemented +
-tested**. Two production blockers remain (by design), enforced by the live release gate.
+**Current phase:** Manual employee password recovery (product decision: EasyGas Guide is
+employee-only; SMS/OTP self-service recovery removed, Eskiz integration retired from the recovery
+path) — **implemented + tested** on branch `phase/manual-employee-recovery` in both repos.
+Built on Phase 10F. **Not pushed / not merged / not deployed** — awaiting review.
 
 **Repos:** two separate git repositories — `server/` and `client/`. Project-root files (like the old
 `PROJECT_STATUS.md`) live **outside** both repos.
+
+---
+
+## Manual employee password recovery — IMPLEMENTED + TESTED
+
+Product decision: the Guide is for EASY GAS employees only. Password recovery is now **manual**:
+an employee contacts an admin via Telegram (**@EasygasGarantbot** — a support-request channel, NOT
+an automated auth/OTP provider); the admin verifies them **out of band**, then issues a one-time
+temporary password from the admin UI. There is **no** automatic Telegram OTP, account linking, or
+self-service reset.
+
+**Server (`phase/manual-employee-recovery`):**
+- Admin reset endpoint `POST /users/:id/reset-password` — ADMIN-only permission `users.reset_password`;
+  requires the admin's **own** password (recent-auth) + a mandatory reason; CSRF + a fail-closed
+  per-admin rate limit; generates a cryptographically-random temporary password (returned **once**,
+  `Cache-Control: no-store`); atomically sets it (bcrypt), sets `must_change_password` + a configurable
+  expiry (`TEMP_PASSWORD_TTL_MINUTES`), **revokes all** the target's sessions and invalidates prior
+  recovery credentials. Self-reset is refused (no last-admin backdoor). Blocked/inactive users stay
+  blocked. The audit chain records actor/target/reason/timestamp and **never** the password or its hash.
+- First-login change `POST /auth/change-password` — authenticated; verifies current (temporary)
+  password, rejects reuse, re-checks temp expiry on the authoritative path, rotates the session + CSRF.
+- Server-side first-login **gate** in `requireAuth`: a temporary-password session may reach only
+  `/auth/me` + `/auth/change-password` (+ logout); every business API is refused with
+  `PASSWORD_CHANGE_REQUIRED` until the password is changed (optional-auth routes degrade it to anon).
+- SMS is now **opt-in** (`smsFeatureEnabled()` = `SMS_PROVIDER==='eskiz'`): startup, readiness and the
+  release gate demand a working SMS provider **only when SMS is enabled** — never faking a broken
+  provider as healthy. Production requires **no** Eskiz credentials by default. The OTP HTTP endpoints
+  are removed; the durable outbox/worker infra is **retained** (unchanged), and a migration
+  (`20260908000002_cancel_pending_recovery_sms`) safely CANCELS any queued recovery SMS (history
+  preserved; tables not dropped).
+- Migrations: `20260908000001_manual_recovery_password_fields` (adds `must_change_password`,
+  `temp_password_expires_at`; idempotent, reversible) + the cancel migration above. Applied only on an
+  isolated `*_test` DB; migrate + rollback + re-migrate run **locally** (the CI workflow is wired to run
+  the same down/up step, but has **not** been executed on GitHub Actions for this branch — see
+  "Verification provenance"). The cancel migration documents the operator deploy sequence
+  (stop/drain the dedicated SMS worker BEFORE running it; a DB migration cannot retract a send already
+  handed to the provider).
+- Tests: new `test:manual-recovery` suite (20 cases — authz, admin re-auth, one-time secret + no-store,
+  session revocation, forced-change gate on direct business APIs, expiry + repeated/concurrent resets,
+  **concurrent reset-vs-change race**, blocked-stays-blocked, CSRF, rate limits, audit redaction,
+  removed-endpoints-404, manual-recovery config/readiness). `auth`/`hardening`/`sms-outbox`/`runtime`
+  suites updated for the removal. **Full `test:all` green (28 suites) — executed LOCALLY**; typecheck +
+  build + OpenAPI check clean locally.
+
+### Verification provenance (what was actually run, and where)
+- **Local machine only.** Every green result above (server `test:all` 28 suites, the browser E2E, client
+  lint/tsc/component tests) was **executed locally**. **No GitHub Actions run has occurred** for these
+  branches — nothing is pushed, so `server-ci` / `e2e-fullstack` have **not** validated this code. The CI
+  is *wired* to run these checks; that wiring is not the same as a green run.
+- **Browser E2E:** chromium project executed and passed (system Edge). The `mobile` (Pixel 5) project is
+  authored + discovered but was **not** run locally; CI would run both.
+- **Concurrency race** (reset-vs-change) is covered by a focused server test; the change-password path now
+  locks the user row `FOR UPDATE` and re-verifies inside the transaction (see below).
+
+**Client (`phase/manual-employee-recovery`):**
+- "Parolni unutdingizmi?" now opens a **support page** (no OTP wizard): Uzbek instructions to contact
+  the admin via Telegram with name/branch/work-phone, an explicit "never send your current password"
+  warning, and a **Telegram orqali murojaat** button → `https://t.me/EasygasGarantbot`.
+- Forced first-login **"Yangi parol o'rnating"** screen + route guard (temp-password sessions are held
+  there until they change the password); admin **"Vaqtinchalik parol"** action in the Users page
+  (confirm admin password + reason → temporary password shown once, copy-to-clipboard, never persisted).
+- Lint + `tsc -b` clean.
+
+**Browser E2E — MANUALLY-VERIFIED:** new `e2e/manual-recovery.spec.ts` (admin UI reset → employee temp
+login → forced change → normal access → new-password login) **executed and passed** on system Edge
+(`PW_CHANNEL=msedge`, chromium project, against the full-stack harness).
+
+### Remaining production blockers (unchanged ownership)
+- **ACTIVE, approved risk matrix** — still DRAFT; approval belongs to an **authorized EASY GAS safety
+  specialist**, not this work. Enforced by the release gate (fail-closed). **PRODUCTION-BLOCKED.**
+- **Attested release inputs** (CI green, restore drill, full-stack safety Playwright on GitHub Actions,
+  backups, secrets, monitoring, manual smoke) — per `RELEASE-CHECKLIST-10F.md`.
+- SMS is **no longer a blocker** by default: the `sms_provider_functional` gate now applies only when
+  SMS is explicitly enabled (`SMS_PROVIDER=eskiz`).
+- Not pushed/merged/deployed; no production data touched; no real Telegram/SMS sent.
+
+### Operational dependency — support-request routing (NOT wired here)
+The recovery UX depends on an admin actually **receiving** an employee's request. This change provides
+only the outbound **support link** (`https://t.me/EasygasGarantbot`); the link alone does **not** prove
+requests reach an admin. The Telegram bot **@EasygasGarantbot** has **no code, repo, or webhook in either
+repository** — routing employee messages to admins (an inbox/notification the admin monitors) is a
+separate operational integration, owned outside this change. The live bot was **not** inspected or
+modified. Until that inbox is wired and verified, treat "employee can request a reset" as **unproven at
+the operational level**, even though the website + admin reset flow are complete.
+
+### Cross-repo compatibility (both repos changed; contracts diverge)
+Changed contracts: **removed** `POST /auth/{forgot-password,verify-otp,reset-password}`; **added**
+`POST /auth/change-password` + `POST /users/:id/reset-password`; login/`/auth/me` user gained an
+additive `mustChangePassword` field. Compatibility of the two branches against the *other repo's* current
+`main` (verified by inspecting the specs + the changed endpoints, not executed cross-version):
+- **server branch × client main** — normal login/app **works** (the extra `mustChangePassword` field is
+  ignored by the old client); the old client's OTP recovery screen would **404** (endpoints removed) but
+  no browser spec exercises it, so the *server* mirror e2e (server branch × client main) stays green.
+- **client branch × server main** — normal login/app **works**; the new admin "Vaqtinchalik parol" action
+  and the change-password screen **404** (server main lacks the endpoints); the forced-change flow never
+  triggers (server main never sends `mustChangePassword`). The new `manual-recovery.spec` would be **RED**
+  against server main.
+- **both branches together** — **green** (verified locally, chromium).
+
+**Proposed coordinated validation/merge sequence (no weakened checks, never merge a red PR):**
+1. Dispatch the client `e2e-fullstack` with `server_ref=phase/manual-employee-recovery` (the workflow
+   accepts a `server_ref` input) and the server mirror e2e with `client_ref=phase/manual-employee-recovery`
+   → both must be green **before** any merge.
+2. Merge the **server** PR first — its default gate (server branch × client `main`) is green and it is
+   backward-compatible for normal operation.
+3. After server `main` carries the endpoints, the client PR's default gate (client branch × server `main`)
+   turns green → merge the **client** PR, then deploy both together. Do **not** merge the client PR while
+   server `main` lacks the endpoints (its e2e is expected red — do not disable the spec to force it green).
 
 ---
 

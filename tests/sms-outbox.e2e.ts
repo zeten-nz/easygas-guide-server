@@ -1,16 +1,18 @@
 /**
- * EASY GAS — Phase 10C durable SMS outbox / worker / OTP lifecycle tests.
+ * EASY GAS — Phase 10C durable SMS outbox / worker tests.
  *
  *   npm run test:sms   (after: npm run test:setup)
  *
  * Deterministic: a controllable in-process provider + manual worker cycles
  * (runOnce) exercise the outbox state machine with no sleeps and no real SMS.
- * Covers: encrypted payload (no plaintext OTP at rest), resend supersede,
- * concurrent resend, delayed worker, expired-message cancel, retry/backoff,
- * permanent + ambiguous outcomes, max attempts, stale-lease recovery, no
- * double-processing, generic API responses, and the deferred Eskiz adapter.
+ * Covers: encrypted payload (no plaintext at rest), enqueue supersede, delayed
+ * worker, expired-message cancel, retry/backoff, permanent + ambiguous outcomes,
+ * max attempts, stale-lease recovery, no double-processing, and the deferred
+ * Eskiz adapter. The outbox infrastructure is retained after SMS/OTP self-service
+ * recovery was removed; it is exercised directly via its enqueue API (there is no
+ * longer an OTP HTTP endpoint).
  *
- * Fixtures: user +998990009101, recipients +99899000920x.
+ * Fixtures: recipient/user +998990009101, recipients +99899000920x.
  */
 import { assertTestDatabase } from './helpers/test-env';
 import assert from 'node:assert/strict';
@@ -18,12 +20,13 @@ import bcrypt from 'bcrypt';
 import { db } from '../src/config/database';
 import { createApp } from '../src/app';
 import { setSmsProviderForTesting } from '../src/sms';
-import { MemoryRedis, setRedisForTesting } from '../src/redis/redis';
 import { SmsSendError, type SmsProvider } from '../src/sms/sms.provider';
 import { EskizSmsProvider } from '../src/sms/eskiz.provider';
 import { runOnce } from '../src/sms/sms.worker';
-import { smsAad } from '../src/sms/outbox.service';
+import { smsAad, enqueueOtpSmsStandalone } from '../src/sms/outbox.service';
 import { encryptSecret, decryptSecret } from '../src/utils/crypto';
+
+const OTP_MSG = (code: string) => `EASY GAS: parolni tiklash kodi: ${code}. Kod 5 daqiqa amal qiladi.`;
 
 const USER = '+998990009101';
 const PASSWORD = 'Sinov-parol-123';
@@ -51,12 +54,6 @@ let failed = 0;
 async function test(name: string, fn: () => Promise<void>): Promise<void> {
   try { control.behavior = 'ok'; await fn(); passed += 1; console.log(`  PASS  ${name}`); }
   catch (err) { failed += 1; console.error(`  FAIL  ${name}`); console.error(`        ${err instanceof Error ? err.stack : String(err)}`); }
-}
-
-async function http(method: string, p: string, body?: unknown): Promise<{ status: number; body: any }> {
-  const res = await fetch(`${baseUrl}${p}`, { method, headers: { 'content-type': 'application/json' }, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
-  const text = await res.text();
-  return { status: res.status, body: text ? JSON.parse(text) : null };
 }
 
 /** Inserts an outbox row directly (full control for worker-mechanics tests). */
@@ -95,27 +92,22 @@ async function run(): Promise<void> {
   baseUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   console.log(`\nRunning SMS outbox E2E against ${baseUrl}\n`);
 
-  const otpOf = (recipient: string) => {
-    const m = [...control.sent].reverse().find((s) => s.phone === recipient);
-    return m?.message.match(/\b(\d{6})\b/)?.[1];
-  };
-
-  // ---- No plaintext OTP at rest ----
-  await test('the outbox stores an ENCRYPTED payload — no plaintext OTP in the DB row', async () => {
-    await http('POST', '/api/v1/auth/forgot-password', { phone: USER });
+  // ---- No plaintext at rest ----
+  await test('the outbox stores an ENCRYPTED payload — no plaintext code in the DB row', async () => {
+    await db('sms_outbox').where({ recipient: USER }).del();
+    await enqueueOtpSmsStandalone({ userId: null, phone: USER, message: OTP_MSG('123456') });
     const row = await db('sms_outbox').where({ recipient: USER, status: 'PENDING' }).orderBy('id', 'desc').first();
     assert.ok(row, 'a PENDING outbox row exists');
     // The row must not contain any 6-digit code in cleartext.
-    assert.ok(!/\b\d{6}\b/.test(row.payload_cipher), 'no plaintext OTP in payload_cipher');
+    assert.ok(!/\b\d{6}\b/.test(row.payload_cipher), 'no plaintext code in payload_cipher');
     // But it decrypts back to the real message with the bound AAD (type+recipient).
     assert.match(decryptSecret(row.payload_cipher, smsAad('OTP', row.recipient)), /parolni tiklash kodi: \d{6}/);
   });
 
-  // ---- Generic API response (enumeration-resistant), delivery is async ----
-  await test('forgot-password returns a generic response and delivers via the worker', async () => {
-    const r = await http('POST', '/api/v1/auth/forgot-password', { phone: USER });
-    assert.equal(r.status, 200);
-    assert.match(r.body.message, /SMS kod yuborildi/);
+  // ---- Enqueue → async delivery by the worker ----
+  await test('a queued message is delivered by the worker and marked SENT', async () => {
+    await db('sms_outbox').where({ recipient: USER }).del();
+    await enqueueOtpSmsStandalone({ userId: null, phone: USER, message: OTP_MSG('234567') });
     const before = control.countFor(USER);
     await runOnce(); // deliver
     assert.ok(control.countFor(USER) > before, 'the worker delivered the queued message');
@@ -123,37 +115,18 @@ async function run(): Promise<void> {
     assert.ok(sent && sent.provider_message_id, 'row marked SENT with a provider message id');
   });
 
-  // ---- Resend supersedes the prior OTP + cancels its queued SMS ----
-  await test('resend supersedes the prior OTP and cancels its still-queued message; only the latest verifies', async () => {
-    setRedisForTesting(new MemoryRedis()); // fresh per-phone rate-limit window
+  // ---- Re-enqueue supersedes the prior still-queued message ----
+  await test('a re-enqueue supersedes the prior still-queued message; only the latest is delivered', async () => {
     await db('sms_outbox').where({ recipient: USER }).del();
-    await db('password_resets').where({ phone: USER }).del();
-    await http('POST', '/api/v1/auth/forgot-password', { phone: USER }); // OTP #1 (still PENDING)
+    await enqueueOtpSmsStandalone({ userId: null, phone: USER, message: OTP_MSG('345678') }); // #1 (still PENDING)
     const first = await db('sms_outbox').where({ recipient: USER }).orderBy('id', 'desc').first();
-    await http('POST', '/api/v1/auth/forgot-password', { phone: USER }); // OTP #2 supersedes #1
+    await enqueueOtpSmsStandalone({ userId: null, phone: USER, message: OTP_MSG('456789') }); // #2 supersedes #1
     const firstAfter = await rowOf(first.id);
-    assert.equal(firstAfter.status, 'CANCELLED', 'the first queued SMS was superseded/cancelled');
-    // Deliver the latest, capture its OTP, verify it works.
-    await runOnce();
-    const otp2 = otpOf(USER)!;
-    const verify = await http('POST', '/api/v1/auth/verify-otp', { phone: USER, otp: otp2 });
-    assert.equal(verify.status, 200, JSON.stringify(verify.body));
-  });
-
-  // ---- Concurrent resend: only one latest valid OTP ----
-  await test('concurrent resend requests leave exactly one deliverable (PENDING) OTP', async () => {
-    setRedisForTesting(new MemoryRedis()); // fresh per-phone rate-limit window
-    await db('sms_outbox').where({ recipient: USER }).del();
-    await db('password_resets').where({ phone: USER }).del();
-    await Promise.all([
-      http('POST', '/api/v1/auth/forgot-password', { phone: USER }),
-      http('POST', '/api/v1/auth/forgot-password', { phone: USER }),
-      http('POST', '/api/v1/auth/forgot-password', { phone: USER }),
-    ]);
+    assert.equal(firstAfter.status, 'CANCELLED', 'the first queued message was superseded/cancelled');
     const pending = await db('sms_outbox').where({ recipient: USER, status: 'PENDING' });
-    assert.equal(pending.length, 1, `exactly one PENDING OTP message (got ${pending.length})`);
-    const validReset = await db('password_resets').where({ phone: USER }).whereNull('consumed_at');
-    assert.equal(validReset.length, 1, 'exactly one un-consumed OTP row');
+    assert.equal(pending.length, 1, `exactly one deliverable message remains (got ${pending.length})`);
+    await runOnce();
+    assert.equal((await rowOf(pending[0].id)).status, 'SENT', 'the latest message is delivered');
   });
 
   // ---- Delayed worker still delivers within the window ----

@@ -1,4 +1,5 @@
 import { db } from '../../config/database';
+import { smsFeatureEnabled } from '../../config/env';
 import { getRedis } from '../../redis/redis';
 import { getStorageProvider } from '../../storage';
 import { smsCapability } from '../../sms';
@@ -66,9 +67,8 @@ async function checkStorage(): Promise<boolean> {
 
 function checkSmsConfig(): boolean {
   try {
-    // Phase 10C: readiness requires a provider that is actually USABLE
-    // (implemented + configured) — never 200 for a known non-functional stub
-    // (e.g. the Eskiz stub) or a console-in-production provider. No send is made.
+    // The ACTUAL provider capability — never faked. Reported honestly even when
+    // SMS is disabled (then it simply does not gate readiness; see readiness()).
     return smsCapability().ready;
   } catch {
     return false;
@@ -85,12 +85,26 @@ async function checkRiskPolicy(): Promise<boolean> {
 
 export interface Readiness {
   ready: boolean;
-  checks: { db: boolean; redis: boolean; storage: boolean; sms: boolean; riskPolicy: boolean; shuttingDown: boolean };
+  checks: {
+    db: boolean;
+    redis: boolean;
+    storage: boolean;
+    /** Actual provider capability (honest). Gates readiness ONLY when smsRequired. */
+    sms: boolean;
+    /** Whether any enabled feature uses SMS (false after manual recovery replaced OTP). */
+    smsRequired: boolean;
+    riskPolicy: boolean;
+    shuttingDown: boolean;
+  };
 }
 
 export async function readiness(): Promise<Readiness> {
+  const smsRequired = smsFeatureEnabled();
   if (shuttingDown) {
-    return { ready: false, checks: { db: false, redis: false, storage: false, sms: false, riskPolicy: false, shuttingDown: true } };
+    return {
+      ready: false,
+      checks: { db: false, redis: false, storage: false, sms: false, smsRequired, riskPolicy: false, shuttingDown: true },
+    };
   }
   let db_ = false;
   let redis_ = false;
@@ -107,8 +121,13 @@ export async function readiness(): Promise<Readiness> {
     // Overall timeout — leave failed checks false.
     sms_ = checkSmsConfig();
   }
-  // Phase 10D: the safety domain is NOT reported healthy without an approved risk
-  // policy — riskPolicy=false surfaces here (and completion/job-start fail closed).
-  const ready = db_ && redis_ && storage_ && sms_ && riskPolicy_;
-  return { ready, checks: { db: db_, redis: redis_, storage: storage_, sms: sms_, riskPolicy: riskPolicy_, shuttingDown: false } };
+  // §E — SMS gates readiness ONLY when an enabled feature actually uses it. When
+  // disabled, a non-usable provider (sms=false) does NOT block readiness, and we
+  // never fake sms=true. Phase 10D: the safety domain is NOT reported healthy
+  // without an approved risk policy (riskPolicy=false fails closed here too).
+  const ready = db_ && redis_ && storage_ && riskPolicy_ && (!smsRequired || sms_);
+  return {
+    ready,
+    checks: { db: db_, redis: redis_, storage: storage_, sms: sms_, smsRequired, riskPolicy: riskPolicy_, shuttingDown: false },
+  };
 }

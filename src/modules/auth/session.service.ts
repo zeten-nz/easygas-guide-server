@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import type { Knex } from 'knex';
 import type { CookieOptions, Response } from 'express';
 import { db } from '../../config/database';
 import { env, isProduction } from '../../config/env';
@@ -56,17 +57,27 @@ export interface CreatedSession {
   rotationSeq: number;
 }
 
-/** Creates a brand-new session family for a fresh login. */
+/**
+ * Creates a brand-new session family for a fresh login.
+ *
+ * `executor` defaults to the global connection, but callers that must make the
+ * session insert ATOMIC with a credential change (login, change-password) pass
+ * their transaction so the new session is committed together with the password
+ * update + revocation under the same row lock. This closes the window in which a
+ * concurrent admin reset could run its revoke-all BETWEEN the caller's commit and
+ * a post-commit session insert, leaving the replacement session alive.
+ */
 export async function createSession(
   userId: number,
   rememberMe: boolean,
   meta: { ip: string | null; userAgent: string | null },
+  executor: Knex | Knex.Transaction = db,
 ): Promise<CreatedSession> {
   const token = generateSessionToken();
   const now = Date.now();
   const absoluteExpiresAt = new Date(now + (rememberMe ? env.SESSION_ABSOLUTE_DAYS * DAY_MS : env.SESSION_TTL_HOURS * HOUR_MS));
   const id = crypto.randomUUID();
-  await db('sessions').insert({
+  await executor('sessions').insert({
     id,
     user_id: userId,
     token_hash: hashSessionToken(token),

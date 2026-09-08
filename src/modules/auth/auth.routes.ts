@@ -5,18 +5,9 @@ import {
   loginIpLimiter,
   loginPhoneLimiter,
   registerLimiter,
-  otpRequestIpLimiter,
-  otpRequestPhoneLimiter,
-  otpVerifyLimiter,
-  resetPasswordLimiter,
+  changePasswordLimiter,
 } from '../../middleware/rate-limit.middleware';
-import {
-  loginSchema,
-  registerSchema,
-  forgotPasswordSchema,
-  verifyOtpSchema,
-  resetPasswordSchema,
-} from './auth.validators';
+import { loginSchema, registerSchema, changePasswordSchema } from './auth.validators';
 import * as controller from './auth.controller';
 
 export const authRouter = Router();
@@ -25,17 +16,13 @@ authRouter.post('/login', loginIpLimiter, loginPhoneLimiter, validate({ body: lo
 authRouter.post('/logout', controller.logout);
 authRouter.get('/me', requireAuth, controller.me);
 authRouter.post('/register', registerLimiter, validate({ body: registerSchema }), controller.register);
+// §D — self password change. requireAuth first so the limiter/gate see req.user;
+// the first-login gate (auth.middleware) allowlists this route so a temporary-
+// password session can reach it while every business API stays blocked.
 authRouter.post(
-  '/forgot-password',
-  otpRequestIpLimiter,
-  otpRequestPhoneLimiter,
-  validate({ body: forgotPasswordSchema }),
-  controller.forgotPassword,
-);
-authRouter.post('/verify-otp', otpVerifyLimiter, validate({ body: verifyOtpSchema }), controller.verifyOtp);
-authRouter.post(
-  '/reset-password',
-  resetPasswordLimiter,
-  validate({ body: resetPasswordSchema }),
-  controller.resetPassword,
+  '/change-password',
+  requireAuth,
+  changePasswordLimiter,
+  validate({ body: changePasswordSchema }),
+  controller.changePassword,
 );

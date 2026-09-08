@@ -1,10 +1,13 @@
 /**
  * EASY GAS — Phase 10A security & concurrency hardening E2E tests.
  *
- * Covers: CSRF matrix (A), trust-proxy IP handling (B), OTP verification
- * races (C), reset-token single-use races (D), last-active-admin invariant
- * races (E), checklist assignment races (F), inactive-branch enforcement (G),
- * test-DB guard behavior (H), MySQL error mapping (I).
+ * Covers: CSRF matrix (A), trust-proxy IP handling (B), last-active-admin
+ * invariant races (E), checklist assignment races (F), inactive-branch
+ * enforcement (G), test-DB guard behavior (H), MySQL error mapping (I).
+ *
+ * (Former sections C/D covered OTP verification + reset-token races. SMS/OTP
+ * self-service recovery has been removed; the manual admin recovery flow is
+ * covered in tests/manual-recovery.e2e.ts.)
  *
  *   npm run test:hardening   (after: npm run test:setup)
  *
@@ -18,8 +21,6 @@ import { createApp } from '../src/app';
 import { csrfTokenFor } from '../src/middleware/csrf.middleware';
 import { errorHandler } from '../src/middleware/error.middleware';
 import { env } from '../src/config/env';
-import { setSmsProviderForTesting } from '../src/sms';
-import { runOnce } from '../src/sms/sms.worker';
 
 const USERS = {
   adminX: '+998990008801',
@@ -214,22 +215,6 @@ async function createFixtures() {
 // ---------------------------------------------------------------------------
 
 async function run(): Promise<void> {
-  const smsInbox: { phone: string; message: string }[] = [];
-  setSmsProviderForTesting({
-    name: 'test-capture',
-    async send(phone, message) {
-      smsInbox.push({ phone, message });
-      return { providerMessageId: `test-${smsInbox.length}`, outcome: 'ACCEPTED' as const };
-    },
-  });
-  // Phase 10C: OTP goes through the durable outbox; flush the worker (no sleeps).
-  const lastOtpFor = async (phone: string): Promise<string> => {
-    await runOnce();
-    const msg = [...smsInbox].reverse().find((m) => m.phone === phone);
-    assert.ok(msg, `no SMS captured for ${phone}`);
-    return msg.message.match(/\b(\d{6})\b/)![1];
-  };
-
   await assertTestDatabase(db);
   await cleanup();
   const fx = await createFixtures();
@@ -362,72 +347,10 @@ async function run(): Promise<void> {
     proxiedServer.close();
   });
 
-  // --------------------------- C. OTP races ------------------------------
-
-  await test('OTP: concurrent wrong attempts cannot exceed the attempt limit', async () => {
-    assert.equal((await http('POST', '/api/v1/auth/forgot-password', { body: { phone: USERS.otpUser1 } })).status, 200);
-    const results = await Promise.all(
-      Array.from({ length: 10 }, () =>
-        http('POST', '/api/v1/auth/verify-otp', { body: { phone: USERS.otpUser1, otp: '000001' } }),
-      ),
-    );
-    assert.ok(results.every((r) => r.status !== 200), 'no wrong attempt may succeed');
-    const record = await db('password_resets').where({ user_id: fx.ids.otpUser1 }).orderBy('id', 'desc').first();
-    assert.equal(
-      record.attempts,
-      env.OTP_MAX_ATTEMPTS,
-      `attempts must be capped at ${env.OTP_MAX_ATTEMPTS} even under concurrency (got ${record.attempts})`,
-    );
-    const lateCorrect = await http('POST', '/api/v1/auth/verify-otp', {
-      body: { phone: USERS.otpUser1, otp: await lastOtpFor(USERS.otpUser1) },
-    });
-    assert.equal(lateCorrect.status, 429, 'the correct code is refused once the limit is reached');
-  });
-
-  await test('OTP: a valid code is consumed exactly once under concurrency', async () => {
-    assert.equal((await http('POST', '/api/v1/auth/forgot-password', { body: { phone: USERS.otpUser2 } })).status, 200);
-    const otp = await lastOtpFor(USERS.otpUser2);
-    const [a, b] = await Promise.all([
-      http('POST', '/api/v1/auth/verify-otp', { body: { phone: USERS.otpUser2, otp } }),
-      http('POST', '/api/v1/auth/verify-otp', { body: { phone: USERS.otpUser2, otp } }),
-    ]);
-    const statuses = [a.status, b.status].sort();
-    assert.equal(statuses[0], 200, `exactly one verification succeeds (got ${statuses})`);
-    assert.notEqual(statuses[1], 200, `the second consumption must fail (got ${statuses})`);
-    const winners = [a, b].filter((r) => r.status === 200);
-    assert.equal(winners.length, 1);
-    assert.ok(winners[0].body.resetToken, 'winner receives the reset token');
-    const record = await db('password_resets').where({ user_id: fx.ids.otpUser2 }).orderBy('id', 'desc').first();
-    assert.ok(record.consumed_at, 'consumed exactly once');
-  });
-
-  // ------------------------ D. Reset-token races --------------------------
-
-  await test('reset token: two simultaneous resets — exactly one succeeds, sessions revoked', async () => {
-    const preSession = await login(USERS.resetUser);
-    assert.equal((await http('POST', '/api/v1/auth/forgot-password', { body: { phone: USERS.resetUser } })).status, 200);
-    const verify = await http('POST', '/api/v1/auth/verify-otp', {
-      body: { phone: USERS.resetUser, otp: await lastOtpFor(USERS.resetUser) },
-    });
-    assert.equal(verify.status, 200);
-    const resetToken = verify.body.resetToken;
-
-    const [a, b] = await Promise.all([
-      http('POST', '/api/v1/auth/reset-password', { body: { resetToken, password: 'Yangi-parol-A-1' } }),
-      http('POST', '/api/v1/auth/reset-password', { body: { resetToken, password: 'Yangi-parol-B-2' } }),
-    ]);
-    const succeeded = [a, b].filter((r) => r.status === 200);
-    assert.equal(succeeded.length, 1, `exactly one reset may succeed (got ${a.status}/${b.status})`);
-
-    const user = await db('users').where({ id: fx.ids.resetUser }).first();
-    const matchesA = await bcrypt.compare('Yangi-parol-A-1', user.password_hash);
-    const matchesB = await bcrypt.compare('Yangi-parol-B-2', user.password_hash);
-    assert.equal(Number(matchesA) + Number(matchesB), 1, 'the stored password is exactly one candidate');
-
-    const liveSessions = await db('sessions').where({ user_id: fx.ids.resetUser }).whereNull('revoked_at');
-    assert.equal(liveSessions.length, 0, 'all sessions revoked after the successful reset');
-    assert.equal((await rawHttp('GET', '/api/v1/auth/me', { headers: { cookie: preSession.cookie } })).status, 401);
-  });
+  // Sections C (OTP verification races) and D (reset-token single-use races)
+  // were retired with SMS/OTP self-service recovery. Concurrency of the
+  // replacement manual admin reset + forced first-login change is covered in
+  // tests/manual-recovery.e2e.ts.
 
   // ------------------------ E. Last-admin races ---------------------------
 
@@ -676,6 +599,25 @@ async function run(): Promise<void> {
     );
     assert.equal(deadlock.statusCode, 409);
     assert.equal(deadlock.payload.error.code, 'CONFLICT_RETRY');
+
+    // An UNEXPECTED database error (e.g. unknown column) must be sanitized to a
+    // generic 500 in every environment — no SQL / schema detail reaches the client,
+    // even though this test runs with NODE_ENV=test (the dev-friendly branch).
+    const rawSql = capture();
+    errorHandler(
+      Object.assign(new Error("Unknown column 'secret_col' in 'field list' — SELECT SECRET SQL"), {
+        errno: 1054,
+        code: 'ER_BAD_FIELD_ERROR',
+        sqlState: '42S22',
+      }),
+      { path: '/t', method: 'GET' } as never,
+      rawSql,
+      (() => {}) as never,
+    );
+    assert.equal(rawSql.statusCode, 500);
+    assert.equal(rawSql.payload.error.code, 'DATABASE_ERROR');
+    assert.ok(!JSON.stringify(rawSql.payload).includes('SECRET SQL'), 'raw SQL must not leak');
+    assert.ok(!JSON.stringify(rawSql.payload).includes('secret_col'), 'schema/column names must not leak');
   });
 
   await cleanup();

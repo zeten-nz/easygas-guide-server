@@ -6,9 +6,10 @@
  *
  *   npm run test:auth
  *
- * Uses a capturing SMS provider so OTP codes can be asserted without a real
- * SMS gateway. All fixtures live in the +9989900099xx phone range and are
- * cleaned up before and after the run.
+ * SMS/OTP self-service recovery has been removed (EasyGas is employee-only;
+ * recovery is now a manual admin flow — see tests/manual-recovery.e2e.ts). All
+ * fixtures live in the +9989900099xx phone range and are cleaned up before and
+ * after the run.
  */
 import { assertTestDatabase } from './helpers/test-env'; // MUST be first: NODE_ENV=test + *_test DB
 import assert from 'node:assert/strict';
@@ -17,9 +18,6 @@ import { db } from '../src/config/database';
 import { env } from '../src/config/env';
 import { createApp } from '../src/app';
 import { csrfTokenFor } from '../src/middleware/csrf.middleware';
-import { setSmsProviderForTesting } from '../src/sms';
-import { runOnce } from '../src/sms/sms.worker';
-import type { SmsProvider } from '../src/sms/sms.provider';
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -37,26 +35,6 @@ const PHONES = {
 };
 
 const PASSWORD = 'Sinov-parol-123';
-
-const smsInbox: { phone: string; message: string }[] = [];
-const captureSms: SmsProvider = {
-  name: 'test-capture',
-  async send(phone, message) {
-    smsInbox.push({ phone, message });
-    return { providerMessageId: `test-${smsInbox.length}`, outcome: 'ACCEPTED' as const };
-  },
-};
-
-// Phase 10C: OTP SMS is delivered asynchronously via the durable outbox worker.
-// Flush the worker (deterministically, no sleeps) before reading the captured code.
-async function lastOtpFor(phone: string): Promise<string> {
-  await runOnce();
-  const msg = [...smsInbox].reverse().find((m) => m.phone === phone);
-  assert.ok(msg, `no SMS captured for ${phone}`);
-  const otp = msg.message.match(/\b(\d{6})\b/)?.[1];
-  assert.ok(otp, `no OTP found in SMS: ${msg.message}`);
-  return otp;
-}
 
 let baseUrl = '';
 
@@ -157,7 +135,6 @@ async function createFixtures(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function run(): Promise<void> {
-  setSmsProviderForTesting(captureSms);
   await assertTestDatabase(db);
   await cleanup();
   await createFixtures();
@@ -372,108 +349,10 @@ async function run(): Promise<void> {
     assert.equal(login.status, 401, 'rejected request must not create an account');
   });
 
-  // 11. Password reset validation
-  await test('reset validation: wrong OTP and garbage token are rejected', async () => {
-    const forgot = await http('POST', '/api/v1/auth/forgot-password', { body: { phone: PHONES.usta } });
-    assert.equal(forgot.status, 200);
-
-    const wrongOtp = await http('POST', '/api/v1/auth/verify-otp', {
-      body: { phone: PHONES.usta, otp: '000000' },
-    });
-    // The real OTP is random 6 digits; 000000 collides with probability 1e-6.
-    assert.equal(wrongOtp.status, 400);
-
-    const badToken = await http('POST', '/api/v1/auth/reset-password', {
-      body: { resetToken: 'f'.repeat(64), password: 'Yangi-parol-123' },
-    });
-    assert.equal(badToken.status, 400);
-
-    const malformed = await http('POST', '/api/v1/auth/verify-otp', {
-      body: { phone: PHONES.usta, otp: 'abc' },
-    });
-    assert.equal(malformed.status, 422);
-  });
-
-  // 12. OTP expiration
-  await test('expired OTP is rejected', async () => {
-    const forgot = await http('POST', '/api/v1/auth/forgot-password', { body: { phone: PHONES.usta2 } });
-    assert.equal(forgot.status, 200);
-    const otp = await lastOtpFor(PHONES.usta2);
-
-    await db('password_resets')
-      .where({ phone: PHONES.usta2 })
-      .whereNull('consumed_at')
-      .update({ otp_expires_at: new Date(Date.now() - 1000) });
-
-    const res = await http('POST', '/api/v1/auth/verify-otp', { body: { phone: PHONES.usta2, otp } });
-    assert.equal(res.status, 400);
-  });
-
-  // 13. OTP single-use + full reset flow
-  let resetToken = '';
-  await test('OTP is single-use; full reset changes password and revokes sessions', async () => {
-    const forgot = await http('POST', '/api/v1/auth/forgot-password', { body: { phone: PHONES.usta } });
-    assert.equal(forgot.status, 200);
-    const otp = await lastOtpFor(PHONES.usta);
-
-    const ok = await http('POST', '/api/v1/auth/verify-otp', { body: { phone: PHONES.usta, otp } });
-    assert.equal(ok.status, 200);
-    assert.ok(ok.body.resetToken);
-    resetToken = ok.body.resetToken;
-
-    const reuse = await http('POST', '/api/v1/auth/verify-otp', { body: { phone: PHONES.usta, otp } });
-    assert.equal(reuse.status, 400, 'consumed OTP must not verify again');
-
-    const newPassword = 'Yangi-parol-456';
-    const reset = await http('POST', '/api/v1/auth/reset-password', {
-      body: { resetToken, password: newPassword },
-    });
-    assert.equal(reset.status, 200);
-
-    const tokenReuse = await http('POST', '/api/v1/auth/reset-password', {
-      body: { resetToken, password: 'Yana-boshqa-789' },
-    });
-    assert.equal(tokenReuse.status, 400, 'reset token must be single-use');
-
-    const meAfter = await http('GET', '/api/v1/auth/me', { cookie: ustaCookie });
-    assert.equal(meAfter.status, 401, 'existing sessions must be revoked after password reset');
-
-    const oldLogin = await http('POST', '/api/v1/auth/login', {
-      body: { phone: PHONES.usta, password: PASSWORD, rememberMe: false },
-    });
-    assert.equal(oldLogin.status, 401, 'old password must no longer work');
-
-    const newLogin = await http('POST', '/api/v1/auth/login', {
-      body: { phone: PHONES.usta, password: newPassword, rememberMe: false },
-    });
-    assert.equal(newLogin.status, 200, 'new password must work');
-    ustaCookie = sessionCookie(newLogin);
-  });
-
-  // 14. OTP rate limiting + attempt limiting
-  await test('forgot-password is rate-limited per phone (3 per 15 min)', async () => {
-    for (let i = 0; i < 3; i += 1) {
-      const res = await http('POST', '/api/v1/auth/forgot-password', { body: { phone: PHONES.rateLimit } });
-      assert.equal(res.status, 200, `request ${i + 1} should pass`);
-    }
-    const fourth = await http('POST', '/api/v1/auth/forgot-password', { body: { phone: PHONES.rateLimit } });
-    assert.equal(fourth.status, 429);
-  });
-
-  await test('OTP verification attempts are limited per code', async () => {
-    const forgot = await http('POST', '/api/v1/auth/forgot-password', { body: { phone: PHONES.usta2 } });
-    assert.equal(forgot.status, 200);
-    const otp = await lastOtpFor(PHONES.usta2);
-
-    for (let i = 0; i < 5; i += 1) {
-      const res = await http('POST', '/api/v1/auth/verify-otp', {
-        body: { phone: PHONES.usta2, otp: '111111' === otp ? '222222' : '111111' },
-      });
-      assert.equal(res.status, 400, `wrong attempt ${i + 1} should be 400`);
-    }
-    const exceeded = await http('POST', '/api/v1/auth/verify-otp', { body: { phone: PHONES.usta2, otp } });
-    assert.equal(exceeded.status, 429, 'correct OTP after attempt limit must be refused');
-  });
+  // NOTE: SMS/OTP self-service password recovery has been removed. The manual
+  // admin recovery flow (issue temporary password → forced first-login change)
+  // and the removal of the OTP endpoints are covered in
+  // tests/manual-recovery.e2e.ts.
 
   // 15. Protected endpoint without authentication
   await test('protected endpoints require authentication', async () => {
@@ -503,7 +382,7 @@ async function run(): Promise<void> {
       .whereIn('users.phone', Object.values(PHONES))
       .distinct('audit_logs.action')
       .pluck('audit_logs.action');
-    for (const expected of ['LOGIN', 'LOGIN_FAILED', 'LOGOUT', 'PASSWORD_RESET_REQUESTED', 'PASSWORD_RESET', 'USER_APPROVED', 'USER_REJECTED']) {
+    for (const expected of ['LOGIN', 'LOGIN_FAILED', 'LOGOUT', 'USER_APPROVED', 'USER_REJECTED']) {
       assert.ok(actions.includes(expected), `missing audit action ${expected}`);
     }
   });

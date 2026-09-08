@@ -12,3 +12,23 @@
 # bad-credentials / 429 fail-closed against a synthetic, non-existent phone. It is
 # not a real credential, is committed nowhere but tests, and authenticates nothing.
 e16e8c953a0f08368e2c73aa17e799164c1375ec:tests/redis-integration.e2e.ts:generic-api-key:214
+
+# FALSE POSITIVES (rule: generic-api-key) — tests/manual-recovery.e2e.ts fixtures.
+# Every one is a TEST-ONLY literal in the manual employee password-recovery suite;
+# none is a real credential, none authenticates anything outside the isolated
+# *_test DB, and each is pinned to its exact historical commit + line (not the file,
+# directory, or rule). Verified individually:
+#   :50   const PASSWORD — the suite's fixed test-login password (created by the suite).
+#   :321,:326,:443,:450,:465  literal `newPassword` values in the change-password /
+#         CSRF / rate-limit tests — throwaway new passwords the tests set and discard.
+#   :523  a synthetic APP_KEY literal passed ONLY to the pure validateProductionConfig()
+#         in a unit assertion — it signs/encrypts nothing and is never used as a key.
+#   c74ad00:424  the `newPassword` literal in the concurrent reset-vs-change test.
+e43dd4686082a6ca410749d8b3814441157f4492:tests/manual-recovery.e2e.ts:generic-api-key:50
+e43dd4686082a6ca410749d8b3814441157f4492:tests/manual-recovery.e2e.ts:generic-api-key:321
+e43dd4686082a6ca410749d8b3814441157f4492:tests/manual-recovery.e2e.ts:generic-api-key:326
+e43dd4686082a6ca410749d8b3814441157f4492:tests/manual-recovery.e2e.ts:generic-api-key:443
+e43dd4686082a6ca410749d8b3814441157f4492:tests/manual-recovery.e2e.ts:generic-api-key:450
+e43dd4686082a6ca410749d8b3814441157f4492:tests/manual-recovery.e2e.ts:generic-api-key:465
+e43dd4686082a6ca410749d8b3814441157f4492:tests/manual-recovery.e2e.ts:generic-api-key:523
+c74ad004797e5dd19be2ff57e8042e9b4923af53:tests/manual-recovery.e2e.ts:generic-api-key:424

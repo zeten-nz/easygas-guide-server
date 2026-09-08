@@ -34,22 +34,14 @@ export const registerSchema = z.object({
   password: passwordSchema,
 });
 
-export const forgotPasswordSchema = z.object({
-  phone: phoneSchema,
-});
-
-export const verifyOtpSchema = z.object({
-  phone: phoneSchema,
-  otp: z.string().regex(/^\d{6}$/, "Kod 6 ta raqamdan iborat bo'lishi kerak"),
-});
-
-export const resetPasswordSchema = z.object({
-  resetToken: z.string().regex(/^[0-9a-f]{64}$/, "Token noto'g'ri"),
-  password: passwordSchema,
+/** §D — authenticated self password change (first-login and voluntary). The new
+ *  password uses the standard policy; the service additionally rejects reuse of
+ *  the current/temporary password. */
+export const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1, 'Joriy parol kiritilishi shart').max(128),
+  newPassword: passwordSchema,
 });
 
 export type LoginInput = z.infer<typeof loginSchema>;
 export type RegisterInput = z.infer<typeof registerSchema>;
-export type ForgotPasswordInput = z.infer<typeof forgotPasswordSchema>;
-export type VerifyOtpInput = z.infer<typeof verifyOtpSchema>;
-export type ResetPasswordInput = z.infer<typeof resetPasswordSchema>;
+export type ChangePasswordInput = z.infer<typeof changePasswordSchema>;
