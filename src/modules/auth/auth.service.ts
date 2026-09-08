@@ -3,7 +3,7 @@ import { db } from '../../config/database';
 import { env } from '../../config/env';
 import { ApiError } from '../../utils/errors';
 import { logAudit } from '../audit/audit.service';
-import { createSession, revokeByToken } from './session.service';
+import { createSession, revokeByToken, type CreatedSession } from './session.service';
 import { toAuthUser, type UserWithRole } from '../users/user.mapper';
 import type { AuthUser, UserRow } from '../../types/auth';
 import type { LoginInput, RegisterInput } from './auth.validators';
@@ -59,86 +59,88 @@ export async function login(input: LoginInput, meta: RequestMeta): Promise<Login
     throw ApiError.unauthorized(GENERIC_LOGIN_ERROR, 'INVALID_CREDENTIALS');
   }
 
-  const passwordOk = await bcrypt.compare(input.password, user.password_hash);
-  if (!passwordOk) {
-    await logAudit({
-      userId: user.id,
-      action: 'LOGIN_FAILED',
-      entityType: 'user',
-      entityId: user.id,
-      ...meta,
-    });
-    throw ApiError.unauthorized(GENERIC_LOGIN_ERROR, 'INVALID_CREDENTIALS');
-  }
+  // The authoritative credential check AND the session insert run as ONE atomic,
+  // row-locked unit — closing the analogous credential-check → session-insert gap
+  // (a concurrent admin reset/block could otherwise run its revoke-all BETWEEN a
+  // pre-lock password check and a post-check session insert, leaving the fresh
+  // session alive). The password is verified against the LOCKED hash, so a reset
+  // that committed first makes the now-stale password fail here. On success the
+  // session is committed with the login; a reset that lands after locks the same
+  // row and its revoke-all catches this session. Lock order (user row → sessions →
+  // audit chain) matches admin reset + change-password, so no deadlock is possible.
+  type Outcome =
+    | { kind: 'ok'; created: CreatedSession; mustChangePassword: boolean }
+    | { kind: 'invalid' }
+    | { kind: 'temp_expired' };
 
-  if (user.status !== 'ACTIVE') {
+  const outcome = await db.transaction(async (trx): Promise<Outcome> => {
+    const row = (await trx('users').where({ id: user.id }).whereNull('deleted_at').forUpdate().first()) as
+      | UserRow
+      | undefined;
+    if (!row) return { kind: 'invalid' };
+
+    const auditFail = (newValue?: Record<string, unknown>): Promise<unknown> =>
+      logAudit(
+        { userId: user.id, action: 'LOGIN_FAILED', entityType: 'user', entityId: user.id, ...(newValue ? { newValue } : {}), ...meta },
+        trx,
+      );
+
+    if (!(await bcrypt.compare(input.password, row.password_hash))) {
+      await auditFail();
+      return { kind: 'invalid' };
+    }
     // Blocked/inactive accounts get the same generic failure as bad credentials,
-    // so a blocked user cannot confirm their password is still valid.
-    // The audit trail keeps the real reason.
-    await logAudit({
-      userId: user.id,
-      action: 'LOGIN_FAILED',
-      entityType: 'user',
-      entityId: user.id,
-      newValue: { reason: 'ACCOUNT_INACTIVE' },
-      ...meta,
-    });
+    // so a blocked user cannot confirm their password is still valid. The audit
+    // trail keeps the real reason.
+    if (row.status !== 'ACTIVE') {
+      await auditFail({ reason: 'ACCOUNT_INACTIVE' });
+      return { kind: 'invalid' };
+    }
+    // Phase 10A branch policy: a deactivated branch means no new sessions for its
+    // users. (Branch status comes from the pre-lock join; branch deactivation is a
+    // separate flow that revokes sessions and is re-checked live by requireAuth.)
+    if (user.branch_id !== null && user.branch_status !== 'ACTIVE') {
+      await auditFail({ reason: 'BRANCH_INACTIVE', branchId: user.branch_id });
+      return { kind: 'invalid' };
+    }
+    // §D — an EXPIRED temporary password is no longer a usable credential (checked
+    // on the LOCKED row). Only fires after a correct password + ACTIVE status, so
+    // it is the legitimate employee being told to obtain a fresh temporary password.
+    if (
+      row.must_change_password &&
+      row.temp_password_expires_at &&
+      new Date(row.temp_password_expires_at).getTime() <= Date.now()
+    ) {
+      await auditFail({ reason: 'TEMP_PASSWORD_EXPIRED' });
+      return { kind: 'temp_expired' };
+    }
+
+    // Phase 10C: creates a session FAMILY with absolute/idle caps, INSIDE this
+    // transaction so it commits atomically with the credential check.
+    const created = await createSession(user.id, input.rememberMe, meta, trx);
+    await trx('users').where({ id: user.id }).update({ last_login_at: trx.fn.now() });
+    await logAudit({ userId: user.id, action: 'LOGIN', entityType: 'user', entityId: user.id, ...meta }, trx);
+    return { kind: 'ok', created, mustChangePassword: Boolean(row.must_change_password) };
+  });
+
+  if (outcome.kind === 'invalid') {
     throw ApiError.unauthorized(GENERIC_LOGIN_ERROR, 'INVALID_CREDENTIALS');
   }
-
-  // Phase 10A branch policy: a deactivated branch means no new sessions for
-  // its users — same generic failure as above, real reason in the audit only.
-  if (user.branch_id !== null && user.branch_status !== 'ACTIVE') {
-    await logAudit({
-      userId: user.id,
-      action: 'LOGIN_FAILED',
-      entityType: 'user',
-      entityId: user.id,
-      newValue: { reason: 'BRANCH_INACTIVE', branchId: user.branch_id },
-      ...meta,
-    });
-    throw ApiError.unauthorized(GENERIC_LOGIN_ERROR, 'INVALID_CREDENTIALS');
-  }
-
-  // §D — an EXPIRED temporary password is no longer a usable credential. This
-  // only fires after a correct password + ACTIVE status, so it is the legitimate
-  // employee being told to obtain a fresh temporary password from an admin; no
-  // session is minted. (A non-expired temporary password logs in normally and is
-  // then confined by the first-login gate until it is changed.)
-  if (
-    user.must_change_password &&
-    user.temp_password_expires_at &&
-    new Date(user.temp_password_expires_at).getTime() <= Date.now()
-  ) {
-    await logAudit({
-      userId: user.id,
-      action: 'LOGIN_FAILED',
-      entityType: 'user',
-      entityId: user.id,
-      newValue: { reason: 'TEMP_PASSWORD_EXPIRED' },
-      ...meta,
-    });
+  if (outcome.kind === 'temp_expired') {
     throw ApiError.unauthorized(
       "Vaqtinchalik parol muddati tugagan. Administratordan yangi parol so'rang.",
       'TEMP_PASSWORD_EXPIRED',
     );
   }
 
-  // Phase 10C: creates a session FAMILY with absolute/idle caps; the token
-  // rotates on later requests. The cookie's absolute expiry is returned for the
-  // Set-Cookie maxAge.
-  const created = await createSession(user.id, input.rememberMe, meta);
-
-  await db('users').where({ id: user.id }).update({ last_login_at: db.fn.now() });
-
-  await logAudit({ userId: user.id, action: 'LOGIN', entityType: 'user', entityId: user.id, ...meta });
-
   return {
-    user: toAuthUser(user),
-    token: created.token,
-    expiresAt: created.absoluteExpiresAt,
+    // Reflect the authoritative must_change_password from the locked row (a reset
+    // could have set it just before this login matched the new temp password).
+    user: toAuthUser({ ...user, must_change_password: outcome.mustChangePassword }),
+    token: outcome.created.token,
+    expiresAt: outcome.created.absoluteExpiresAt,
     rememberMe: input.rememberMe,
-    rotationSeq: created.rotationSeq,
+    rotationSeq: outcome.created.rotationSeq,
   };
 }
 
@@ -255,7 +257,7 @@ export async function changePassword(
   // the ~250ms bcrypt hash.
   const passwordHash = await bcrypt.hash(newPassword, env.BCRYPT_ROUNDS);
 
-  await db.transaction(async (trx) => {
+  const created = await db.transaction(async (trx) => {
     const row = (await trx('users').where({ id: actor.id }).whereNull('deleted_at').forUpdate().first()) as
       | UserRow
       | undefined;
@@ -295,19 +297,24 @@ export async function changePassword(
       temp_password_expires_at: null,
       updated_at: trx.fn.now(),
     });
-    // Kill every existing session/family — including the one that made THIS
-    // request. A fresh family is minted below so the response stays authenticated.
+    // Credential update, revoke-all, AND the replacement session are ONE atomic
+    // unit under the user-row lock. Kill every existing session/family (including
+    // the one that made THIS request) and mint the fresh family INSIDE the same
+    // transaction: an admin reset that lands after this commit is strictly
+    // serialized (it locks the same row), so its own revoke-all catches this
+    // just-created session — a stale/replacement session can never outlive an
+    // intervening reset. The cookie is issued only after this commit (controller).
     await trx('sessions').where({ user_id: actor.id }).whereNull('revoked_at').update({ revoked_at: trx.fn.now() });
+    // audit last — consistent lock order (user row → sessions → audit chain).
     await logAudit(
       { userId: actor.id, action: 'PASSWORD_CHANGED', entityType: 'user', entityId: actor.id, ...meta },
       trx,
     );
+    // Non-persistent by design — a fresh explicit login re-establishes "remember
+    // me" if wanted. CSRF is derived from the token by the controller.
+    return createSession(actor.id, false, meta, trx);
   });
 
-  // Rotate to a brand-new session family (+ CSRF, derived from the token by the
-  // controller). Non-persistent by design — a fresh explicit login re-establishes
-  // "remember me" if wanted.
-  const created = await createSession(actor.id, false, meta);
   const fresh = await findUserById(actor.id);
   return {
     user: toAuthUser(fresh!),

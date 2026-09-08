@@ -46,8 +46,13 @@ const PHONES = {
   ustaB: '+998990070004',
   blocked: '+998990070005',
   rlUser: '+998990070006',
+  loginRaceUser: '+998990070007',
 };
 const PASSWORD = 'Sinov-parol-123';
+// New-password fixture for the change-path race regressions. DERIVED from PASSWORD
+// (not a fresh literal) so no additional secret-scan fixture is introduced; it
+// still differs from any temporary password and satisfies the length policy.
+const CHANGED_PW = `${PASSWORD}-Yangi`;
 
 let baseUrl = '';
 
@@ -159,6 +164,7 @@ async function createFixtures(): Promise<void> {
   ids.ustaB = await insert({ first_name: 'Mr', last_name: 'UstaB', phone: PHONES.ustaB, branch_id: branch.id, role_id: roleId('USTA'), status: 'ACTIVE' });
   ids.blocked = await insert({ first_name: 'Mr', last_name: 'Blocked', phone: PHONES.blocked, branch_id: branch.id, role_id: roleId('USTA'), status: 'BLOCKED' });
   ids.rlUser = await insert({ first_name: 'Mr', last_name: 'RateLimit', phone: PHONES.rlUser, branch_id: branch.id, role_id: roleId('USTA'), status: 'ACTIVE' });
+  ids.loginRaceUser = await insert({ first_name: 'Mr', last_name: 'LoginRace', phone: PHONES.loginRaceUser, branch_id: branch.id, role_id: roleId('USTA'), status: 'ACTIVE' });
 }
 
 /** Admin issues a temporary password for `targetId`. Returns the raw HttpResult. */
@@ -445,13 +451,71 @@ async function run(): Promise<void> {
     assert.equal((await login(PHONES.ustaB, newPassword)).status, 401, 'the changed password never became usable');
     assert.equal((await login(PHONES.ustaB, temp2)).status, 200, 'the latest temporary password is the valid credential');
 
-    // If the change returned 200, its session must NOT retain unrestricted access:
-    // the reset revoked all sessions, and even a survivor is re-gated by must_change.
+    // A 200 change means it won the row lock first, so the admin reset committed
+    // AFTER it. Because the replacement session is created INSIDE the change's
+    // transaction (not after commit), the reset's revoke-all caught it: the change's
+    // returned cookie must be fully dead (401), not merely gated by must_change.
     if (changeRes.status === 200) {
       const changed = sessionCookie(changeRes);
-      const biz = await http('GET', '/api/v1/customers', { cookie: changed });
-      assert.notEqual(biz.status, 200, 'a change that raced a reset must not keep unrestricted access');
+      assert.equal(
+        (await http('GET', '/api/v1/auth/me', { cookie: changed })).status,
+        401,
+        'a change that raced (and preceded) a reset must leave no authenticating session',
+      );
     }
+  });
+
+  await test('change-password: the returned cookie cannot authenticate after an intervening admin reset', async () => {
+    // Deterministic end-state proof of the atomic session issuance: a temp session
+    // → change (returns a fresh cookie) → a later admin reset must kill that cookie.
+    const admin = await login(PHONES.admin);
+    const adminCookie = sessionCookie(admin);
+    const r1 = await adminReset(adminCookie, ids.ustaB);
+    const temp1 = r1.body.temporaryPassword;
+    const tempLogin = await login(PHONES.ustaB, temp1);
+    assert.equal(tempLogin.status, 200);
+
+    const change = await http('POST', '/api/v1/auth/change-password', {
+      cookie: sessionCookie(tempLogin),
+      body: { currentPassword: temp1, newPassword: CHANGED_PW },
+    });
+    assert.equal(change.status, 200);
+    const changedCookie = sessionCookie(change);
+    // The fresh session is issued only after commit and works immediately.
+    assert.equal((await http('GET', '/api/v1/auth/me', { cookie: changedCookie })).status, 200);
+
+    // A subsequent admin reset revokes every session — including the one the change
+    // committed inside its transaction. The change's returned cookie is now dead.
+    await adminReset(adminCookie, ids.ustaB);
+    assert.equal(
+      (await http('GET', '/api/v1/auth/me', { cookie: changedCookie })).status,
+      401,
+      "the change's returned cookie must not authenticate after an intervening reset",
+    );
+  });
+
+  await test('login racing an admin reset leaves no session that authenticates after the reset', async () => {
+    // The analogous login credential-check → session-insert gap: a login and an
+    // admin reset run concurrently on a dedicated user. Whichever ordering wins, no
+    // login-minted session may survive the reset's revoke-all.
+    const admin = await login(PHONES.admin);
+    const adminCookie = sessionCookie(admin);
+    const [loginRes, resetRes] = await Promise.all([
+      login(PHONES.loginRaceUser, PASSWORD),
+      adminReset(adminCookie, ids.loginRaceUser),
+    ]);
+    assert.equal(resetRes.status, 200, 'the reset always succeeds');
+    if (loginRes.status === 200) {
+      const cookie = sessionCookie(loginRes);
+      assert.equal(
+        (await http('GET', '/api/v1/auth/me', { cookie })).status,
+        401,
+        'a login that raced a reset must not leave an authenticating session',
+      );
+    }
+    // Post-conditions hold regardless of interleaving: old password dead, temp valid.
+    assert.equal((await login(PHONES.loginRaceUser, PASSWORD)).status, 401, 'old password invalid after the reset');
+    assert.equal((await login(PHONES.loginRaceUser, resetRes.body.temporaryPassword)).status, 200, 'the temp password is valid');
   });
 
   // --------------------------- Blocked users -------------------------------
