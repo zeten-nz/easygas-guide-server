@@ -40,6 +40,19 @@ checklistTemplatesRouter.get(
   },
 );
 
+// §D permanently delete an UNUSED, DRAFT-only template. Eligibility is re-checked
+// under a row lock in the service (a stable conflict, never a raw FK error, when
+// the template has published/archived history or is referenced by a job).
+checklistTemplatesRouter.delete(
+  '/:id',
+  requirePermission('templates.manage'),
+  validate({ params: templateIdParamsSchema }),
+  async (req: Request, res: Response) => {
+    const deleted = await service.deleteTemplate(req.user!, Number(req.params.id), requestMeta(req));
+    res.json({ deleted, message: `"${deleted.name}" shabloni o'chirildi` });
+  },
+);
+
 checklistTemplatesRouter.post(
   '/',
   requirePermission('templates.manage'),

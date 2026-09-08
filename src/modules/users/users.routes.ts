@@ -29,6 +29,13 @@ usersRouter.get(
   },
 );
 
+// §C own profile — self-scoped, so it needs no users.view (every employee may view
+// their OWN profile). Declared BEFORE '/:id' so 'me' is not captured as an id.
+usersRouter.get('/me', async (req: Request, res: Response) => {
+  const user = await service.getOwnProfile(req.user!);
+  res.json({ user });
+});
+
 usersRouter.get(
   '/:id',
   requirePermission('users.view'),

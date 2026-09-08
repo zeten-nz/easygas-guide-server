@@ -273,8 +273,9 @@ export const openapiSpec = {
       get: {
         tags: ['Users'],
         operationId: 'usersList',
-        summary: 'List users',
-        description: 'Requires permission: users.view. Branch-scoped for non-admin roles.',
+        summary: 'List users (employee directory)',
+        description:
+          'Requires permission: users.view. Branch-scoped for non-admin roles. The CURRENT viewer is excluded from their own directory (before COUNT and pagination), so the total and pages never include the caller — every other user (including other administrators) is listed. Deterministic order (created_at desc, id desc). Use GET /users/me for the caller\'s own profile.',
         parameters: [
           { $ref: '#/components/parameters/SearchQuery' },
           { name: 'role', in: 'query', schema: { $ref: '#/components/schemas/RoleCode' } },
@@ -330,13 +331,26 @@ export const openapiSpec = {
         },
       },
     },
+    '/users/me': {
+      get: {
+        tags: ['Users'],
+        operationId: 'usersGetOwnProfile',
+        summary: 'Get own profile',
+        description:
+          'Authenticated only — self-scoped, so NO users.view permission is required (every employee may view their own profile). Returns the caller\'s own UserDetail (branch name, status, created/last-login). It never accepts a target id and cannot read another account.',
+        responses: {
+          '200': { description: 'Own profile.', content: { 'application/json': { schema: { $ref: '#/components/schemas/UserDetail' } } } },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+        },
+      },
+    },
     '/users/{id}': {
       parameters: [{ $ref: '#/components/parameters/IdPath' }],
       get: {
         tags: ['Users'],
         operationId: 'usersGet',
         summary: 'Get user',
-        description: 'Requires permission: users.view.',
+        description: 'Requires permission: users.view. Out-of-scope / nonexistent ids return 404 (never 403) so ids cannot be probed across branch boundaries.',
         responses: {
           '200': {
             description: 'User detail.',
@@ -2077,12 +2091,40 @@ export const openapiSpec = {
         tags: ['Templates'],
         operationId: 'templatesGet',
         summary: 'Get template',
-        description: 'Requires permission: templates.manage.',
+        description: 'Requires permission: templates.manage. The response carries an advisory `deletable` flag + `deletableReason`.',
         responses: {
           '200': { description: 'Template detail.', content: { 'application/json': { schema: { $ref: '#/components/schemas/ChecklistTemplate' } } } },
           '401': { $ref: '#/components/responses/Unauthorized' },
           '403': { $ref: '#/components/responses/Forbidden' },
           '404': { $ref: '#/components/responses/NotFound' },
+        },
+      },
+      delete: {
+        tags: ['Templates'],
+        operationId: 'templatesDelete',
+        summary: 'Permanently delete an unused draft-only template',
+        description:
+          'Requires permission: templates.manage. Permanently deletes a template ONLY when every version is still DRAFT and no job references it — eligibility is re-checked under a row lock. A template with a published/archived version (409 TEMPLATE_HAS_HISTORY) must be archived instead; one referenced by a job returns 409 TEMPLATE_IN_USE. History and audit integrity are never weakened to permit deletion.',
+        parameters: [{ $ref: '#/components/parameters/CsrfTokenHeader' }],
+        responses: {
+          '200': {
+            description: 'Template deleted.',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    deleted: { type: 'object', properties: { id: { type: 'integer' }, name: { type: 'string' } } },
+                    message: { type: 'string' },
+                  },
+                },
+              },
+            },
+          },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+          '409': { $ref: '#/components/responses/Conflict' },
         },
       },
     },
@@ -2760,12 +2802,21 @@ export const openapiSpec = {
       },
       ChecklistTemplate: {
         type: 'object',
-        required: ['id', 'name', 'versions'],
+        required: ['id', 'name', 'versions', 'deletable'],
         properties: {
           id: { type: 'integer' },
           name: { type: 'string' },
           description: { type: ['string', 'null'] },
           versions: { type: 'array', items: { $ref: '#/components/schemas/TemplateVersion' } },
+          deletable: {
+            type: 'boolean',
+            description: 'Advisory: true only when every version is DRAFT (never published). Re-checked on DELETE.',
+          },
+          deletableReason: {
+            type: ['string', 'null'],
+            enum: ['HAS_PUBLISHED_OR_ARCHIVED_HISTORY', null],
+            description: 'Why the template is not permanently deletable (null when deletable).',
+          },
         },
       },
 

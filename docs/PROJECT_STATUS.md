@@ -3,13 +3,95 @@
 > This is the **canonical, git-tracked** project status. The copy at the repo-root
 > (`../../PROJECT_STATUS.md`, outside both git repos) is now **non-authoritative**.
 
-**Current phase:** Manual employee password recovery (product decision: EasyGas Guide is
-employee-only; SMS/OTP self-service recovery removed, Eskiz integration retired from the recovery
-path) — **implemented + tested** on branch `phase/manual-employee-recovery` in both repos.
-Built on Phase 10F. **Not pushed / not merged / not deployed** — awaiting review.
+**Current phase:** Phase 11A — Admin Workspace, Employee Profiles, Pagination UX & Safe Template
+Management — **implemented + tested** on branch `phase/11A-admin-workspace` in both repos (branched
+from `origin/main` after manual employee password recovery merged — server PR #7 / client PR #8).
+**Not pushed / not merged / not deployed** — awaiting review. (Manual recovery is now **merged to
+main** in both repos; its section below is retained as prior-work reference.)
 
 **Repos:** two separate git repositories — `server/` and `client/`. Project-root files (like the old
 `PROJECT_STATUS.md`) live **outside** both repos.
+
+---
+
+## Phase 11A — Admin Workspace, Employee Profiles, Pagination & Safe Template Deletion
+
+Full detail: `PHASE-11A.md`. Base SHAs: server `origin/main` = `fe493f9`, client `origin/main` =
+`c7b1997`.
+
+### Employee directory (§B) — IMPLEMENTED + TESTED
+- `GET /users` now **excludes the current viewer** from their own directory (a `whereNot(id, actor.id)`
+  applied to the SHARED builder, so it is removed BEFORE COUNT and pagination — the total/pages never
+  include the caller). Only the caller is hidden; every other user, **including other administrators**,
+  is listed. Scoped to the directory read only (the assignment-candidate query is untouched).
+- Deterministic order with an **id tie-breaker** (`created_at desc, id desc`) so equal timestamps never
+  reshuffle across pages. Bounded limit unchanged (Zod `min 1, max 100, default 25`; the UI offers 25/50).
+- Client: a shared `Pagination` (persistent summary "Jami N xodim · a–b ko'rsatilmoqda", page-size 25/50,
+  prev/next), URL-synced page/size/filters (`useTableParams` → first `useSearchParams` usage) so the view
+  survives reload and browser Back/Forward, page resets on filter/size change, and an empty current page
+  recovers to the last valid page. A compact table (desktop) / cards (mobile); the name links to the
+  profile, row actions live in an accessible menu (no full-row click). The same pagination is used on Jobs.
+
+### Own & employee profiles (§C) — IMPLEMENTED + TESTED
+- New self-scoped `GET /users/me` (auth only, **no `users.view`**) returns the caller's own `UserDetail`;
+  it never accepts a target id. Client `/app/profile` ("Mening profilim", opened from the account menu):
+  read-only identity (truthful no-branch state), and a clear path to the **existing** change-password
+  workflow — `/change-password` now serves both the forced first-login change and a voluntary change
+  (same server endpoint; all-session revocation + fresh session/CSRF preserved). Identity fields are not
+  self-editable and no new self-edit permission/password API was added.
+- Employee profile `GET /users/:id` (existing) exposed at client `/app/admin/users/:id` — authorization is
+  **server-enforced**: out-of-scope / nonexistent ids → **404 (never 403)**; roles without `users.view` →
+  403; the forced-change gate blocks these endpoints. Management actions (edit / block-unblock / one-time
+  temporary-password reset) reuse the existing secure modals. Loading / error / not-found / forbidden
+  states are all handled.
+
+### Safe template deletion (§D) — IMPLEMENTED + TESTED
+- New `DELETE /checklist-templates/:id` (`templates.manage`) permanently deletes a template **only** when
+  every version is still DRAFT (never published → never assigned) and no job references it. Eligibility is
+  re-checked **inside a transaction** under a consistent lock order (template row → all version rows FOR
+  UPDATE → audit last) so a check-then-delete race with a concurrent publish/createVersion is impossible: a
+  publish that lands first is seen as history and the delete is refused; one that blocks then 404s on the
+  deleted version. A published/archived template → **409 `TEMPLATE_HAS_HISTORY`** (archive instead); a
+  referenced one → **409 `TEMPLATE_IN_USE`** (defensive; the RESTRICT FKs are the last-line backstop, never
+  weakened). Children are deleted child→parent (steps [measurements cascade] → versions → template). A
+  `TEMPLATE_DELETED` audit records the name + version count only (no step internals). `listTemplates`/
+  `getTemplate` now return an advisory `deletable` + `deletableReason`. The existing version publish/archive
+  lifecycle is unchanged (no whole-template archive state added). Client: status labels
+  **Qoralama / Faol / Arxivlangan**, a status filter, per-template delete with a confirmation naming the
+  template + a permanent-vs-archive explanation, a shown reason when deletion is unavailable, and an honest
+  refetch on success **or** conflict (never an optimistic success).
+
+### Shell redesign (§A) — IMPLEMENTED
+- The horizontal-scroll top nav is replaced by a **grouped left sidebar** (Ish / Xodimlar / Amaliyot /
+  Xavfsizlik) + a compact top bar (page context + account menu) + an accessible **mobile drawer**
+  (Escape/backdrop close, ≥44px targets). Brand **blue** is the primary action colour, brand **red** is
+  reserved for destructive (the global `Button` `primary` moved to blue + a solid `danger` variant added —
+  a consolidation, not a parallel system). The admin home is concise task-oriented cards (no hero, no
+  invented analytics). Existing route URLs are unchanged and every page renders inside the new shell.
+
+### Verification (LOCAL only — no GitHub Actions run for this branch)
+- **Server:** new `test:admin-workspace` (13 cases — directory exclusion/pagination determinism/bounded
+  limits/filters, own-profile without `users.view`, profile authz 404-vs-403 + forced-change gate, template
+  delete success/authz/history-block/concurrency, audit redaction). Full `test:all` — see the run summary
+  in the checkpoint. Typecheck + build + OpenAPI check clean; OpenAPI artifact regenerated (89 ops / 72
+  paths). No migration required (behavioural change only; no schema change).
+- **Client:** 58 unit/component tests (14 new — Pagination, Sidebar authorization, ProfilePage states,
+  DeleteTemplateDialog conflict feedback, directory link/pagination). Lint + `tsc -b` + `tsc -p
+  tsconfig.test.json` + production build clean. New browser E2E `e2e/admin-workspace.spec.ts` (directory
+  pagination with 55 synthetic employees + a second admin, profile + Back, own-profile → change-password,
+  create+delete a draft template, published-template-cannot-delete, mobile drawer + no overflow at
+  360/768/1366/1920) executed on system Edge (chromium) — see the checkpoint for the executed result.
+- **Out of scope (documented as later phases):** price/service catalogue, reference-data CRUD, injection
+  modelling, risk-matrix redesign, photo-gallery workflows, Telegram/SMS, inventory/payments/notifications/
+  offline/5-WHY.
+
+### Cross-repo compatibility & merge order
+Contracts: **added** `GET /users/me` + `DELETE /checklist-templates/:id`; `GET /users` now excludes the
+caller; `ChecklistTemplate` gained additive `deletable`/`deletableReason`. The client needs the new server
+endpoints, so **merge the server PR first**, then the client PR (its `e2e-fullstack` gate goes green against
+the updated server `main`). To validate before merging, dispatch the client `e2e-fullstack` with
+`server_ref=phase/11A-admin-workspace` (and the server mirror with `client_ref=phase/11A-admin-workspace`)
+— both must be green first. Do not merge the client PR against a server `main` lacking the endpoints.
 
 ---
 
