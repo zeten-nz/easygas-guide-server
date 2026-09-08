@@ -16,11 +16,30 @@ import type { Knex } from 'knex';
  *   - it is idempotent — re-running matches nothing the second time;
  *   - it does not drop tables or rewrite merged migrations.
  *
- * With SMS disabled the worker does not run (see server.ts) and no new recovery
- * SMS is ever enqueued (the OTP endpoints are gone), so cancelled rows stay
- * cancelled. `down` is intentionally a no-op: un-cancelling messages to make them
- * deliverable again would be unsafe, and the original queued/processing state
- * cannot be reconstructed.
+ * DEPLOY SEQUENCING (operator — see docs/PRODUCTION-RUNTIME-10C.md):
+ *   1. Deploy the new build with SMS disabled (SMS_PROVIDER unset). The API no
+ *      longer calls startWorker(), and even if invoked the worker fails closed
+ *      (startWorker + runOnce both refuse when the provider is not `ready`).
+ *   2. STOP AND DRAIN the previous dedicated worker (`easygas-sms-worker`) BEFORE
+ *      running this migration: `pm2 stop easygas-sms-worker` triggers the app's
+ *      graceful stop, which awaits the in-flight batch (stopWorker()), so no row
+ *      is mid-send when the migration runs. Reload/replace it with the new build.
+ *   3. THEN run this migration. Because the worker is drained, there are no live
+ *      PROCESSING rows; any PROCESSING row that remains is a CRASHED worker's stale
+ *      lease (its provider outcome is unknown/AMBIGUOUS) — cancelling it prevents a
+ *      duplicate re-send and is the correct choice while retiring recovery SMS.
+ *
+ * ALREADY-IN-FLIGHT SENDS: a DB migration CANNOT retract a message a worker has
+ * already handed to the SMS provider — marking such a row CANCELLED only records
+ * that we will not retry it, not that the provider un-sent it. The drain in step 2
+ * is what guarantees nothing is in flight when this runs; there is no way to recall
+ * an OTP already accepted by the gateway, and this migration does not pretend to.
+ *
+ * With SMS disabled the worker does not run and no new recovery SMS is ever
+ * enqueued (the OTP endpoints are gone), so cancelled rows stay cancelled. `down`
+ * is intentionally a NO-OP: it does NOT resurrect cancelled OTPs (un-cancelling
+ * them would be unsafe, and the original queued/processing state cannot be
+ * reconstructed) — a rollback leaves history intact and the messages retired.
  */
 const NON_TERMINAL = ['PENDING', 'RETRY', 'PROCESSING'];
 

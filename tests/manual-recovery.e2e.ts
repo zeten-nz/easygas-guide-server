@@ -410,6 +410,50 @@ async function run(): Promise<void> {
     assert.equal(Number(ok1) + Number(ok2), 1, 'exactly one temporary password is valid after concurrent resets');
   });
 
+  await test('concurrent admin reset vs self change: no lost update, no unrestricted session on stale credentials', async () => {
+    const admin = await login(PHONES.admin);
+    const adminCookie = sessionCookie(admin);
+
+    // Issue temp1 and open a temp-password session for the employee.
+    const first = await adminReset(adminCookie, ids.ustaB);
+    const temp1 = first.body.temporaryPassword;
+    const empLogin = await login(PHONES.ustaB, temp1);
+    assert.equal(empLogin.status, 200);
+    const empCookie = sessionCookie(empLogin);
+
+    const newPassword = 'Yangi-Parol-RACE-1';
+    // Fire a SECOND admin reset and the employee's change CONCURRENTLY. Both lock
+    // the same user row FOR UPDATE, so they serialize into one of two safe outcomes:
+    //   (A) the change commits first, then the reset re-restricts on top of it; or
+    //   (B) the reset commits first, then the change's now-stale temp fails to verify.
+    const [resetRes, changeRes] = await Promise.all([
+      adminReset(adminCookie, ids.ustaB),
+      http('POST', '/api/v1/auth/change-password', { cookie: empCookie, body: { currentPassword: temp1, newPassword } }),
+    ]);
+    assert.equal(resetRes.status, 200, 'the admin reset always succeeds');
+    const temp2 = resetRes.body.temporaryPassword;
+    assert.ok(
+      [200, 400].includes(changeRes.status),
+      `change is either applied-then-overridden (200) or rejected on a stale temp (400), got ${changeRes.status}`,
+    );
+
+    // Invariant in BOTH outcomes: the admin's LATER reset wins the row — the account
+    // is re-restricted, the latest temp is the valid credential, and the attempted
+    // new password NEVER became usable (no lost update, no stale credential restored).
+    const rowAfter = await db('users').where({ id: ids.ustaB }).first();
+    assert.equal(Boolean(rowAfter.must_change_password), true, 'the account stays restricted (admin reset preserved)');
+    assert.equal((await login(PHONES.ustaB, newPassword)).status, 401, 'the changed password never became usable');
+    assert.equal((await login(PHONES.ustaB, temp2)).status, 200, 'the latest temporary password is the valid credential');
+
+    // If the change returned 200, its session must NOT retain unrestricted access:
+    // the reset revoked all sessions, and even a survivor is re-gated by must_change.
+    if (changeRes.status === 200) {
+      const changed = sessionCookie(changeRes);
+      const biz = await http('GET', '/api/v1/customers', { cookie: changed });
+      assert.notEqual(biz.status, 200, 'a change that raced a reset must not keep unrestricted access');
+    }
+  });
+
   // --------------------------- Blocked users -------------------------------
 
   await test('a BLOCKED employee stays blocked after a reset (temp password cannot log in)', async () => {

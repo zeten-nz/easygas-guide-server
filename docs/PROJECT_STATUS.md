@@ -42,12 +42,27 @@ self-service reset.
   preserved; tables not dropped).
 - Migrations: `20260908000001_manual_recovery_password_fields` (adds `must_change_password`,
   `temp_password_expires_at`; idempotent, reversible) + the cancel migration above. Applied only on an
-  isolated `*_test` DB; down/up verified in CI.
-- Tests: new `test:manual-recovery` suite (19 cases — authz, admin re-auth, one-time secret + no-store,
+  isolated `*_test` DB; migrate + rollback + re-migrate run **locally** (the CI workflow is wired to run
+  the same down/up step, but has **not** been executed on GitHub Actions for this branch — see
+  "Verification provenance"). The cancel migration documents the operator deploy sequence
+  (stop/drain the dedicated SMS worker BEFORE running it; a DB migration cannot retract a send already
+  handed to the provider).
+- Tests: new `test:manual-recovery` suite (20 cases — authz, admin re-auth, one-time secret + no-store,
   session revocation, forced-change gate on direct business APIs, expiry + repeated/concurrent resets,
-  blocked-stays-blocked, CSRF, rate limits, audit redaction, removed-endpoints-404, manual-recovery
-  config/readiness). `auth`/`hardening`/`sms-outbox`/`runtime` suites updated for the removal. **Full
-  `test:all` green (28 suites)**; typecheck + build + OpenAPI check clean.
+  **concurrent reset-vs-change race**, blocked-stays-blocked, CSRF, rate limits, audit redaction,
+  removed-endpoints-404, manual-recovery config/readiness). `auth`/`hardening`/`sms-outbox`/`runtime`
+  suites updated for the removal. **Full `test:all` green (28 suites) — executed LOCALLY**; typecheck +
+  build + OpenAPI check clean locally.
+
+### Verification provenance (what was actually run, and where)
+- **Local machine only.** Every green result above (server `test:all` 28 suites, the browser E2E, client
+  lint/tsc/component tests) was **executed locally**. **No GitHub Actions run has occurred** for these
+  branches — nothing is pushed, so `server-ci` / `e2e-fullstack` have **not** validated this code. The CI
+  is *wired* to run these checks; that wiring is not the same as a green run.
+- **Browser E2E:** chromium project executed and passed (system Edge). The `mobile` (Pixel 5) project is
+  authored + discovered but was **not** run locally; CI would run both.
+- **Concurrency race** (reset-vs-change) is covered by a focused server test; the change-password path now
+  locks the user row `FOR UPDATE` and re-verifies inside the transaction (see below).
 
 **Client (`phase/manual-employee-recovery`):**
 - "Parolni unutdingizmi?" now opens a **support page** (no OTP wizard): Uzbek instructions to contact
@@ -71,9 +86,38 @@ login → forced change → normal access → new-password login) **executed and
   SMS is explicitly enabled (`SMS_PROVIDER=eskiz`).
 - Not pushed/merged/deployed; no production data touched; no real Telegram/SMS sent.
 
-**Missing integration dependency:** the Telegram bot **@EasygasGarantbot** is referenced only as a
-support link — no bot code/repo/webhook exists in either repository. Wiring the support inbox (routing
-employee requests to admins) is a separate integration owned outside this change.
+### Operational dependency — support-request routing (NOT wired here)
+The recovery UX depends on an admin actually **receiving** an employee's request. This change provides
+only the outbound **support link** (`https://t.me/EasygasGarantbot`); the link alone does **not** prove
+requests reach an admin. The Telegram bot **@EasygasGarantbot** has **no code, repo, or webhook in either
+repository** — routing employee messages to admins (an inbox/notification the admin monitors) is a
+separate operational integration, owned outside this change. The live bot was **not** inspected or
+modified. Until that inbox is wired and verified, treat "employee can request a reset" as **unproven at
+the operational level**, even though the website + admin reset flow are complete.
+
+### Cross-repo compatibility (both repos changed; contracts diverge)
+Changed contracts: **removed** `POST /auth/{forgot-password,verify-otp,reset-password}`; **added**
+`POST /auth/change-password` + `POST /users/:id/reset-password`; login/`/auth/me` user gained an
+additive `mustChangePassword` field. Compatibility of the two branches against the *other repo's* current
+`main` (verified by inspecting the specs + the changed endpoints, not executed cross-version):
+- **server branch × client main** — normal login/app **works** (the extra `mustChangePassword` field is
+  ignored by the old client); the old client's OTP recovery screen would **404** (endpoints removed) but
+  no browser spec exercises it, so the *server* mirror e2e (server branch × client main) stays green.
+- **client branch × server main** — normal login/app **works**; the new admin "Vaqtinchalik parol" action
+  and the change-password screen **404** (server main lacks the endpoints); the forced-change flow never
+  triggers (server main never sends `mustChangePassword`). The new `manual-recovery.spec` would be **RED**
+  against server main.
+- **both branches together** — **green** (verified locally, chromium).
+
+**Proposed coordinated validation/merge sequence (no weakened checks, never merge a red PR):**
+1. Dispatch the client `e2e-fullstack` with `server_ref=phase/manual-employee-recovery` (the workflow
+   accepts a `server_ref` input) and the server mirror e2e with `client_ref=phase/manual-employee-recovery`
+   → both must be green **before** any merge.
+2. Merge the **server** PR first — its default gate (server branch × client `main`) is green and it is
+   backward-compatible for normal operation.
+3. After server `main` carries the endpoints, the client PR's default gate (client branch × server `main`)
+   turns green → merge the **client** PR, then deploy both together. Do **not** merge the client PR while
+   server `main` lacks the endpoints (its e2e is expected red — do not disable the spec to force it green).
 
 ---
 

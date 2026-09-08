@@ -5,7 +5,7 @@ import { ApiError } from '../../utils/errors';
 import { logAudit } from '../audit/audit.service';
 import { createSession, revokeByToken } from './session.service';
 import { toAuthUser, type UserWithRole } from '../users/user.mapper';
-import type { AuthUser } from '../../types/auth';
+import type { AuthUser, UserRow } from '../../types/auth';
 import type { LoginInput, RegisterInput } from './auth.validators';
 
 const GENERIC_LOGIN_ERROR = "Telefon raqam yoki parol noto'g'ri";
@@ -225,15 +225,23 @@ export interface ChangePasswordResult {
  * standard password policy (validated at the router).
  *
  * Guarantees:
- *  - authoritative temp-password expiry re-check — an expired temporary password
- *    cannot be "upgraded" into a permanent one even if a session already exists;
+ *  - the user row is locked FOR UPDATE and RE-READ inside the transaction, and the
+ *    current password is verified against THAT locked hash — so a concurrent admin
+ *    reset (which also locks this row) can never interleave to leave a lost update
+ *    or an unrestricted session on stale credentials: either this change commits
+ *    first (and the admin reset then re-restricts on top of it), or the reset
+ *    commits first (and the now-stale temporary password fails verification here);
+ *  - authoritative temp-password expiry re-check on the locked row — an expired
+ *    temporary password cannot be "upgraded" into a permanent one;
  *  - the current password is verified (constant-time bcrypt), and the new one is
  *    rejected if it equals the current/temporary password (no reuse);
  *  - password update + revocation of EVERY existing session/family + audit commit
  *    atomically; the restriction (must_change_password) is cleared only on that
  *    committed change;
  *  - a brand-new session family is then minted so the caller can rotate the
- *    cookie + CSRF token (the just-used temporary-password session is dead).
+ *    cookie + CSRF token (the just-used temporary-password session is dead). If a
+ *    reset lands after this commit, requireAuth re-reads must_change_password on
+ *    every request, so the fresh session is immediately re-restricted.
  * The audit entry records the actor only — never the old or new password.
  */
 export async function changePassword(
@@ -242,38 +250,45 @@ export async function changePassword(
   newPassword: string,
   meta: RequestMeta,
 ): Promise<ChangePasswordResult> {
-  const row = await findUserById(actor.id);
-  // requireAuth already re-validated the account this request; a missing row here
-  // means it was removed mid-request — treat as unauthenticated.
-  if (!row) throw ApiError.unauthorized();
-
-  // Authoritative expiry check on the change path (§D): reject even if a session
-  // was minted just before the temporary password expired.
-  if (
-    row.must_change_password &&
-    row.temp_password_expires_at &&
-    new Date(row.temp_password_expires_at).getTime() <= Date.now()
-  ) {
-    throw ApiError.unauthorized(
-      "Vaqtinchalik parol muddati tugagan. Administratordan yangi parol so'rang.",
-      'TEMP_PASSWORD_EXPIRED',
-    );
-  }
-
-  const currentOk = await bcrypt.compare(currentPassword, row.password_hash);
-  if (!currentOk) {
-    throw ApiError.badRequest("Joriy parol noto'g'ri", 'INVALID_CURRENT_PASSWORD');
-  }
-
-  // The new password must differ from the current/temporary one.
-  const sameAsCurrent = await bcrypt.compare(newPassword, row.password_hash);
-  if (sameAsCurrent) {
-    throw ApiError.badRequest('Yangi parol avvalgisidan farq qilishi kerak', 'PASSWORD_REUSE');
-  }
-
+  // Hash the NEW password before the transaction — it does not depend on the row,
+  // so the row lock below is held only for the short verify+write section, not for
+  // the ~250ms bcrypt hash.
   const passwordHash = await bcrypt.hash(newPassword, env.BCRYPT_ROUNDS);
 
   await db.transaction(async (trx) => {
+    const row = (await trx('users').where({ id: actor.id }).whereNull('deleted_at').forUpdate().first()) as
+      | UserRow
+      | undefined;
+    // requireAuth already re-validated the account this request; a missing row here
+    // means it was removed mid-request — treat as unauthenticated.
+    if (!row) throw ApiError.unauthorized();
+
+    // Authoritative expiry check on the LOCKED row (§D): reject even if a session
+    // was minted just before the temporary password expired.
+    if (
+      row.must_change_password &&
+      row.temp_password_expires_at &&
+      new Date(row.temp_password_expires_at).getTime() <= Date.now()
+    ) {
+      throw ApiError.unauthorized(
+        "Vaqtinchalik parol muddati tugagan. Administratordan yangi parol so'rang.",
+        'TEMP_PASSWORD_EXPIRED',
+      );
+    }
+
+    // Verify the current password against the LOCKED hash (never a pre-read copy),
+    // so a reset that committed first makes the stale temporary password fail here.
+    const currentOk = await bcrypt.compare(currentPassword, row.password_hash);
+    if (!currentOk) {
+      throw ApiError.badRequest("Joriy parol noto'g'ri", 'INVALID_CURRENT_PASSWORD');
+    }
+
+    // The new password must differ from the current/temporary one.
+    const sameAsCurrent = await bcrypt.compare(newPassword, row.password_hash);
+    if (sameAsCurrent) {
+      throw ApiError.badRequest('Yangi parol avvalgisidan farq qilishi kerak', 'PASSWORD_REUSE');
+    }
+
     await trx('users').where({ id: actor.id }).update({
       password_hash: passwordHash,
       must_change_password: false,
