@@ -23,6 +23,14 @@ export const listUsersQuerySchema = z.object({
   status: z.enum(['ACTIVE', 'BLOCKED']).optional(),
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(25),
+  // Phase 11A employee directory opt-in: exclude the CURRENT caller from the
+  // results (before COUNT + pagination). Off by default, so GET /users stays a
+  // general lookup that includes everyone for any other/future consumer — only
+  // the directory passes excludeSelf=true. (String flag: only 'true' enables it.)
+  excludeSelf: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
 });
 
 export const userIdParamsSchema = z.object({

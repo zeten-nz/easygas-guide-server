@@ -122,13 +122,13 @@ export interface ListUsersResult {
 export async function listUsers(actor: AuthUser, query: ListUsersQuery): Promise<ListUsersResult> {
   const build = () => {
     const q = baseSelect();
-    // Phase 11A employee directory: the current viewer never appears in their own
-    // directory — they manage their own account via "Mening profilim" (own profile).
-    // Applied to the SHARED builder so it is excluded BEFORE both COUNT and the page
-    // (the filtered total stays accurate). Only the actor is hidden — every OTHER
-    // user, including other administrators, remains visible. This is scoped to the
-    // directory read; it does not touch the assignment candidate query.
-    q.whereNot('users.id', actor.id);
+    // Phase 11A employee directory (OPT-IN via excludeSelf): the current viewer
+    // never appears in their OWN directory — they manage their account via "Mening
+    // profilim". Applied to the SHARED builder so it is removed BEFORE both COUNT
+    // and the page (the filtered total stays accurate). Only the actor is hidden —
+    // every OTHER user, including other administrators, remains. Off by default, so
+    // GET /users is unchanged for any other consumer; only the directory opts in.
+    if (query.excludeSelf) q.whereNot('users.id', actor.id);
     // Branch-scoped actors (RAHBAR) only ever see their own branch.
     if (isBranchScoped(actor.role)) {
       q.where('users.branch_id', actor.branchId ?? -1);

@@ -20,10 +20,13 @@ Full detail: `PHASE-11A.md`. Base SHAs: server `origin/main` = `fe493f9`, client
 `c7b1997`.
 
 ### Employee directory (§B) — IMPLEMENTED + TESTED
-- `GET /users` now **excludes the current viewer** from their own directory (a `whereNot(id, actor.id)`
-  applied to the SHARED builder, so it is removed BEFORE COUNT and pagination — the total/pages never
-  include the caller). Only the caller is hidden; every other user, **including other administrators**,
-  is listed. Scoped to the directory read only (the assignment-candidate query is untouched).
+- `GET /users` excludes the current viewer from their own directory **only when `excludeSelf=true`**
+  (opt-in; the employee directory passes it, verified as the endpoint's sole consumer — the assignment
+  picker uses a different endpoint). Off by default, so `GET /users` stays a general lookup that
+  includes everyone for any other/future consumer. When on, the `whereNot(id, actor.id)` is applied to
+  the SHARED builder so the caller is removed BEFORE COUNT and pagination — the total/pages never
+  include the caller; only the caller is hidden, every other user (**including other administrators**)
+  remains.
 - Deterministic order with an **id tie-breaker** (`created_at desc, id desc`) so equal timestamps never
   reshuffle across pages. Bounded limit unchanged (Zod `min 1, max 100, default 25`; the UI offers 25/50).
 - Client: a shared `Pagination` (persistent summary "Jami N xodim · a–b ko'rsatilmoqda", page-size 25/50,
@@ -48,10 +51,15 @@ Full detail: `PHASE-11A.md`. Base SHAs: server `origin/main` = `fe493f9`, client
 ### Safe template deletion (§D) — IMPLEMENTED + TESTED
 - New `DELETE /checklist-templates/:id` (`templates.manage`) permanently deletes a template **only** when
   every version is still DRAFT (never published → never assigned) and no job references it. Eligibility is
-  re-checked **inside a transaction** under a consistent lock order (template row → all version rows FOR
-  UPDATE → audit last) so a check-then-delete race with a concurrent publish/createVersion is impossible: a
-  publish that lands first is seen as history and the delete is refused; one that blocks then 404s on the
-  deleted version. A published/archived template → **409 `TEMPLATE_HAS_HISTORY`** (archive instead); a
+  re-checked **inside a transaction** under a **consistent lock order — template row → version rows → audit
+  last — now shared by ALL template mutations** (`createVersion`, `publishVersion`, `archiveVersion`,
+  `deleteTemplate`; publish/archive gained the leading template-row lock in this review to remove a
+  possible version-lock-ordering deadlock). So concurrent template mutations serialize on the template row:
+  a publish that lands first is seen as history and the delete is refused; one that blocks then 404s on the
+  deleted version. `delete-vs-createVersion` and `delete-vs-assignment` are **mutually-exclusive states**
+  (delete needs all-DRAFT; createVersion needs no-DRAFT; assignment needs a PUBLISHED version), so they are
+  not valid concurrent pairings — the valid ones (`delete-vs-publish`, `delete-vs-draft-mutation`) are
+  covered by ×5 concurrent regressions asserting no orphan rows, no 500/raw SQL, and a clean win/conflict. A published/archived template → **409 `TEMPLATE_HAS_HISTORY`** (archive instead); a
   referenced one → **409 `TEMPLATE_IN_USE`** (defensive; the RESTRICT FKs are the last-line backstop, never
   weakened). Children are deleted child→parent (steps [measurements cascade] → versions → template). A
   `TEMPLATE_DELETED` audit records the name + version count only (no step internals). `listTemplates`/
@@ -70,17 +78,24 @@ Full detail: `PHASE-11A.md`. Base SHAs: server `origin/main` = `fe493f9`, client
   invented analytics). Existing route URLs are unchanged and every page renders inside the new shell.
 
 ### Verification (LOCAL only — no GitHub Actions run for this branch)
-- **Server:** new `test:admin-workspace` (13 cases — directory exclusion/pagination determinism/bounded
-  limits/filters, own-profile without `users.view`, profile authz 404-vs-403 + forced-change gate, template
-  delete success/authz/history-block/concurrency, audit redaction). Full `test:all` — see the run summary
-  in the checkpoint. Typecheck + build + OpenAPI check clean; OpenAPI artifact regenerated (89 ops / 72
-  paths). No migration required (behavioural change only; no schema change).
-- **Client:** 58 unit/component tests (14 new — Pagination, Sidebar authorization, ProfilePage states,
-  DeleteTemplateDialog conflict feedback, directory link/pagination). Lint + `tsc -b` + `tsc -p
-  tsconfig.test.json` + production build clean. New browser E2E `e2e/admin-workspace.spec.ts` (directory
-  pagination with 55 synthetic employees + a second admin, profile + Back, own-profile → change-password,
-  create+delete a draft template, published-template-cannot-delete, mobile drawer + no overflow at
-  360/768/1366/1920) executed on system Edge (chromium) — see the checkpoint for the executed result.
+- **Server:** new `test:admin-workspace` (15 cases — directory exclusion **opt-in** (default keeps the
+  caller) / pagination determinism / bounded limits / filters, own-profile without `users.view`, profile
+  authz 404-vs-403 + forced-change gate, template delete success/authz/history-block, ×5 concurrent
+  delete-vs-publish and delete-vs-draft-mutation races, audit redaction). Full `test:all` green (all suites)
+  — see the checkpoint. Typecheck + build + OpenAPI check clean; OpenAPI regenerated (89 ops / 72 paths).
+  No migration required (behavioural change only; no schema change). Prod audit **0**, full audit **0**.
+- **Client:** 61 unit/component tests (17 new — Pagination, Sidebar authorization, ProfilePage states,
+  DeleteTemplateDialog conflict feedback, directory link/pagination, DropdownMenu keyboard/focus). Lint +
+  `tsc -b` + `tsc -p tsconfig.test.json` + production build clean. Prod audit **0**, full audit **5**
+  (dev-only — vite/vitest/vite-node/esbuild toolchain; no production dependency affected; fix is a breaking
+  major bump). The **full browser E2E suite** now runs on **BOTH configured projects** (chromium *and* the
+  Pixel-5 mobile project) on system Edge (`PW_CHANNEL=msedge`): `admin-workspace` (directory pagination with
+  55 synthetic employees + a second admin, profile + Back, own-profile → change-password, create+delete a
+  draft template, published-template-cannot-delete, mobile drawer with **Escape-close + focus restore** and
+  no overflow at 360/768/1366/1920), the pre-existing `manual-recovery` safety journey (updated for the new
+  shell — "Xodimlar" heading + reset via the accessible row menu, and isolated onto its own branch so it
+  never perturbs the directory count), `visual` smoke, and the 5 `workflow` safety journeys —
+  **24 tests / 24 passed / 0 failed / 0 skipped** (see the checkpoint).
 - **Out of scope (documented as later phases):** price/service catalogue, reference-data CRUD, injection
   modelling, risk-matrix redesign, photo-gallery workflows, Telegram/SMS, inventory/payments/notifications/
   offline/5-WHY.

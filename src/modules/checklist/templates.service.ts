@@ -507,6 +507,14 @@ export async function publishVersion(
   meta: RequestMeta,
 ): Promise<TemplateDetail> {
   await db.transaction(async (trx) => {
+    // Lock the TEMPLATE row first — a consistent lock order (template row → version
+    // rows) shared with createVersion / archiveVersion / deleteTemplate, so
+    // concurrent template mutations serialize on the template row and can never
+    // deadlock on version-lock ordering (delete locks the version set in PK order;
+    // publish would otherwise lock target-then-previous — the opposite order).
+    const template = await trx('checklist_templates').where({ id: templateId }).forUpdate().first();
+    if (!template) throw ApiError.notFound('Shablon topilmadi');
+
     const version = await trx('checklist_template_versions')
       .where({ id: versionId, template_id: templateId })
       .forUpdate()
@@ -572,6 +580,10 @@ export async function archiveVersion(
   meta: RequestMeta,
 ): Promise<TemplateDetail> {
   await db.transaction(async (trx) => {
+    // Template row first — consistent lock order (see publishVersion/deleteTemplate).
+    const template = await trx('checklist_templates').where({ id: templateId }).forUpdate().first();
+    if (!template) throw ApiError.notFound('Shablon topilmadi');
+
     const version = await trx('checklist_template_versions')
       .where({ id: versionId, template_id: templateId })
       .forUpdate()

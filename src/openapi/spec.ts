@@ -275,12 +275,18 @@ export const openapiSpec = {
         operationId: 'usersList',
         summary: 'List users (employee directory)',
         description:
-          'Requires permission: users.view. Branch-scoped for non-admin roles. The CURRENT viewer is excluded from their own directory (before COUNT and pagination), so the total and pages never include the caller — every other user (including other administrators) is listed. Deterministic order (created_at desc, id desc). Use GET /users/me for the caller\'s own profile.',
+          'Requires permission: users.view. Branch-scoped for non-admin roles. Deterministic order (created_at desc, id desc). Pass excludeSelf=true (the employee directory does) to omit the CURRENT caller from the results BEFORE the COUNT and pagination, so the total and pages never include the caller — every other user (including other administrators) is still listed; off by default, so this stays a general lookup for any other consumer. Use GET /users/me for the caller\'s own profile.',
         parameters: [
           { $ref: '#/components/parameters/SearchQuery' },
           { name: 'role', in: 'query', schema: { $ref: '#/components/schemas/RoleCode' } },
           { name: 'branchId', in: 'query', schema: { type: 'integer' } },
           { name: 'status', in: 'query', schema: { $ref: '#/components/schemas/UserStatus' } },
+          {
+            name: 'excludeSelf',
+            in: 'query',
+            description: 'When "true", exclude the current caller from the results (employee directory).',
+            schema: { type: 'string', enum: ['true', 'false'] },
+          },
           { $ref: '#/components/parameters/PageQuery' },
           { $ref: '#/components/parameters/LimitQuery' },
         ],

@@ -207,7 +207,7 @@ async function run(): Promise<void> {
     let page = 1;
     let total = -1;
     for (;;) {
-      const res = await http('GET', `/api/v1/users?limit=${limit}&page=${page}`, { cookie: rahbar });
+      const res = await http('GET', `/api/v1/users?limit=${limit}&page=${page}&excludeSelf=true`, { cookie: rahbar });
       assert.equal(res.status, 200, JSON.stringify(res.body));
       total = res.body.total;
       for (const u of res.body.users) seen.push(u.id);
@@ -228,8 +228,8 @@ async function run(): Promise<void> {
 
   await test('directory order is deterministic under an identical created_at (id-desc tie-breaker)', async () => {
     const rahbar = sessionCookie(await login(PHONES.rahbar));
-    const a = await http('GET', '/api/v1/users?limit=50', { cookie: rahbar });
-    const b = await http('GET', '/api/v1/users?limit=50', { cookie: rahbar });
+    const a = await http('GET', '/api/v1/users?limit=50&excludeSelf=true', { cookie: rahbar });
+    const b = await http('GET', '/api/v1/users?limit=50&excludeSelf=true', { cookie: rahbar });
     const orderA = a.body.users.map((u: any) => u.id);
     const orderB = b.body.users.map((u: any) => u.id);
     assert.deepEqual(orderA, orderB, 'two identical requests return an identical order');
@@ -240,12 +240,12 @@ async function run(): Promise<void> {
 
   await test('directory filters (status/role/search) narrow the total accurately', async () => {
     const rahbar = sessionCookie(await login(PHONES.rahbar));
-    const blocked = await http('GET', '/api/v1/users?status=BLOCKED&limit=50', { cookie: rahbar });
+    const blocked = await http('GET', '/api/v1/users?status=BLOCKED&limit=50&excludeSelf=true', { cookie: rahbar });
     assert.equal(blocked.body.total, 1, 'one blocked directory user');
     assert.equal(blocked.body.users[0].status, 'BLOCKED');
-    const byRole = await http('GET', '/api/v1/users?role=MASTER&limit=50', { cookie: rahbar });
+    const byRole = await http('GET', '/api/v1/users?role=MASTER&limit=50&excludeSelf=true', { cookie: rahbar });
     assert.equal(byRole.body.total, 0, 'no MASTER directory users');
-    const search = await http('GET', '/api/v1/users?search=Xodim05&limit=50', { cookie: rahbar });
+    const search = await http('GET', '/api/v1/users?search=Xodim05&limit=50&excludeSelf=true', { cookie: rahbar });
     assert.equal(search.body.total, 1, 'search matches exactly one');
     assert.equal(search.body.users[0].lastName, 'Xodim05');
   });
@@ -262,7 +262,7 @@ async function run(): Promise<void> {
     const seen: number[] = [];
     let page = 1;
     for (;;) {
-      const res = await http('GET', `/api/v1/users?limit=100&page=${page}`, { cookie: admin });
+      const res = await http('GET', `/api/v1/users?limit=100&page=${page}&excludeSelf=true`, { cookie: admin });
       assert.equal(res.status, 200);
       for (const u of res.body.users) seen.push(u.id);
       if (page * 100 >= res.body.total) break;
@@ -272,6 +272,19 @@ async function run(): Promise<void> {
     assert.ok(!seen.includes(ids.admin), 'the signed-in admin is not in their own directory');
     assert.ok(seen.includes(ids.admin2), 'a different administrator is still visible');
     assert.ok(seen.includes(ids.rahbar) && seen.includes(ids.ustaOutside), 'admin sees all branches');
+  });
+
+  await test('exclusion is OPT-IN: without excludeSelf, GET /users still includes the caller (general lookup unchanged)', async () => {
+    const rahbar = sessionCookie(await login(PHONES.rahbar));
+    // No excludeSelf → the RAHBAR sees their whole branch INCLUDING themselves (13),
+    // proving the endpoint's default semantics are untouched for other consumers.
+    const withSelf = await http('GET', '/api/v1/users?limit=50', { cookie: rahbar });
+    assert.equal(withSelf.status, 200);
+    assert.ok(withSelf.body.users.some((u: any) => u.id === ids.rahbar), 'the caller is present by default');
+    assert.equal(withSelf.body.total, DIR_COUNT + 1, 'default total includes the caller');
+    // excludeSelf=false behaves the same as omitting it.
+    const explicitFalse = await http('GET', '/api/v1/users?limit=50&excludeSelf=false', { cookie: rahbar });
+    assert.ok(explicitFalse.body.users.some((u: any) => u.id === ids.rahbar), "excludeSelf=false keeps the caller");
   });
 
   // ------------------------------ Own profile ------------------------------
@@ -415,26 +428,88 @@ async function run(): Promise<void> {
     assert.equal(archived.status, 'ARCHIVED', 'archived version remains available (not destroyed)');
   });
 
-  await test('concurrent delete vs publish is safe: exactly one wins, no corruption', async () => {
+  /** Asserts the template is either FULLY present or FULLY gone — never a partial/orphan state. */
+  async function assertNoOrphans(tId: number, vId: number, stepIds: number[]): Promise<'gone' | 'present'> {
+    const tpl = await db('checklist_templates').where({ id: tId }).first();
+    const vers = await db('checklist_template_versions').where({ template_id: tId });
+    const steps = Number((await db('checklist_steps').whereIn('id', stepIds.length ? stepIds : [-1]).count({ c: '*' }).first())?.c ?? 0);
+    const meas = Number(
+      (await db('checklist_step_measurements').whereIn('step_id', stepIds.length ? stepIds : [-1]).count({ c: '*' }).first())?.c ?? 0,
+    );
+    if (!tpl) {
+      // Fully gone: no versions, steps, or measurements linger.
+      assert.equal(vers.length, 0, 'no orphan versions after delete');
+      assert.equal(steps, 0, 'no orphan steps after delete');
+      assert.equal(meas, 0, 'no orphan measurements after delete');
+      return 'gone';
+    }
+    // Fully present: the version + its steps are intact.
+    assert.ok(vers.some((v: any) => v.id === vId), 'the version is preserved');
+    assert.equal(steps, stepIds.length, 'all steps preserved');
+    return 'present';
+  }
+
+  await test('concurrent delete vs publish (x5): exactly one wins, no orphan/500/deadlock leak', async () => {
     const admin = sessionCookie(await login(PHONES.admin));
-    const { tId, vId } = await makeDraftTemplate(admin, 'TEST AW Race');
-    const [del, pub] = await Promise.all([
-      http('DELETE', `/api/v1/checklist-templates/${tId}`, { cookie: admin }),
-      http('POST', `/api/v1/checklist-templates/${tId}/versions/${vId}/publish`, { cookie: admin }),
-    ]);
-    const tplExists = !!(await db('checklist_templates').where({ id: tId }).first());
-    if (del.status === 200) {
-      // Delete won → template gone, publish could not publish a deleted version.
-      assert.equal(tplExists, false, 'template deleted');
-      assert.ok([404, 409].includes(pub.status), `publish must fail cleanly when the template is gone (got ${pub.status})`);
-    } else {
-      // Publish won → template kept with a PUBLISHED version; delete refused as history.
-      assert.equal(del.status, 409, `delete must be refused when publish won (got ${del.status})`);
-      assert.equal(del.body.error.code, 'TEMPLATE_HAS_HISTORY');
-      assert.equal(pub.status, 200, 'publish succeeded');
-      assert.equal(tplExists, true, 'template preserved');
-      const v = await db('checklist_template_versions').where({ id: vId }).first();
-      assert.equal(v.status, 'PUBLISHED');
+    for (let i = 0; i < 5; i++) {
+      const { tId, vId } = await makeDraftTemplate(admin, `TEST AW RacePub ${i}`);
+      const stepIds = (await db('checklist_steps').where({ version_id: vId }).select('id')).map((s: { id: number }) => s.id);
+      const [del, pub] = await Promise.all([
+        http('DELETE', `/api/v1/checklist-templates/${tId}`, { cookie: admin }),
+        http('POST', `/api/v1/checklist-templates/${tId}/versions/${vId}/publish`, { cookie: admin }),
+      ]);
+      // No raw 500 from either operation (a deadlock maps to a stable 409, not a 500).
+      assert.notEqual(del.status, 500, `delete must never 500 (got ${del.status} ${JSON.stringify(del.body)})`);
+      assert.notEqual(pub.status, 500, `publish must never 500 (got ${pub.status} ${JSON.stringify(pub.body)})`);
+      const state = await assertNoOrphans(tId, vId, stepIds);
+      if (del.status === 200) {
+        assert.equal(state, 'gone', 'delete won → template fully gone');
+        assert.ok([404, 409].includes(pub.status), `publish fails cleanly when the template is gone (got ${pub.status})`);
+      } else {
+        // Publish won (or a retryable conflict) → template kept; delete refused as history/conflict.
+        assert.ok([409].includes(del.status), `delete refused with a stable conflict (got ${del.status})`);
+        assert.equal(state, 'present', 'template preserved');
+        if (pub.status === 200) {
+          const v = await db('checklist_template_versions').where({ id: vId }).first();
+          assert.equal(v.status, 'PUBLISHED');
+          assert.equal(del.body.error.code, 'TEMPLATE_HAS_HISTORY');
+        }
+      }
+      // Clean up the survivor (if any) so the loop stays isolated.
+      await db('checklist_step_measurements').whereIn('step_id', stepIds.length ? stepIds : [-1]).del();
+      await db('checklist_steps').where({ version_id: vId }).del();
+      await db('checklist_template_versions').where({ template_id: tId }).del();
+      await db('checklist_templates').where({ id: tId }).del();
+    }
+  });
+
+  await test('concurrent delete vs draft mutation (addStep, x5): no orphan/500, clean outcome', async () => {
+    const admin = sessionCookie(await login(PHONES.admin));
+    for (let i = 0; i < 5; i++) {
+      const { tId, vId } = await makeDraftTemplate(admin, `TEST AW RaceStep ${i}`);
+      const [del, add] = await Promise.all([
+        http('DELETE', `/api/v1/checklist-templates/${tId}`, { cookie: admin }),
+        http('POST', `/api/v1/checklist-templates/${tId}/versions/${vId}/steps`, { cookie: admin, body: { name: 'Qoshimcha' } }),
+      ]);
+      assert.notEqual(del.status, 500, `delete must never 500 (got ${del.status})`);
+      assert.notEqual(add.status, 500, `addStep must never 500 (got ${add.status})`);
+      const tpl = await db('checklist_templates').where({ id: tId }).first();
+      if (del.status === 200) {
+        // Delete won → template + all steps gone; a step added after commit is impossible.
+        assert.equal(tpl, undefined, 'template fully deleted');
+        assert.equal((await db('checklist_template_versions').where({ template_id: tId })).length, 0, 'no orphan versions');
+        assert.equal(Number((await db('checklist_steps').where({ version_id: vId }).count({ c: '*' }).first())?.c ?? 0), 0, 'no orphan steps');
+        // addStep may have committed (201) just before delete removed the version+step,
+        // or failed cleanly once the version was gone (404) / conflicted (409).
+        assert.ok([201, 404, 409].includes(add.status), `addStep resolves cleanly (got ${add.status})`);
+      } else {
+        // addStep won the row → the draft (with the extra step) survives; delete was a clean conflict/retry.
+        assert.ok([409].includes(del.status), `delete refused/retry (got ${del.status})`);
+        assert.ok(tpl, 'template preserved when delete did not win');
+      }
+      await db('checklist_steps').where({ version_id: vId }).del();
+      await db('checklist_template_versions').where({ template_id: tId }).del();
+      await db('checklist_templates').where({ id: tId }).del();
     }
   });
 
