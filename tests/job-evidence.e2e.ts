@@ -147,6 +147,38 @@ async function run(): Promise<void> {
   const [legacyId] = await db('job_photos').insert({ job_id: jobId, job_step_id: stepId, attempt: 1, status: 'UNVERIFIED', storage_key: `photos/${jobId}/${stepId}/legacy.png`, original_name: 'legacy.png', mime_type: 'image/png', content_type: 'image/png', size_bytes: PNG.length, hash: 'deadbeef', created_by: ustaRow.id });
   await db('job_photos').insert({ job_id: jobId, job_step_id: stepId, attempt: 3, status: 'FAILED', failure_reason: 'STORAGE_IO', storage_key: `photos/${jobId}/${stepId}/failed.png`, original_name: 'failed.png', mime_type: 'image/png', content_type: 'image/png', size_bytes: PNG.length, hash: 'cafe', created_by: ustaRow.id });
 
+  // --- Job B: a photo referenced by MULTIPLE snapshots. Complete cycle 1, reopen,
+  // re-close WITHOUT redoing the step → its attempt-1 photo is frozen into BOTH the
+  // cycle-1 and cycle-2 snapshots (a step not re-done carries the same evidence). ---
+  const buildJob = async (plate: string): Promise<{ id: number; step: number }> => {
+    const [vid] = await db('vehicles').insert({ customer_id: customerId, plate_number: plate, make: 'Chevrolet', model: 'Onix', created_by: ustaRow.id });
+    const [id] = await db('jobs').insert({ customer_id: customerId, vehicle_id: vid, branch_id: branchA, status: 'DRAFT', created_by: ustaRow.id, assigned_technician_id: ustaRow.id, assignment_status: 'ASSIGNED', cycle: 1 });
+    await db('job_assignments').insert({ job_id: id, cycle: 1, technician_id: ustaRow.id, assigned_by: ustaRow.id, provenance: 'SELF_AT_CREATION' });
+    await jobsService.startJob(usta, id, META);
+    await execution.assignChecklist(usta, id, tpl.id, META);
+    const step = (await db('job_steps').join('job_checklists', 'job_checklists.id', 'job_steps.job_checklist_id').where('job_checklists.job_id', id).select('job_steps.id').first()).id as number;
+    return { id, step };
+  };
+  const jobB = await buildJob('TJE002');
+  const pB = await photos.uploadStepPhoto(usta, jobB.id, jobB.step, { buffer: PNG, originalname: 'b1.png' }, META);
+  await execution.completeStep(usta, jobB.id, jobB.step, { measurements: [] }, META);
+  await completion.saveSignature(usta, jobB.id, { buffer: PNG }, META, (await completion.getSignableSummary(jobB.id))!.digest);
+  await completion.closeJob(master, jobB.id, META); // COMPLETED cycle 1 → snapshot 1 (pB)
+  await completion.reopenJob(sifat, jobB.id, "qayta ko'rish", META); // REOPENED cycle 2 — step NOT redone
+  await completion.saveSignature(usta, jobB.id, { buffer: PNG }, META, (await completion.getSignableSummary(jobB.id))!.digest);
+  await completion.closeJob(master, jobB.id, META); // REOPENED → QUALITY_REVIEW (no snapshot yet)
+  await completion.confirmQuality(sifat, jobB.id, META); // QUALITY_REVIEW → COMPLETED cycle 2 → snapshot 2 (pB again)
+  const jobBRow = await db('jobs').where({ id: jobB.id }).first();
+  assert.equal(jobBRow.status, 'COMPLETED'); assert.equal(jobBRow.cycle, 2);
+  assert.equal(Number((await db('completion_snapshots').where({ job_id: jobB.id }).count({ c: '*' }))[0].c), 2, 'two snapshots');
+
+  // --- Job C: a CANCELLED job with READY evidence → HISTORICAL_UNCLASSIFIED
+  // (not snapshotted, not workable, not a strictly-earlier attempt). ---
+  const jobC = await buildJob('TJE003');
+  const pC = await photos.uploadStepPhoto(usta, jobC.id, jobC.step, { buffer: PNG, originalname: 'c.png' }, META);
+  await jobsService.cancelJob(usta, jobC.id, 'mijoz voz kechdi', META);
+  assert.equal((await db('jobs').where({ id: jobC.id }).first()).status, 'CANCELLED');
+
   const app = createApp();
   const server = app.listen(0);
   await new Promise<void>((r) => server.once('listening', r));
@@ -208,6 +240,57 @@ async function run(): Promise<void> {
     assert.equal((await http('GET', `/api/v1/jobs/${jobId}/checklist/steps/${stepId}/photos/${legacyId}/file`, { cookie: ustaCookie })).status, 404);
     // Cross-branch download refused (404).
     assert.equal((await http('GET', `/api/v1/jobs/${jobId}/checklist/steps/${stepId}/photos/${p1.id}/file`, { cookie: ustaBCookie })).status, 404);
+  });
+
+  await test('a photo referenced by MULTIPLE snapshots reports all cycles (spans cycle 1 and 2)', async () => {
+    const all = await http('GET', `/api/v1/jobs/${jobB.id}/photos?limit=100`, { cookie: ustaCookie });
+    assert.equal(all.status, 200);
+    const photo = all.body.photos.find((p: any) => p.id === pB.id);
+    assert.ok(photo, 'the shared photo is listed');
+    assert.equal(photo.role, 'COMPLETED_CYCLE');
+    assert.deepEqual(photo.cycles, [1, 2], 'recorded for BOTH completed cycles');
+    assert.equal(photo.cycle, 2, 'primary = latest cycle');
+    assert.equal(photo.snapshotEvidence, true);
+    // The cycle filter includes the shared photo for EITHER cycle.
+    const c1 = await http('GET', `/api/v1/jobs/${jobB.id}/photos?cycle=1`, { cookie: ustaCookie });
+    assert.ok(c1.body.photos.some((p: any) => p.id === pB.id), 'cycle 1 includes it');
+    const c2 = await http('GET', `/api/v1/jobs/${jobB.id}/photos?cycle=2`, { cookie: ustaCookie });
+    assert.ok(c2.body.photos.some((p: any) => p.id === pB.id), 'cycle 2 includes it');
+  });
+
+  await test("cancelled-job READY evidence is HISTORICAL_UNCLASSIFIED (honest unknown, never 'current')", async () => {
+    const r = await http('GET', `/api/v1/jobs/${jobC.id}/photos?limit=100`, { cookie: ustaCookie });
+    assert.equal(r.status, 200);
+    const photo = r.body.photos.find((p: any) => p.id === pC.id);
+    assert.ok(photo, 'the cancelled-job photo is listed');
+    assert.equal(photo.role, 'HISTORICAL_UNCLASSIFIED');
+    assert.equal(photo.cycle, null);
+    assert.deepEqual(photo.cycles, []);
+    assert.equal(photo.downloadable, true); // still READY, still viewable
+  });
+
+  await test('direct historical-file access is branch-authorized (a completed-cycle photo, cross-branch → 404)', async () => {
+    // In-branch actor can stream the READY completed-cycle photo.
+    assert.equal((await http('GET', `/api/v1/jobs/${jobB.id}/checklist/steps/${jobB.step}/photos/${pB.id}/file`, { cookie: ustaCookie })).status, 200);
+    // Another branch cannot reach it (404, not 403) — a frontend-hidden link is not access control.
+    assert.equal((await http('GET', `/api/v1/jobs/${jobB.id}/checklist/steps/${jobB.step}/photos/${pB.id}/file`, { cookie: ustaBCookie })).status, 404);
+  });
+
+  await test('responsible-technician filter list is branch-scoped, searchable and id-resolvable', async () => {
+    // usta (branchA) is the responsible technician on jobs in branchA → listed.
+    const listed = await http('GET', '/api/v1/jobs/technicians', { cookie: ustaCookie });
+    assert.equal(listed.status, 200);
+    assert.ok(listed.body.items.some((t: any) => t.id === ustaRow.id), 'usta listed (has jobs in scope)');
+    // Name search.
+    const searched = await http('GET', `/api/v1/jobs/technicians?search=${encodeURIComponent(ustaRow.first_name)}`, { cookie: ustaCookie });
+    assert.ok(searched.body.items.some((t: any) => t.id === ustaRow.id), 'found by name');
+    // Resolve one by id (drives the "selected name after reload" display).
+    const byId = await http('GET', `/api/v1/jobs/technicians?id=${ustaRow.id}`, { cookie: ustaCookie });
+    assert.equal(byId.body.items.length, 1);
+    assert.equal(byId.body.items[0].name, 'Je Usta');
+    // Branch scope: another branch cannot resolve/list a branch-A technician.
+    const crossBranch = await http('GET', `/api/v1/jobs/technicians?id=${ustaRow.id}`, { cookie: ustaBCookie });
+    assert.equal(crossBranch.body.items.length, 0, 'cross-branch technician not resolvable');
   });
 
   await test('completed-job list filters — technician, status and date range (additive, allowlisted)', async () => {

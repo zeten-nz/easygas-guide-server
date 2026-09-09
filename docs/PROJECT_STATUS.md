@@ -27,15 +27,24 @@ authority/business rules changed, no policy activated on developer/production, n
   creates nothing, works for DRAFT/ACTIVE/RETIRED, and is **distinct from production `assessRisk`**,
   which still fails closed without an ACTIVE policy). `listMatrices` now returns `approvedByName`/
   `supersededBy`. Provisional (definition provenance) is kept distinct from lifecycle approval.
-- **Client** — completed-job filters + a "Fotolar" gallery embedded in JobDetail (grouped by cycle/step,
-  lazy thumbnails, honest states) + an accessible full-screen photo viewer (top-bar/side controls, no
-  bottom-anchored footer; keyboard/focus/zoom/retry), and a redesigned `/app/admin/risk-policy`
-  (plain-language explainer, real server matrix, illustrative preview, history + compare, and an
-  activation/retirement flow using the centered Modal).
-- **Verification (local, isolated `*_test`):** server `test:job-evidence` **7/7** + `test:riskpolicy-preview`
-  **7/7**, full `test:all` green, typecheck/build/`openapi:check` clean (**122 ops / 93 paths, no drift**).
-  Client **24 files / 77 component tests**, lint + `tsc -b` + build clean, bundle budget OK; browser
-  E2E `evidence-policy.spec` on chromium + Pixel-5. The Playwright harness seeds `E2E-EVI-<proj>`
+- **Client** — completed-job filters (status/branch/date + a bounded searchable **responsible-technician**
+  combobox, URL-synced) + a "Fotolar" gallery embedded in JobDetail (grouped by cycle/step, lazy
+  thumbnails, honest role labels incl. multi-cycle + HISTORICAL_UNCLASSIFIED) + an accessible full-screen
+  photo viewer (top-bar/side controls, no bottom-anchored footer; keyboard/focus/zoom/retry), and a
+  redesigned `/app/admin/risk-policy` (plain-language explainer, real server matrix, illustrative preview,
+  history + compare, activation/retirement flow using the centered Modal).
+- **Provenance (verified):** photo cycle is derived only from the immutable snapshot; a photo can span
+  MULTIPLE snapshots (`cycles[]`); "Joriy" is reliable current-attempt evidence; insufficient provenance is
+  HISTORICAL_UNCLASSIFIED (never "current"); the uploader (`created_by`) is kept distinct from the step
+  performer (`completed_by`) and never guess-attributed. `GET /jobs/technicians` is historical filtering
+  access, not assignment eligibility.
+- **Acceptance review:** patched the two prod npm-audit advisories (morgan 1.11→1.12, multer 2.2→2.3 —
+  compatible minor bumps, no `--force`); **prod & full audit now 0** (client prod 0 / full 5 dev-only,
+  unchanged); upload workflows re-verified on multer 2.3.0.
+- **Verification (local, isolated `*_test`):** server `test:job-evidence` **11/11** + `test:riskpolicy-preview`
+  **7/7**, full `test:all` green, typecheck/build/`openapi:check` clean (**123 ops / 94 paths, no drift**).
+  Client **77 component tests**, lint + `tsc -b` + build clean, bundle budget OK; browser E2E
+  `evidence-policy.spec` (9 tests) on chromium + Pixel-5. The Playwright harness seeds `E2E-EVI-<proj>`
   (completed) + `E2E-EVR-<proj>` (reopened) evidence jobs via the real workflow.
 - **Cross-repo:** client needs the new server endpoints → **merge server first, then client**.
 

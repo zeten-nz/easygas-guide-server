@@ -30,13 +30,20 @@ async function loadScopedJob(actor: AuthUser, jobId: number) {
   return job;
 }
 
-/** Photo → completed cycle, from the immutable snapshots (authoritative history). */
+/**
+ * Photo → the completed cycle(s) it was frozen as evidence for, from the immutable
+ * snapshots (authoritative history). A photo CAN belong to more than one snapshot:
+ * `completion_snapshots.content.summary.steps[].evidence[].photoId` is the READY
+ * photos of each step's RELEVANT attempt at that cycle's close, so a step that is
+ * NOT re-done across a reopen carries the SAME photoId into every subsequent cycle's
+ * snapshot. We therefore record ALL cycles per photo (ascending), never overwrite.
+ */
 async function snapshotEvidence(jobId: number): Promise<{
-  photoCycle: Map<number, number>;
+  photoCycles: Map<number, number[]>;
   cycles: Array<{ cycle: number; provenance: string; createdAt: Date }>;
 }> {
   const rows = await db('completion_snapshots').where({ job_id: jobId }).orderBy('cycle', 'asc').select('cycle', 'provenance', 'content', 'created_at');
-  const photoCycle = new Map<number, number>();
+  const photoCycles = new Map<number, number[]>();
   const cycles: Array<{ cycle: number; provenance: string; createdAt: Date }> = [];
   for (const r of rows) {
     cycles.push({ cycle: r.cycle, provenance: r.provenance, createdAt: r.created_at });
@@ -51,14 +58,30 @@ async function snapshotEvidence(jobId: number): Promise<{
     for (const s of steps) {
       if (!Array.isArray(s?.evidence)) continue;
       for (const e of s.evidence) {
-        if (typeof e?.photoId === 'number') photoCycle.set(e.photoId, r.cycle);
+        if (typeof e?.photoId !== 'number') continue;
+        const list = photoCycles.get(e.photoId) ?? [];
+        if (!list.includes(r.cycle)) list.push(r.cycle); // ascending; dedupe
+        photoCycles.set(e.photoId, list);
       }
     }
   }
-  return { photoCycle, cycles };
+  return { photoCycles, cycles };
 }
 
-export type EvidenceRole = 'COMPLETED_CYCLE' | 'CURRENT' | 'SUPERSEDED_ATTEMPT' | 'PENDING' | 'FAILED' | 'UNVERIFIED';
+/**
+ * Truthful provenance role (server-computed; the client never infers it):
+ *  - COMPLETED_CYCLE        — READY and frozen into ≥1 completed cycle's snapshot.
+ *  - CURRENT                — READY, the step's CURRENT attempt (job_steps.attempt),
+ *                             on a workable (in-progress/reopened) job, not yet
+ *                             snapshotted → reliable current-attempt evidence.
+ *  - SUPERSEDED_ATTEMPT     — READY but a strictly EARLIER attempt than the step's
+ *                             current one (redone), and not carried into a snapshot.
+ *  - HISTORICAL_UNCLASSIFIED— READY but provenance is insufficient to place it (a
+ *                             terminal/cancelled job or a legacy completed job with
+ *                             no snapshot). An honest "unclassified", NOT "current".
+ *  - PENDING / UNVERIFIED / FAILED — not (yet / ever) valid evidence.
+ */
+export type EvidenceRole = 'COMPLETED_CYCLE' | 'CURRENT' | 'SUPERSEDED_ATTEMPT' | 'HISTORICAL_UNCLASSIFIED' | 'PENDING' | 'FAILED' | 'UNVERIFIED';
 
 export interface JobPhotoItem {
   id: number;
@@ -71,16 +94,25 @@ export interface JobPhotoItem {
   attempt: number;
   status: string; // READY | PENDING | UNVERIFIED | FAILED
   failureReason: string | null;
-  /** Uploader = the actual performer of this upload (job_photos.created_by). */
+  /**
+   * The UPLOADER of THIS photo (job_photos.created_by) — an immutable per-photo
+   * fact. This is deliberately NOT the same stored fact as the step PERFORMER
+   * (job_steps.completed_by) or the assigned technician: the step performer is a
+   * current-state value that cannot be reliably attributed to a historical photo's
+   * attempt/cycle (snapshots do not freeze the performer per attempt), so we never
+   * guess it here. The client labels this as "Yuklagan" (uploaded by), not "performer".
+   */
   uploadedById: number;
   uploadedByName: string;
   createdAt: Date;
   readyAt: Date | null;
   sizeBytes: number;
   mimeType: string;
-  /** Completed cycle this photo was frozen as evidence for, or null (never inferred). */
+  /** The LATEST completed cycle this photo was frozen as evidence for, or null. Never inferred. */
   cycle: number | null;
-  /** Referenced by a completion snapshot (authoritative historical evidence). */
+  /** ALL completed cycles this photo is snapshot evidence for (a photo can span cycles). */
+  cycles: number[];
+  /** Referenced by ≥1 completion snapshot (authoritative historical evidence). */
   snapshotEvidence: boolean;
   /** Truthful role for labelling — server-computed so the client never infers it. */
   role: EvidenceRole;
@@ -117,14 +149,15 @@ export interface ListJobPhotosQuery {
  */
 export async function listJobPhotos(actor: AuthUser, jobId: number, query: ListJobPhotosQuery): Promise<JobPhotosResult> {
   const job = await loadScopedJob(actor, jobId);
-  const { photoCycle, cycles } = await snapshotEvidence(jobId);
+  const { photoCycles, cycles } = await snapshotEvidence(jobId);
   const workable = isWorkable(job);
 
   // If a cycle filter is set, confine to exactly the photoIds that cycle's snapshot
-  // froze — an honest, complete group for a completed cycle (no partial groups).
+  // froze — an honest, complete group for a completed cycle (no partial groups). A
+  // photo shared across cycles is included whenever the requested cycle is one of them.
   let cycleFilterIds: number[] | null = null;
   if (query.cycle != null) {
-    cycleFilterIds = [...photoCycle.entries()].filter(([, c]) => c === query.cycle).map(([id]) => id);
+    cycleFilterIds = [...photoCycles.entries()].filter(([, cs]) => cs.includes(query.cycle!)).map(([id]) => id);
     if (cycleFilterIds.length === 0) {
       return { job: jobHeader(job), cycles, photos: [], total: 0, page: query.page, limit: query.limit };
     }
@@ -155,19 +188,26 @@ export async function listJobPhotos(actor: AuthUser, jobId: number, query: ListJ
     );
 
   const photos: JobPhotoItem[] = rows.map((r: any) => {
-    const cycle = photoCycle.get(r.id) ?? null;
-    // The step's OWN current attempt is the live truth for current-vs-superseded
-    // (a completed cycle's evidence is identified by snapshot membership instead).
+    const cyclesFor = photoCycles.get(r.id) ?? []; // ascending; may span multiple cycles
+    const cycle = cyclesFor.length > 0 ? cyclesFor[cyclesFor.length - 1] : null; // latest
+    // The step's OWN current attempt (job_steps.attempt) is the live truth for
+    // current-vs-superseded; a completed cycle's evidence is identified by snapshot
+    // membership instead — never by "absent from a snapshot".
     const isCurrentAttempt = r.attempt === r.step_current_attempt;
     let role: EvidenceRole;
     if (r.status !== 'READY') {
       role = r.status as EvidenceRole; // PENDING | UNVERIFIED | FAILED — not valid evidence
-    } else if (cycle != null) {
-      role = 'COMPLETED_CYCLE'; // frozen into a completed cycle's snapshot
+    } else if (cyclesFor.length > 0) {
+      role = 'COMPLETED_CYCLE'; // frozen into ≥1 completed cycle's snapshot
     } else if (isCurrentAttempt && workable) {
-      role = 'CURRENT'; // working evidence of the in-progress/reopened cycle
+      role = 'CURRENT'; // reliable current-attempt evidence of the in-progress/reopened cycle
+    } else if (r.attempt < r.step_current_attempt) {
+      role = 'SUPERSEDED_ATTEMPT'; // a strictly earlier attempt, not carried into a snapshot
     } else {
-      role = 'SUPERSEDED_ATTEMPT'; // an earlier attempt not carried into a snapshot
+      // READY, but not snapshotted, not the current attempt of a workable job, and
+      // not a clearly-earlier attempt (e.g. a cancelled/terminal job's evidence, or a
+      // legacy completed job with no snapshot) — honest "unclassified", never "current".
+      role = 'HISTORICAL_UNCLASSIFIED';
     }
     return {
       id: r.id,
@@ -187,7 +227,8 @@ export async function listJobPhotos(actor: AuthUser, jobId: number, query: ListJ
       sizeBytes: r.size_bytes,
       mimeType: r.mime_type,
       cycle,
-      snapshotEvidence: cycle != null,
+      cycles: cyclesFor,
+      snapshotEvidence: cyclesFor.length > 0,
       role,
       downloadable: r.status === 'READY',
     };

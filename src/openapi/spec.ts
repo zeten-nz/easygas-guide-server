@@ -998,6 +998,38 @@ export const openapiSpec = {
         },
       },
     },
+    '/jobs/technicians': {
+      get: {
+        tags: ['Jobs'],
+        operationId: 'jobsResponsibleTechnicians',
+        summary: 'List responsible technicians for the job filter (Phase 11C)',
+        description:
+          'Requires permission: jobs.view. Distinct responsible technicians (jobs.assigned_technician_id) that have jobs in the caller’s branch scope — for the completed-job list filter. Branch-scoped, name-searchable, bounded. `id` resolves one technician (to show the selected name after reload). This is historical filtering access, not assignment eligibility, and is never the uploader/step-performer.',
+        parameters: [
+          { $ref: '#/components/parameters/SearchQuery' },
+          { name: 'id', in: 'query', description: 'Resolve a single technician by id.', schema: { type: 'integer' } },
+          { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 50, default: 20 } },
+        ],
+        responses: {
+          '200': {
+            description: 'Responsible technicians.',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    items: { type: 'array', items: { type: 'object', properties: { id: { type: 'integer' }, name: { type: 'string' } } } },
+                    total: { type: 'integer' },
+                  },
+                },
+              },
+            },
+          },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+        },
+      },
+    },
     '/jobs/{id}': {
       parameters: [{ $ref: '#/components/parameters/IdPath' }],
       get: {
@@ -1338,9 +1370,10 @@ export const openapiSpec = {
                           readyAt: { type: ['string', 'null'], format: 'date-time' },
                           sizeBytes: { type: 'integer' },
                           mimeType: { type: 'string' },
-                          cycle: { type: ['integer', 'null'] },
+                          cycle: { type: ['integer', 'null'], description: 'Latest completed cycle the photo is snapshot evidence for, or null.' },
+                          cycles: { type: 'array', items: { type: 'integer' }, description: 'ALL completed cycles the photo is snapshot evidence for (a photo can span cycles).' },
                           snapshotEvidence: { type: 'boolean' },
-                          role: { type: 'string', enum: ['COMPLETED_CYCLE', 'CURRENT', 'SUPERSEDED_ATTEMPT', 'PENDING', 'FAILED', 'UNVERIFIED'] },
+                          role: { type: 'string', enum: ['COMPLETED_CYCLE', 'CURRENT', 'SUPERSEDED_ATTEMPT', 'HISTORICAL_UNCLASSIFIED', 'PENDING', 'FAILED', 'UNVERIFIED'] },
                           downloadable: { type: 'boolean' },
                         },
                       },

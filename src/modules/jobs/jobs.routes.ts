@@ -50,6 +50,18 @@ jobsRouter.get('/mine', requirePermission('jobs.view'), async (req: Request, res
   res.json(await assignmentService.listMyJobs(req.user!, { page, pageSize }));
 });
 
+// Phase 11C — responsible technicians (with jobs in scope) for the completed-job
+// list filter. Bounded + searchable; branch-scoped; declared before '/:id'.
+const techQuery = z.object({
+  search: z.string().trim().max(100).optional(),
+  id: z.coerce.number().int().positive().optional(),
+  limit: z.coerce.number().int().min(1).max(50).optional(),
+});
+jobsRouter.get('/technicians', requirePermission('jobs.view'), validate({ query: techQuery }), async (req: Request, res: Response) => {
+  const q = req.query as unknown as { search?: string; id?: number; limit?: number };
+  res.json(await assignmentService.listResponsibleTechnicians(req.user!, q));
+});
+
 jobsRouter.get(
   '/:id',
   requirePermission('jobs.view'),

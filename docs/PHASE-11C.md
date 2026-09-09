@@ -50,6 +50,44 @@ A `cycle` filter returns exactly that cycle's snapshot evidence (a complete grou
 partial page). The listing performs **no N+1** (one snapshot read + one grouped
 join). Implementation: `src/modules/photos/job-evidence.service.ts`.
 
+### Photo provenance rules (verified against the real model)
+
+- **Photo → snapshot association:** a photoId is snapshot evidence iff it appears in
+  `completion_snapshots.content.summary.steps[].evidence[].photoId` — the READY photos
+  of each step's RELEVANT attempt (latest STOP decision, else 1) frozen at that cycle's
+  close.
+- **A photo CAN belong to more than one snapshot.** A step that is NOT re-done across a
+  reopen keeps the same relevant attempt, so its photoId is frozen into every later
+  cycle's snapshot. The service records **all** cycles per photo (`cycles: number[]`,
+  ascending; `cycle` = the latest) — it never overwrites. Regression: `job-evidence`
+  builds a completed → reopen → re-close (no redo) job and asserts `cycles = [1,2]`.
+- **"Joriy" (CURRENT) is reliable current-attempt evidence**, not merely "absent from a
+  snapshot": READY **and** `attempt === job_steps.attempt` (the step's live current
+  attempt) **and** the job is workable (IN_PROGRESS/REOPENED). A strictly earlier
+  attempt (`attempt < job_steps.attempt`) not carried into a snapshot is
+  **SUPERSEDED_ATTEMPT**.
+- **Insufficient provenance is labelled honestly, never "current":**
+  **HISTORICAL_UNCLASSIFIED** = READY but not snapshotted, not the current attempt of a
+  workable job, and not a clearly-earlier attempt — e.g. a **cancelled/terminal** job's
+  evidence or a **legacy completed** job with no snapshot. Regression: a cancelled job's
+  READY photo is HISTORICAL_UNCLASSIFIED (not CURRENT).
+- **Uploader vs performer are DISTINCT stored facts and are not conflated.** The per-
+  photo actor exposed is the **uploader** (`job_photos.created_by`, immutable — labelled
+  "Yuklagan"). The step **performer** (`job_steps.completed_by`) is a separate current-
+  state fact that snapshots do NOT freeze per attempt, so it cannot be reliably
+  attributed to a historical photo's attempt/cycle and is deliberately **not guessed**
+  per photo. Neither is the assigned technician (`jobs.assigned_technician_id`).
+- Original records are never mutated; the listing is read-only.
+
+### Responsible-technician filter (Phase 11C)
+
+`GET /jobs/technicians` (`jobs.view`, branch-scoped) — the distinct **responsible
+technicians that actually have jobs** in the caller's scope (source:
+`jobs.assigned_technician_id`), name-searchable and bounded (≤50); `?id=` resolves one
+(to show the selected name after reload). This is **historical filtering access**,
+deliberately NOT the job-scoped assignment-eligibility list (`listCandidates`), and is
+never the uploader/step-performer. Feeds the additive `technicianId` list filter.
+
 ### Downloads — the existing endpoint, no bypass
 
 Image bytes are still streamed by the pre-existing **READY-only** endpoint
