@@ -42,3 +42,12 @@ c74ad004797e5dd19be2ff57e8042e9b4923af53:tests/manual-recovery.e2e.ts:generic-ap
 # tests/manual-recovery.e2e.ts:50 above. Pinned to its exact historical commit + line
 # — not the file, the tests directory, or the rule.
 1e6f51af7583507763538ee58486722db125c5d6:tests/admin-workspace.e2e.ts:generic-api-key:38
+
+# FALSE POSITIVE (rule: generic-api-key) — tests/catalog.e2e.ts:28.
+# `const PASSWORD` — the catalogue e2e suite's fixed test-login password (Uzbek for
+# "test password"); the suite CREATES its own synthetic users in the isolated *_test
+# DB with it and logs in as them. Byte-identical to the already-allowlisted
+# tests/admin-workspace.e2e.ts:38 / tests/manual-recovery.e2e.ts:50 fixtures — not a
+# real credential, committed nowhere but tests, authenticates nothing outside the test
+# DB. Pinned to its exact historical commit + line — not the file, directory, or rule.
+1a731dcf0124c71f953a8b74c05ebd5b27689f7a:tests/catalog.e2e.ts:generic-api-key:28

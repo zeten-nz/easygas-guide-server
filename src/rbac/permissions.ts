@@ -52,6 +52,10 @@ export const PERMISSIONS = [
   'risk.matrix.approve', // create/activate/retire a risk-matrix version (safety governance)
   'jobs.assign', // assign/reassign the responsible technician
   'gps.override', // authorized override when GPS capture is unavailable
+
+  // Phase 11B — product & service catalogue + reference data
+  'catalog.view', // read the price base + reference data (office/management roles)
+  'catalog.manage', // ADMIN-only: create/edit/price/archive/delete catalogue + reference data
 ] as const;
 
 export type Permission = (typeof PERMISSIONS)[number];
@@ -91,7 +95,7 @@ export const ROLE_PERMISSIONS: Record<RoleCode, readonly Permission[]> = {
     'jobs.assign', // service master assigns/reassigns technicians
     'gps.override',
   ],
-  RAHBAR: ['jobs.view', 'five_why.create', 'users.view', 'users.create', 'customers.view', 'vehicles.view'],
+  RAHBAR: ['jobs.view', 'five_why.create', 'users.view', 'users.create', 'customers.view', 'vehicles.view', 'catalog.view'],
   SIFAT: [
     'jobs.view',
     'jobs.reopen',
@@ -103,6 +107,7 @@ export const ROLE_PERMISSIONS: Record<RoleCode, readonly Permission[]> = {
     'risks.override',
     'risk.matrix.approve',
     'gps.override',
+    'catalog.view',
   ],
   ADMIN: [
     'users.view',
@@ -127,6 +132,8 @@ export const ROLE_PERMISSIONS: Record<RoleCode, readonly Permission[]> = {
     'risk.matrix.approve',
     'jobs.assign',
     'gps.override',
+    'catalog.view',
+    'catalog.manage',
   ],
 };
 
