@@ -62,3 +62,8 @@ c74ad004797e5dd19be2ff57e8042e9b4923af53:tests/manual-recovery.e2e.ts:generic-ap
 # historical commit + line — not the file, the tests directory, or the rule.
 55983b7c4cacec9ca299ac60f09a5edc1bef70a4:tests/risk-policy-preview.e2e.ts:generic-api-key:28
 55983b7c4cacec9ca299ac60f09a5edc1bef70a4:tests/job-evidence.e2e.ts:generic-api-key:34
+# The same fixture literal briefly appeared in THIS allowlist's own comment when it
+# was first added (commit c0baf2a), so the history scan finds it there too. A later
+# commit removed the literal from the comment; this pins that one historical
+# occurrence. Same non-secret test fixture — not the file or rule, just this line.
+c0baf2a83e4efeabecb22d7791bd56389c232545:.gitleaksignore:generic-api-key:56
