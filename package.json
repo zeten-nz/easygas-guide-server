@@ -44,6 +44,8 @@
     "test:snapshot": "tsx tests/snapshot.e2e.ts",
     "test:gps": "tsx tests/gps.e2e.ts",
     "test:riskpolicy": "tsx tests/risk-policy.e2e.ts",
+    "test:riskpolicy-preview": "tsx tests/risk-policy-preview.e2e.ts",
+    "test:job-evidence": "tsx tests/job-evidence.e2e.ts",
     "test:observability": "tsx tests/observability.e2e.ts",
     "test:audit": "tsx tests/audit-integrity.e2e.ts",
     "test:redis-int": "tsx tests/redis-integration.e2e.ts",
@@ -54,7 +56,7 @@
     "openapi:gen": "tsx scripts/openapi-gen.ts",
     "openapi:check": "tsx scripts/validate-openapi.ts",
     "release:gate": "tsx scripts/release-gate.ts",
-    "test:all": "npm run test:auth && npm run test:rbac && npm run test:demo-seed && npm run test:cv && npm run test:jobs && npm run test:checklist && npm run test:stop && npm run test:rework && npm run test:completion && npm run test:quality && npm run test:hardening && npm run test:manual-recovery && npm run test:admin-workspace && npm run test:catalog && npm run test:storage && npm run test:evidence && npm run test:reconcile && npm run test:session && npm run test:ratelimit && npm run test:sms && npm run test:encryption && npm run test:runtime && npm run test:maintenance && npm run test:risk && npm run test:assignment && npm run test:snapshot && npm run test:gps && npm run test:riskpolicy && npm run test:observability && npm run test:audit"
+    "test:all": "npm run test:auth && npm run test:rbac && npm run test:demo-seed && npm run test:cv && npm run test:jobs && npm run test:checklist && npm run test:stop && npm run test:rework && npm run test:completion && npm run test:quality && npm run test:hardening && npm run test:manual-recovery && npm run test:admin-workspace && npm run test:catalog && npm run test:storage && npm run test:evidence && npm run test:reconcile && npm run test:session && npm run test:ratelimit && npm run test:sms && npm run test:encryption && npm run test:runtime && npm run test:maintenance && npm run test:risk && npm run test:assignment && npm run test:snapshot && npm run test:gps && npm run test:riskpolicy && npm run test:riskpolicy-preview && npm run test:job-evidence && npm run test:observability && npm run test:audit"
   },
   "keywords": [],
   "author": "",

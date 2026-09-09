@@ -18,6 +18,12 @@ export const listJobsQuerySchema = z.object({
   search: z.string().trim().max(100).optional(),
   status: z.enum(JOB_STATUSES).optional(),
   branchId: z.coerce.number().int().positive().optional(),
+  // Phase 11C completed-job review filters (additive, optional). `technicianId`
+  // filters by the current responsible technician; `dateFrom`/`dateTo` bound the
+  // job creation date (inclusive; date-only, interpreted at day boundaries).
+  technicianId: z.coerce.number().int().positive().optional(),
+  dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'YYYY-MM-DD').optional(),
+  dateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'YYYY-MM-DD').optional(),
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(25),
 });

@@ -936,6 +936,9 @@ export const openapiSpec = {
           { $ref: '#/components/parameters/SearchQuery' },
           { name: 'status', in: 'query', schema: { $ref: '#/components/schemas/JobStatus' } },
           { name: 'branchId', in: 'query', schema: { type: 'integer' } },
+          { name: 'technicianId', in: 'query', description: 'Filter by current responsible technician (Phase 11C).', schema: { type: 'integer' } },
+          { name: 'dateFrom', in: 'query', description: 'Inclusive job-creation date lower bound, YYYY-MM-DD (Phase 11C).', schema: { type: 'string', format: 'date' } },
+          { name: 'dateTo', in: 'query', description: 'Inclusive job-creation date upper bound, YYYY-MM-DD (Phase 11C).', schema: { type: 'string', format: 'date' } },
           { $ref: '#/components/parameters/PageQuery' },
           { $ref: '#/components/parameters/LimitQuery' },
         ],
@@ -1268,6 +1271,87 @@ export const openapiSpec = {
           '200': {
             description: 'Completion snapshot.',
             content: { 'application/json': { schema: { $ref: '#/components/schemas/CompletionSnapshot' } } },
+          },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+        },
+      },
+    },
+    '/jobs/{id}/photos': {
+      parameters: [{ $ref: '#/components/parameters/IdPath' }],
+      get: {
+        tags: ['Completion'],
+        operationId: 'jobsListPhotos',
+        summary: 'List a job’s photo evidence (Phase 11C)',
+        description:
+          'Requires permission: jobs.view (branch-scoped 404 for out-of-scope jobs). Job-level, cross-step, cross-cycle photo-evidence listing for completed-job review. Each row carries truthful provenance: verification status (READY/PENDING/UNVERIFIED/FAILED), attempt, uploader (the actual performer of that upload, distinct from the assigned technician), and a completed cycle derived ONLY from immutable completion snapshots (never inferred from the job’s current cycle) plus a server-computed evidence role. Only READY rows are downloadable, via the existing step file endpoint — this listing adds no download bypass. Bounded pagination.',
+        parameters: [
+          { name: 'cycle', in: 'query', description: 'Confine to a completed cycle’s snapshot evidence.', schema: { type: 'integer' } },
+          { name: 'jobStepId', in: 'query', schema: { type: 'integer' } },
+          { $ref: '#/components/parameters/PageQuery' },
+          { $ref: '#/components/parameters/LimitQuery' },
+        ],
+        responses: {
+          '200': {
+            description: 'Job photo-evidence list.',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    job: {
+                      type: 'object',
+                      properties: {
+                        id: { type: 'integer' },
+                        status: { type: 'string' },
+                        cycle: { type: 'integer' },
+                        assignedTechnicianId: { type: ['integer', 'null'] },
+                        assignmentStatus: { type: ['string', 'null'] },
+                      },
+                    },
+                    cycles: {
+                      type: 'array',
+                      items: {
+                        type: 'object',
+                        properties: { cycle: { type: 'integer' }, provenance: { type: 'string' }, createdAt: { type: 'string', format: 'date-time' } },
+                      },
+                    },
+                    photos: {
+                      type: 'array',
+                      items: {
+                        type: 'object',
+                        properties: {
+                          id: { type: 'integer' },
+                          jobStepId: { type: 'integer' },
+                          stepId: { type: 'integer' },
+                          stepName: { type: 'string' },
+                          stepOrder: { type: 'integer' },
+                          isStop: { type: 'boolean' },
+                          requiredPhotos: { type: 'integer' },
+                          attempt: { type: 'integer' },
+                          status: { type: 'string', enum: ['READY', 'PENDING', 'UNVERIFIED', 'FAILED'] },
+                          failureReason: { type: ['string', 'null'] },
+                          uploadedById: { type: 'integer' },
+                          uploadedByName: { type: 'string' },
+                          createdAt: { type: 'string', format: 'date-time' },
+                          readyAt: { type: ['string', 'null'], format: 'date-time' },
+                          sizeBytes: { type: 'integer' },
+                          mimeType: { type: 'string' },
+                          cycle: { type: ['integer', 'null'] },
+                          snapshotEvidence: { type: 'boolean' },
+                          role: { type: 'string', enum: ['COMPLETED_CYCLE', 'CURRENT', 'SUPERSEDED_ATTEMPT', 'PENDING', 'FAILED', 'UNVERIFIED'] },
+                          downloadable: { type: 'boolean' },
+                        },
+                      },
+                    },
+                    total: { type: 'integer' },
+                    page: { type: 'integer' },
+                    limit: { type: 'integer' },
+                  },
+                },
+              },
+            },
           },
           '401': { $ref: '#/components/responses/Unauthorized' },
           '403': { $ref: '#/components/responses/Forbidden' },
@@ -2372,7 +2456,7 @@ export const openapiSpec = {
                 type: 'object',
                 required: ['version', 'definition'],
                 properties: {
-                  version: { type: 'integer', minimum: 1, maximum: 32 },
+                  version: { type: 'string', minLength: 1, maxLength: 32 },
                   definition: { $ref: '#/components/schemas/MatrixDefinition' },
                 },
               },
@@ -2384,6 +2468,109 @@ export const openapiSpec = {
           '401': { $ref: '#/components/responses/Unauthorized' },
           '403': { $ref: '#/components/responses/Forbidden' },
           '409': { $ref: '#/components/responses/Conflict' },
+          '422': { $ref: '#/components/responses/ValidationError' },
+        },
+      },
+    },
+    '/risk-policy/versions/{version}': {
+      parameters: [{ $ref: '#/components/parameters/VersionPath' }],
+      get: {
+        tags: ['RiskPolicy'],
+        operationId: 'riskPolicyVersionDetail',
+        summary: 'Get one risk-matrix version in full',
+        description:
+          'Requires permission: risk.matrix.approve. Returns the immutable definition, the server-computed classified severity×likelihood grid (the client never re-computes levels), approver/rationale provenance, and the operations a blocking-level risk prevents. Read-only.',
+        responses: {
+          '200': {
+            description: 'Matrix version detail.',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    version: {
+                      type: 'object',
+                      properties: {
+                        version: { type: 'string' },
+                        status: { type: 'string', enum: ['DRAFT', 'ACTIVE', 'RETIRED'] },
+                        isActive: { type: 'boolean' },
+                        definition: { $ref: '#/components/schemas/MatrixDefinition' },
+                        cells: {
+                          type: 'array',
+                          items: {
+                            type: 'object',
+                            properties: {
+                              severity: { type: 'integer' },
+                              likelihood: { type: 'integer' },
+                              score: { type: 'integer' },
+                              level: { type: 'string', enum: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'] },
+                              blocking: { type: 'boolean' },
+                            },
+                          },
+                        },
+                        approvedBy: { type: ['integer', 'null'] },
+                        approvedByName: { type: ['string', 'null'] },
+                        approvedAt: { type: ['string', 'null'], format: 'date-time' },
+                        rationale: { type: ['string', 'null'] },
+                        createdAt: { type: 'string', format: 'date-time' },
+                        supersededBy: { type: ['integer', 'null'] },
+                        blockedOperations: { type: 'array', items: { type: 'string' } },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
+        },
+      },
+    },
+    '/risk-policy/versions/{version}/preview': {
+      parameters: [{ $ref: '#/components/parameters/VersionPath' }],
+      get: {
+        tags: ['RiskPolicy'],
+        operationId: 'riskPolicyVersionPreview',
+        summary: 'Illustrative classification against a matrix version',
+        description:
+          'Requires permission: risk.matrix.approve. Classifies a chosen severity/likelihood/source against the version’s definition using the SHARED authoritative evaluator. Read-only — creates NO risk event, activates nothing, and works for DRAFT/ACTIVE/RETIRED. It is an EXAMPLE, distinct from production assessRisk (which still requires an ACTIVE policy).',
+        parameters: [
+          { name: 'severity', in: 'query', required: true, schema: { type: 'integer', minimum: 1, maximum: 10 } },
+          { name: 'likelihood', in: 'query', required: true, schema: { type: 'integer', minimum: 1, maximum: 10 } },
+          { name: 'source', in: 'query', required: false, schema: { type: 'string', enum: ['MANUAL', 'STOP_REJECTED', 'MEASUREMENT_OUT_OF_RANGE', 'CHECKLIST_FLAG'] } },
+        ],
+        responses: {
+          '200': {
+            description: 'Illustrative classification.',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    preview: {
+                      type: 'object',
+                      properties: {
+                        version: { type: 'string' },
+                        status: { type: 'string' },
+                        severity: { type: 'integer' },
+                        likelihood: { type: 'integer' },
+                        source: { type: 'string' },
+                        score: { type: 'integer' },
+                        level: { type: 'string', enum: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'] },
+                        blocking: { type: 'boolean' },
+                        example: { type: 'boolean' },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' },
           '422': { $ref: '#/components/responses/ValidationError' },
         },
       },
@@ -3446,9 +3633,11 @@ export const openapiSpec = {
           version: { type: 'string' },
           status: { type: 'string', enum: ['DRAFT', 'ACTIVE', 'RETIRED'] },
           approvedBy: { type: ['integer', 'null'] },
+          approvedByName: { type: ['string', 'null'], description: 'Approver display name where the user still exists; null → use approvedBy as fallback.' },
           approvedAt: { type: ['string', 'null'], format: 'date-time' },
           rationale: { type: ['string', 'null'] },
           createdAt: { type: 'string', format: 'date-time' },
+          supersededBy: { type: ['integer', 'null'] },
           definition: { $ref: '#/components/schemas/MatrixDefinition' },
         },
       },

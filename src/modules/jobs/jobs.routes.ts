@@ -16,6 +16,7 @@ import { z } from 'zod';
 import * as service from './jobs.service';
 import * as completionService from './completion.service';
 import * as assignmentService from './assignment.service';
+import * as jobEvidence from '../photos/job-evidence.service';
 import { ApiError } from '../../utils/errors';
 import type { ListJobsQuery } from './jobs.validators';
 
@@ -174,6 +175,22 @@ jobsRouter.get('/:id/completion-snapshot', requirePermission('jobs.view'), valid
   const snapshot = await completionService.getCompletionSnapshotFor(jobId, cycle);
   if (!snapshot) throw new ApiError(404, 'NOT_FOUND', 'Snapshot topilmadi');
   res.json(snapshot);
+});
+
+// Phase 11C: job-level photo-evidence listing for completed-job review. Truthful
+// per-photo provenance (cycle derived only from snapshots, status, attempt,
+// uploader-vs-assigned), bounded pagination. Downloads still go through the
+// existing READY-only step file endpoint — this adds no bypass. (jobs.view;
+// branch-scoped 404 inside the service.)
+const jobPhotosQuery = z.object({
+  page: z.coerce.number().int().positive().default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+  cycle: z.coerce.number().int().positive().optional(),
+  jobStepId: z.coerce.number().int().positive().optional(),
+});
+jobsRouter.get('/:id/photos', requirePermission('jobs.view'), validate({ params: jobIdParamsSchema, query: jobPhotosQuery }), async (req: Request, res: Response) => {
+  const q = req.query as unknown as { page: number; limit: number; cycle?: number; jobStepId?: number };
+  res.json(await jobEvidence.listJobPhotos(req.user!, Number(req.params.id), q));
 });
 
 jobsRouter.get(
