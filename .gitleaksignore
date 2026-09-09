@@ -53,8 +53,8 @@ c74ad004797e5dd19be2ff57e8042e9b4923af53:tests/manual-recovery.e2e.ts:generic-ap
 1a731dcf0124c71f953a8b74c05ebd5b27689f7a:tests/catalog.e2e.ts:generic-api-key:28
 
 # FALSE POSITIVES (rule: generic-api-key) — Phase 11C evidence/risk-policy e2e suites.
-# `const PASSWORD = 'Sinov-parol-123'` (Uzbek: literally "test password") — the fixed
-# test-login password of the two new 11C full-stack suites. Each suite CREATES its own
+# `const PASSWORD` (its value is Uzbek for "test password") — the fixed test-login
+# password of the two new 11C full-stack suites. Each suite CREATES its own
 # synthetic users in the isolated *_test DB and logs in as them; the literal is not a
 # real credential, is committed nowhere but tests, and authenticates nothing outside
 # the test DB. Byte-identical to the already-allowlisted admin-workspace.e2e.ts:38 /
