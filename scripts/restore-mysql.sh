@@ -66,6 +66,24 @@ if [[ "$RESTORE_TARGET_DB" != *_test ]]; then
   echo "WARNING: restoring into a NON-test database '$RESTORE_TARGET_DB' (FORCE_PROD_RESTORE=yes)."
 fi
 
+# --- HAZARD GUARD (fail closed): reject a dump that carries its OWN database ---
+# context. `mysqldump --databases`/`--all-databases` embed `CREATE DATABASE` and
+# `USE <db>;`. Piped into `mysql <target>`, those `USE` lines SILENTLY redirect
+# every statement to the dump's database — ignoring RESTORE_TARGET_DB and thereby
+# bypassing BOTH the `_test` and FORCE_PROD_RESTORE guards above (a dump of a
+# production DB would overwrite production even with RESTORE_TARGET_DB=..._test).
+# scripts/backup-mysql.sh dumps a SINGLE database positionally and emits NO such
+# lines, so its dumps pass. Anything else is refused — re-dump single-DB, or strip
+# the CREATE DATABASE / USE lines first.
+# grep -c (not -q): reads the WHOLE stream, so gzip never gets SIGPIPE — which under
+# `set -o pipefail` would otherwise make this pipeline exit non-zero on a match and
+# silently skip the guard. `|| true` absorbs grep's exit 1 on a zero count.
+HAZARD_HITS="$(gzip -dc "$DUMP_FILE" 2>/dev/null \
+  | grep -ciE '^[[:space:]]*(CREATE[[:space:]]+DATABASE|USE[[:space:]]+`?[A-Za-z0-9_]+`?[[:space:]]*;)' || true)"
+if [ "${HAZARD_HITS:-0}" != "0" ]; then
+  die "Dump embeds CREATE DATABASE / USE ($HAZARD_HITS line(s)) and would target its OWN database, ignoring RESTORE_TARGET_DB='$RESTORE_TARGET_DB' and bypassing the safety guards. Re-create it with scripts/backup-mysql.sh (single-DB, no USE) or strip those lines. Refusing."
+fi
+
 # --- Secret handling: temp defaults-extra-file (0600), removed on exit -------
 DEFAULTS_FILE="$(mktemp "${TMPDIR:-/tmp}/easygas-restore-XXXXXX.cnf")"
 cleanup() { rm -f "$DEFAULTS_FILE"; }
@@ -91,8 +109,9 @@ if [ "$APPLY" != "1" ]; then
 DRY-RUN only. Nothing was changed. To actually restore, re-run with APPLY=1.
 It WOULD:
   1. CREATE DATABASE IF NOT EXISTS \`$RESTORE_TARGET_DB\`
-  2. Pipe: gzip -dc "$DUMP_FILE" | mysql \`$RESTORE_TARGET_DB\`
-     (this overwrites objects contained in the dump).
+  2. Pipe: gzip -dc "$DUMP_FILE" | mysql --one-database \`$RESTORE_TARGET_DB\`
+     (this overwrites objects contained in the dump; --one-database confines
+      writes to the named DB as defense-in-depth behind the hazard guard above).
 EOF
   exit 0
 fi
@@ -104,7 +123,7 @@ mysql --defaults-extra-file="$DEFAULTS_FILE" \
 
 echo "Restoring (this overwrites data)..."
 set +e
-gzip -dc "$DUMP_FILE" | mysql --defaults-extra-file="$DEFAULTS_FILE" "$RESTORE_TARGET_DB"
+gzip -dc "$DUMP_FILE" | mysql --defaults-extra-file="$DEFAULTS_FILE" --one-database "$RESTORE_TARGET_DB"
 STATUS=${PIPESTATUS[1]}
 set -e
 [ "$STATUS" -eq 0 ] || die "Restore failed (mysql exit $STATUS). The target DB may be in a partial state — investigate before use."
