@@ -57,6 +57,10 @@ APPLY="${APPLY:-0}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
+# Verification downloads bytes into a private temp dir; always clean it up.
+_VTMP=""
+trap 'rm -rf "${_VTMP:-}" 2>/dev/null || true' EXIT
+
 # Resolve FROM/TO by direction.
 case "$DIRECTION" in
   backup)
@@ -106,30 +110,42 @@ case "$EVIDENCE_TOOL" in
 esac
 echo "Evidence $DIRECTION step complete ($MODE)."
 
-# --- Retrieval verification (restore + apply): representative object hashes --
-# Proves the retrieved copy is READABLE and byte-identical, not just "present".
+# --- Retrieval verification (restore + apply): REAL bytes + SHA-256 ---------
+# Downloads the ACTUAL bytes of every object from BOTH the off-site source and the
+# restored copy and compares SHA-256 (never ETag — ETag is not a content hash for
+# multipart objects and is provider-specific). Any missing or mismatched object
+# makes this FAIL with a non-zero exit; "VERIFIED" is printed only after every
+# object passes. Set EVIDENCE_VERIFY=0 to skip (not recommended).
 if [ "$DIRECTION" = "restore" ] && [ "$APPLY" = "1" ] && [ "${EVIDENCE_VERIFY:-1}" = "1" ]; then
-  echo "Verifying retrieved evidence (representative objects)..."
+  echo "Verifying restored evidence against the off-site source (retrieved bytes + SHA-256)..."
   case "$EVIDENCE_TOOL" in
     aws)
-      # Compare the source object's ETag/size against the retrieved local copy for
-      # a few keys. (S3 ETag is an md5 only for single-part objects; for a strong
-      # check, retrieved-file sha256 is compared to the DB's recorded sha256 in the
-      # app-level reconcile — see docs/BACKUP-RESTORE-10F.md.)
-      SAMPLE="$(aws s3 ls "$FROM" --recursive | awk 'NR<=3{print $4}')"
-      for key in $SAMPLE; do
-        [ -n "$key" ] || continue
-        base="$(basename "$key")"
-        if [ -f "${TO%/}/$base" ] || [ -f "${TO%/}/$key" ]; then
-          echo "  retrieved: $key"
-        else
-          echo "  WARNING: expected retrieved object not found locally for key '$key'" >&2
-        fi
-      done ;;
+      command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required for verification but was not found."
+      _VTMP="$(mktemp -d "${TMPDIR:-/tmp}/eg-evverify-XXXXXX")"
+      # Empty temp dirs → both syncs download the real object bytes (no skipping).
+      aws s3 sync "$FROM" "$_VTMP/src" --only-show-errors || die "Verification failed: could not retrieve off-site source bytes."
+      aws s3 sync "$TO"   "$_VTMP/dst" --only-show-errors || die "Verification failed: could not retrieve restored bytes."
+      fails=0; checked=0
+      while IFS= read -r -d '' f; do
+        rel="${f#"$_VTMP"/src/}"; checked=$((checked + 1))
+        if [ ! -f "$_VTMP/dst/$rel" ]; then echo "  MISSING in restore: $rel" >&2; fails=$((fails + 1)); continue; fi
+        ha="$(sha256sum "$f" | awk '{print $1}')"
+        hb="$(sha256sum "$_VTMP/dst/$rel" | awk '{print $1}')"
+        [ "$ha" = "$hb" ] || { echo "  HASH MISMATCH: $rel ($ha != $hb)" >&2; fails=$((fails + 1)); }
+      done < <(find "$_VTMP/src" -type f -print0)
+      [ "$checked" -gt 0 ] || die "Verification failed: no objects found at the off-site source '$FROM'."
+      [ "$fails" -eq 0 ] || die "Verification FAILED: $fails of $checked object(s) missing or hash-mismatched."
+      echo "Evidence restore VERIFIED: $checked object(s) retrieved, all SHA-256 match."
+      ;;
     rclone)
-      echo "  run 'rclone check \"$FROM\" \"$TO\"' to verify hashes match (rclone compares checksums natively)." ;;
+      # `rclone check --download` retrieves BOTH sides' bytes and compares them;
+      # it exits non-zero if any object is missing or differs. This actually RUNS
+      # the verification (it is not a printed suggestion).
+      rclone check "$FROM" "$TO" --download || die "Verification FAILED: rclone check --download found missing/differing objects."
+      echo "Evidence restore VERIFIED: rclone check --download reported no differences."
+      ;;
   esac
-  echo "Also run the APP-LEVEL reconcile (dry-run) to confirm every DB reference resolves to a retrievable object with the recorded sha256:  npm run reconcile"
+  echo "For DB-reference integrity, also run the app-level reconcile (dry-run): npm run reconcile"
 fi
 
 # ---------------------------------------------------------------------------
