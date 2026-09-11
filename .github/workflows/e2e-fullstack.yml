@@ -102,9 +102,11 @@ jobs:
           # Client is the DEPENDENCY dimension here; default main.
           CLIENT_REF="${IN_CLIENT_REF:-main}"
           if [ "$CLIENT_REF" = "main" ]; then MODE="main-compat"; else MODE="coordinated"; fi
-          printf 'server_ref=%s\n' "$SERVER_REF" >> "$GITHUB_OUTPUT"
-          printf 'client_ref=%s\n' "$CLIENT_REF" >> "$GITHUB_OUTPUT"
-          printf 'mode=%s\n' "$MODE" >> "$GITHUB_OUTPUT"
+          {
+            printf 'server_ref=%s\n' "$SERVER_REF"
+            printf 'client_ref=%s\n' "$CLIENT_REF"
+            printf 'mode=%s\n' "$MODE"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Checkout server (this repo)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
