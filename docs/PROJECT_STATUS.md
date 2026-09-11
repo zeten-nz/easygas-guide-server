@@ -382,23 +382,29 @@ Full detail: `PHASE-10F.md` and the topic docs listed at the bottom.
   PR/force-push/environment rules.
 
 ### Release gate — IMPLEMENTED
-- `npm run release:gate` (`--json` + human): LIVE blockers (migrations, ACTIVE+approved risk matrix,
-  SMS ready, audit chain clean, readiness, prod config) + ATTESTED blockers
-  (`release-attestation.json`; template `release-attestation.example.json`). Exit 0=READY, 3=BLOCKED,
+- `npm run release:gate` (`--json` + human): LIVE blockers (migrations [bookkeeping only, not full
+  schema verification], ACTIVE+approved risk matrix, SMS ready **only when SMS enabled**, audit-chain
+  **consistency** [not completeness], readiness, prod config) + ATTESTED blockers
+  (`release-attestation.json`; template `release-attestation.example.json`) plus an echoed traceability
+  `release` binding (client/server SHAs + CI/e2e/restore-drill refs — never auto-filled). Verification
+  is preflight + post-start smoke on the PRIVATE port before public cutover. Exit 0=READY, 3=BLOCKED,
   1=error. **No flag bypasses a safety blocker.**
 
 ### Operations — IMPLEMENTED (artifacts) + MANUALLY-VERIFIED (procedures documented)
 - Docs: `OPERATIONS-RUNBOOK-10F.md`, `INCIDENT-RESPONSE-10F.md`, `KEY-ROTATION-10F.md`,
   `BACKUP-RESTORE-10F.md`.
-- Artifacts (reference, not recreated): `deploy/{ecosystem.config.cjs (split easygas-api +
-  easygas-sms-worker, kill_timeout 30s > 25s shutdown), nginx.example.conf, .env.production.example,
-  crontab.example}`; `scripts/{backup-mysql.sh, backup-evidence.sh, restore-mysql.sh}`;
+- Artifacts (reference, not recreated): `deploy/{ecosystem.config.cjs (default SINGLE easygas-api
+  process; optional opt-in easygas-sms-worker on a private port via EG_ENABLE_SMS_WORKER=1;
+  kill_timeout 30s > 25s shutdown), nginx.example.conf (same-origin baseline), .env.production.example,
+  crontab.example}`; `scripts/{backup-mysql.sh, backup-evidence.sh, restore-mysql.sh, with-env.mjs}`;
   `loadtest/{smoke.js, README.md}`.
 
 ### KNOWN PRODUCTION BLOCKERS — PRODUCTION-BLOCKED (enforced by the live gate)
-1. **Eskiz SMS provider is a fail-closed STUB** (no verified official spec) — OTP delivery not
-   functional; production cannot be declared ready.
-2. **Risk matrix v1 is DRAFT** until an EasyGas safety specialist approves it.
+1. **Risk matrix v1 is DRAFT** until an EasyGas safety specialist approves it.
+2. **SMS (SUPERSEDED — no longer a default blocker):** manual admin password recovery replaced OTP,
+   so SMS is disabled by default (`SMS_PROVIDER` unset) and the gate's SMS check does not block. It is
+   a blocker again only if SMS is explicitly enabled (`SMS_PROVIDER=eskiz`), where the Eskiz adapter
+   is still a fail-closed stub. See "Manual employee password recovery" above.
 
 ### Test summary (executed this phase)
 - Server `test:all`: **27 suites, 0 failed** (incl. observability 5, audit **11** — per-field tamper

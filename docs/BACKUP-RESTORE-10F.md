@@ -23,10 +23,14 @@ The system has **two** stateful stores that reference each other:
 
 The DB rows point at the evidence objects. Restoring one without the other
 yields **dangling references** (DB row → missing object) or **orphans** (object
-→ no row). **Always take, and restore, the DB backup and the evidence backup as
-a consistent pair**, scheduled close together (see `deploy/crontab.example`) and
-treated as one recovery point. After a restore, `npm run reconcile` (dry-run)
-tells you whether the pair is coherent.
+→ no row). The DB dump and the evidence copy run minutes apart, so they are **NOT
+a transactionally consistent pair**. Safe recovery instead relies on **object
+versioning** on both stores (so no referenced version is lost) plus a
+**reconcile** at the chosen recovery point: restore the DB, ensure the evidence
+versions for that point are present, then run `npm run reconcile` (dry-run) to
+confirm the two are coherent and repair any dangling reference. Schedule the two
+backups close together (see `deploy/crontab.example`), but treat versioning +
+reconcile — not timing — as what makes a recovery point.
 
 **Redis is NOT a primary store** and does not need a data backup — see §4.
 
@@ -34,11 +38,20 @@ tells you whether the pair is coherent.
 
 ## 1. MySQL backup
 
-Script: `scripts/backup-mysql.sh` (POSIX bash). It runs
-`mysqldump --single-transaction --routines --triggers --set-gtid-purged=OFF`,
-gzips to `BACKUP_DIR/<DB_NAME>-YYYYmmdd-HHMMSS.sql.gz`, refuses to run without
-`DB_NAME`, never prints the password (temp `--defaults-extra-file`, 0600,
-removed by a trap), and prints only the output filename + size.
+Script: `scripts/backup-mysql.sh` (POSIX bash). It runs a **positional
+single-database** dump (`mysqldump --single-transaction --routines --triggers
+--events --no-tablespaces --set-gtid-purged=OFF <DB_NAME>` — never
+`--databases`/`--all-databases`), gzips to
+`BACKUP_DIR/<DB_NAME>-YYYYmmdd-HHMMSSZ.sql.gz`, and hardens the artifact end to
+end: it checks **both** pipeline stages (mysqldump AND gzip, so a compressor or
+disk-full failure never reports success), writes to a private temp file and only
+then **atomically publishes** it, verifies gzip integrity + the `Dump completed
+on` marker before publishing, **refuses to overwrite** an existing file,
+**self-locks** (`flock`) so two runs never overlap, and records a `.sha256`
+sidecar + a `.manifest` (routines/triggers/events flags). It refuses to run
+without `DB_NAME`, writes everything mode 600, never prints the password (temp
+`--defaults-extra-file`, 0600, removed by a trap), and prints the final filename,
+size and sha256.
 
 ```bash
 DB_USER=<user> DB_PASSWORD=<pw> DB_NAME=easygas \
@@ -65,9 +78,14 @@ against the RPO target in §7.
 ## 2. Evidence (S3/MinIO) backup & versioning
 
 Script: `scripts/backup-evidence.sh`. Dry-run by default; `APPLY=1` performs the
-sync. Requires `EVIDENCE_SRC` and `EVIDENCE_DEST`; uses the AWS credential chain
-/ rclone remote (**never** embeds credentials); does **not** delete from the
-source.
+copy. Choose **one tool explicitly** — `EVIDENCE_TOOL=aws` (default; `s3://`
+URIs) or `EVIDENCE_TOOL=rclone` (`remote:bucket` syntax). aws-cli and rclone do
+**not** share remote syntax, so the script refuses an `s3://` path under rclone
+(and a `remote:` path under aws) — never feed `s3://` to rclone.
+`DIRECTION=backup` (default) copies `EVIDENCE_SRC` → `EVIDENCE_DEST`;
+`DIRECTION=restore` retrieves `EVIDENCE_DEST` → `EVIDENCE_RESTORE_TO` and verifies
+the retrieved copy. It uses the AWS credential chain / rclone remote (**never**
+embeds credentials) and does **not** delete from the source.
 
 ```bash
 # dry-run
@@ -140,6 +158,18 @@ Script: `scripts/restore-mysql.sh`. **Defaults to dry-run.** To apply it needs
 a dump argument, `RESTORE_TARGET_DB`, `CONFIRM_RESTORE=yes`, `APPLY=1`, and —
 for a non-`_test` (production-shaped) target — `FORCE_PROD_RESTORE=yes` as well.
 
+It is safe-by-construction:
+- **Validate-before-mutate:** the whole compressed artifact is gzip-integrity-checked
+  and decompressed to a validated temp file **first** — that temp is the exact file
+  `mysql` then consumes, so the bytes validated are the bytes restored. If validation
+  fails, no database is touched.
+- **Provenance:** if a `<file>.sha256` sidecar is present it is verified (mismatch →
+  refuse). There is deliberately **no flag that bypasses integrity validation.**
+- **Target-id guard:** `RESTORE_TARGET_DB` must be a plain `[A-Za-z0-9_]` identifier,
+  validated **before** it is ever interpolated into SQL.
+- **Honest failure:** if `mysql` errors mid-import, the script warns the target may be
+  in a **PARTIAL/inconsistent** state — do not use it until re-restored from a good artifact.
+
 > **Dump-context hazard (guarded).** A dump made with `mysqldump --databases`
 > or `--all-databases` embeds `CREATE DATABASE` + `USE <db>;`. Piped into
 > `mysql <target>`, those `USE` lines silently redirect every statement to the
@@ -148,16 +178,16 @@ for a non-`_test` (production-shaped) target — `FORCE_PROD_RESTORE=yes` as wel
 > `easygas` even with `RESTORE_TARGET_DB=easygas_restore_test`). `backup-mysql.sh`
 > dumps a **single database positionally** and emits no such lines.
 >
-> The restore script now runs a **fail-closed heuristic scan** that refuses any
-> dump whose lines begin with `CREATE DATABASE`/`USE` — including the
-> `/*!NNNNN … */` executable-comment wrapper and leading-whitespace/case variants,
-> i.e. every form the mysqldump family emits — and additionally passes
-> `mysql --one-database`. **This scan is defense-in-depth, not a comprehensive SQL
-> parser or a security boundary** (`--one-database` is a rudimentary client filter;
-> a hand-crafted dump could still evade a text scan, e.g. a `USE` placed mid-line).
-> The real guarantee is: **only ever restore dumps produced by `backup-mysql.sh`**
-> (single-DB, positional). Never restore a `--databases` dump through this path;
-> re-dump single-DB or strip the `CREATE DATABASE`/`USE` lines first.
+> The restore script runs a **fail-closed heuristic scan** that refuses any dump
+> with line-anchored `CREATE DATABASE`/`USE` — including the `/*!NNNNN … */`
+> executable-comment wrapper and leading-whitespace/case variants, i.e. every form
+> the mysqldump family emits. **This scan is defense-in-depth — NOT a comprehensive
+> SQL parser and NOT a security boundary**: a hand-crafted dump could still evade a
+> line-anchored text scan (e.g. a `USE` placed after a `;` mid-line). The real
+> guarantees are (a) **only ever restore dumps produced by `backup-mysql.sh`**
+> (single-DB, positional, with no embedded `CREATE DATABASE`/`USE`) and (b) an
+> **isolated, disposable target** (see §8). Never restore a `--databases` dump
+> through this path; re-dump single-DB or strip the `CREATE DATABASE`/`USE` lines first.
 
 ```bash
 # 1) DRY-RUN (prints the plan, changes nothing)
@@ -176,16 +206,18 @@ evidence objects for that recovery point are present (from the versioned off-sit
 bucket). Then run the verification checklist.
 
 ### Post-restore verification (the script prints this too)
-1. **Migrations:** `npm run migrate:status` (and `npm run migrate` if behind).
-2. **Audit chain:** `npm run audit:verify` — the tamper-evident hash chain must
-   verify (added by another Phase 10F contributor; confirm the exact script
-   name). A failure means tampering/corruption — do not put the DB into service.
+1. **Migrations:** `npm run migrate:status` (and `npm run migrate` if behind) —
+   this is **bookkeeping only**, not a full schema verification.
+2. **Audit chain:** `npm run audit:verify` — verifies the **consistency** of the
+   tamper-evident hash-chain links. A failure means tampering/corruption (do not
+   put the DB into service). It is **not** proof that no historical rows were lost;
+   completeness is a separate question.
 3. **Evidence reconciliation:** `npm run reconcile` (dry-run) — confirms DB
-   references and objects match (the pair is coherent). Investigate before any
-   `--apply`.
+   references and objects match (the recovery point is coherent). Investigate
+   before any `--apply`.
 4. **Completion snapshots readable / active risk policy:** `npm run risk-policy`
    and spot-check a completion snapshot read.
-5. **Readiness:** start the app against the restored DB and
+5. **Readiness:** start the app against the restored DB (on the PRIVATE port) and
    `curl -fsS http://127.0.0.1:4000/api/v1/ready` → expect HTTP 200
    `{"status":"ready"}` (503 = a dependency is down).
 
@@ -208,17 +240,23 @@ leadership against cost and risk, then this table filled in and the schedules in
 | Restore-drill cadence | How often the drill (§8) is run | **TBD** |
 
 > With the example nightly schedule, RPO is up to ~24h and RTO is however long a
-> full DB import + evidence availability + verification takes on your hardware —
-> **measure it during the drill and record it above.**
+> full DB import + evidence availability + verification takes on your hardware.
+> **Measure it during the drill and record it above** — but a measured drill
+> duration is an observation, **not** a promised RTO (the RTO target is a business
+> decision, set independently of any single measurement).
 
 ---
 
-## 8. Disposable LOCAL / TEST restore drill
+## 8. Disposable restore drill
 
-Practice restores regularly against a **throwaway `*_test` database** so the
-`_test` fail-closed guard (Phase 10A, `tests/helpers/test-env.ts`) and the
-restore script's own non-`_test` guard both apply — you cannot accidentally
-overwrite production.
+Practice restores regularly. **Run the drill against a SEPARATE, disposable MySQL
+instance** with its own restricted credentials and no network path to
+development/production. The `_test` suffix on `RESTORE_TARGET_DB` is only a
+**fat-finger guard-rail** (it lets the restore proceed without
+`FORCE_PROD_RESTORE`) — it is **NOT** an isolation boundary and does **not**
+protect a shared privileged server where a mistake could still reach real data.
+Real isolation comes from the disposable instance, not the name; point
+`DB_HOST`/credentials at that instance.
 
 ```bash
 # Restore last night's dump into a disposable *_test DB (no force flag needed
