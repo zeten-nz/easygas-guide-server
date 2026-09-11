@@ -3,16 +3,19 @@
 The human-readable release checklist. It mirrors the automated release gate
 (`npm run release:gate`). **There is no flag that bypasses a safety blocker.**
 
-> ## KNOWN PRODUCTION BLOCKERS (currently UNRESOLVED)
+> ## KNOWN PRODUCTION BLOCKER (currently UNRESOLVED)
 >
-> The system **cannot** be declared production-ready while either of these stands. Both are
-> enforced by the **live** release gate:
+> The system **cannot** be declared production-ready while this stands. It is enforced by the
+> **live** release gate:
 >
-> 1. **Eskiz SMS provider is a fail-closed STUB.** There is no verified official spec, so the real
->    adapter is not implemented; the stub fails closed (startup, readiness, and the worker all
->    refuse). OTP delivery is not functional. → gate check `smsCapability ready` **BLOCKS**.
-> 2. **Risk matrix v1 is DRAFT.** It remains a draft until an **EasyGas safety specialist** reviews
+> 1. **Risk matrix v1 is DRAFT.** It remains a draft until an **EasyGas safety specialist** reviews
 >    and approves it. → gate check `ACTIVE + approved risk matrix` **BLOCKS**.
+>
+> **SMS is not a blocker in the normal configuration.** EasyGas uses manual admin password recovery
+> and SMS is **disabled** (`SMS_PROVIDER` unset), so the gate's `sms_provider_functional` check does
+> **not** block. It becomes a blocker **only if you enable SMS** (`SMS_PROVIDER=eskiz`) — the Eskiz
+> adapter is still a fail-closed STUB pending a verified official spec, so leave SMS disabled
+> unless/until that adapter lands.
 
 ---
 
@@ -35,10 +38,10 @@ safety blocker.**
 
 | Check | Passes when |
 |---|---|
-| Migrations applied | All migrations are applied to the connected DB |
+| Migrations applied | No pending migrations on the connected DB — **bookkeeping only**, NOT a full schema verification (down/up is the attested `db_migrations_verified` in CI) |
 | Risk matrix | Exactly one **ACTIVE + approved** matrix exists |
-| SMS provider | `smsCapability` is **ready** (a functional provider) — ❌ blocked today (stub) |
-| Audit chain | `audit:verify` reports a clean chain |
+| SMS provider | Passes by default — SMS is **disabled** (manual admin recovery). Blocks **only when SMS is enabled** (`SMS_PROVIDER=eskiz`), where the fail-closed stub is not ready |
+| Audit chain | `audit:verify` reports a **consistent** chain (tamper-evidence links verify) — NOT proof that no historical rows were lost (completeness is separate) |
 | Readiness | `/ready` reports OK |
 | Production config | Production configuration validates |
 
@@ -75,6 +78,13 @@ Template shape (`release-attestation.example.json`):
 
 ```json
 {
+  "release": {
+    "client_sha": "",
+    "server_sha": "",
+    "ci_run": "",
+    "e2e_run": "",
+    "restore_drill": ""
+  },
   "attestations": {
     "ci_all_green":                        { "attested": false, "by": "", "at": "" },
     "db_migrations_verified":              { "attested": false, "by": "", "at": "" },
@@ -90,6 +100,9 @@ Template shape (`release-attestation.example.json`):
 }
 ```
 
+> The `release` block is a traceability **binding** — the exact `client_sha` / `server_sha` and the
+> `ci_run` / `e2e_run` / `restore_drill` references this release covers. The gate **echoes** it (it
+> does not verify a CI/attestation service) and warns if it is unset; it is **never** auto-filled.
 > Attesting an item you did not actually verify defeats the purpose. Each attestation is an
 > operational confirmation on the record.
 
@@ -103,7 +116,7 @@ Work top-to-bottom; every item maps to a gate check or an attestation.
 - [ ] Cross-repo full-stack E2E run and passing → `fullstack_playwright_passed`
 - [ ] Migrations applied on target DB; down/up verified → LIVE *migrations* + `db_migrations_verified`
 - [ ] **Risk matrix v1 approved by an EasyGas safety specialist and ACTIVE** → LIVE *risk matrix* **(BLOCKER)**
-- [ ] **Real Eskiz adapter implemented against a verified spec; `smsCapability` ready** → LIVE *SMS* **(BLOCKER)**
+- [ ] SMS: **disabled by default (no action)**. *Only if enabling SMS* (`SMS_PROVIDER=eskiz`): real Eskiz adapter implemented against a verified spec + `smsCapability` ready → LIVE *SMS* **(BLOCKER while enabled)**
 - [ ] `npm run audit:verify` clean; off-server checkpoint anchored → LIVE *audit chain*
 - [ ] `/ready` OK against the target system → LIVE *readiness*
 - [ ] Production config validates (`METRICS_TOKEN` set if metrics enabled, etc.) → LIVE *prod config*
@@ -125,5 +138,10 @@ npm run release:gate
 # exit 0 → READY   |   exit 3 → BLOCKED (read the report)   |   exit 1 → error
 ```
 
-Until both KNOWN BLOCKERS are resolved, the gate will exit **3 (BLOCKED)** — as intended. There is
-no escape flag.
+The gate's verification model is **preflight** (config / migrations / this gate) **+ a post-start
+smoke on the PRIVATE port before public cutover** — it never requires opening public traffic to
+verify.
+
+Until the KNOWN BLOCKER (the DRAFT risk matrix) is resolved and the attested inputs are recorded,
+the gate will exit **3 (BLOCKED)** — as intended. There is no escape flag. (Enabling SMS re-adds the
+functional-SMS-provider blocker until the real Eskiz adapter lands.)

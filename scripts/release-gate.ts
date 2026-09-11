@@ -54,9 +54,9 @@ async function main(): Promise<void> {
   try {
     const pending = await db.migrate.list();
     const pendingCount = Array.isArray(pending?.[1]) ? pending[1].length : 0;
-    checks.push({ id: 'migrations_applied', description: 'No pending DB migrations', kind: 'live', blocker: true, status: pendingCount === 0 ? 'pass' : 'fail', detail: `${pendingCount} pending` });
+    checks.push({ id: 'migrations_applied', description: 'No pending DB migrations (migration BOOKKEEPING only — NOT a full schema verification; use db_migrations_verified for down/up in CI)', kind: 'live', blocker: true, status: pendingCount === 0 ? 'pass' : 'fail', detail: `${pendingCount} pending` });
   } catch (e) {
-    checks.push({ id: 'migrations_applied', description: 'No pending DB migrations', kind: 'live', blocker: true, status: 'unknown', detail: String((e as Error).message) });
+    checks.push({ id: 'migrations_applied', description: 'No pending DB migrations (migration BOOKKEEPING only — NOT a full schema verification; use db_migrations_verified for down/up in CI)', kind: 'live', blocker: true, status: 'unknown', detail: String((e as Error).message) });
   }
 
   try {
@@ -91,7 +91,7 @@ async function main(): Promise<void> {
 
   try {
     const v = await verifyAuditChains();
-    checks.push({ id: 'audit_chain_clean', description: 'Audit hash chain verifies clean', kind: 'live', blocker: true, status: v.ok ? 'pass' : 'fail', detail: v.ok ? `${v.totalChained} chained entries OK` : `failures: ${v.chains.filter((c) => !c.ok).map((c) => c.chainId).join(',')}` });
+    checks.push({ id: 'audit_chain_clean', description: 'Audit hash chain is CONSISTENT (tamper-evidence links verify) — NOT a proof that no historical rows were lost (completeness is separate)', kind: 'live', blocker: true, status: v.ok ? 'pass' : 'fail', detail: v.ok ? `${v.totalChained} chained entries link OK (consistency only)` : `failures: ${v.chains.filter((c) => !c.ok).map((c) => c.chainId).join(',')}` });
   } catch (e) {
     checks.push({ id: 'audit_chain_clean', description: 'Audit chain verification', kind: 'live', blocker: true, status: 'unknown', detail: String((e as Error).message) });
   }
@@ -108,13 +108,22 @@ async function main(): Promise<void> {
 
   // ---- ATTESTED blockers ----
   let attestation: Record<string, { attested?: boolean; by?: string; at?: string }> = {};
+  // Release-evidence BINDING: the exact client/server commits + run/drill references
+  // this release covers. Bounded (recorded + echoed here, never auto-filled and not a
+  // verification service) so a release is traceable to specific SHAs and CI/drill runs.
+  let release: Record<string, string> = {};
   let attestationFound = false;
   try {
-    attestation = JSON.parse(readFileSync(resolve(__dirname, '..', 'release-attestation.json'), 'utf8')).attestations ?? {};
+    const doc = JSON.parse(readFileSync(resolve(__dirname, '..', 'release-attestation.json'), 'utf8'));
+    attestation = doc.attestations ?? {};
+    release = doc.release ?? {};
     attestationFound = true;
   } catch {
     attestationFound = false;
   }
+  // Warn (do not silently pass) if the release binding is unset — evidence with no
+  // SHA/run references is not traceable.
+  const releaseBound = !!(release.client_sha && release.server_sha);
   for (const a of ATTESTED) {
     const rec = attestation[a.id];
     const ok = rec?.attested === true && !!rec.by && !!rec.at;
@@ -123,12 +132,20 @@ async function main(): Promise<void> {
 
   const blocked = checks.filter((c) => c.blocker && c.status !== 'pass');
   const verdict = blocked.length === 0 ? 'READY' : 'BLOCKED';
-  const result = { verdict, evaluatedAt: new Date().toISOString(), nodeEnv: env.NODE_ENV, blockers: blocked.map((c) => c.id), checks };
+  const result = { verdict, evaluatedAt: new Date().toISOString(), nodeEnv: env.NODE_ENV, release, releaseBound, blockers: blocked.map((c) => c.id), checks };
 
   if (json) {
     console.log(JSON.stringify(result, null, 2));
   } else {
     console.log(`\nPRODUCTION RELEASE GATE: ${verdict}\n`);
+    console.log('Release binding (traceability, not a blocker):');
+    console.log(`  client_sha=${release.client_sha || '<unset>'} server_sha=${release.server_sha || '<unset>'}`);
+    console.log(`  ci_run=${release.ci_run || '<unset>'} e2e_run=${release.e2e_run || '<unset>'} restore_drill=${release.restore_drill || '<unset>'}`);
+    if (!releaseBound) console.log('  WARNING: release binding is unset — this evidence is not traceable to specific commits/runs.');
+    // Verification is PREFLIGHT (config/migrations/gate) + POST-START smoke against
+    // the PRIVATE port BEFORE the node joins the public proxy — it never requires
+    // opening public traffic to verify.
+    console.log('Verification model: preflight (this gate) + post-start smoke on the PRIVATE port before public cutover.\n');
     for (const c of checks) console.log(`  [${c.status === 'pass' ? 'PASS' : c.status === 'fail' ? 'FAIL' : '????'}] (${c.kind}) ${c.id} — ${c.detail}`);
     if (blocked.length) {
       console.log(`\nBLOCKED by ${blocked.length} unmet blocker(s): ${blocked.map((c) => c.id).join(', ')}`);

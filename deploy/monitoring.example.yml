@@ -1,0 +1,111 @@
+# EASY GAS — monitoring EXAMPLE (Prometheus scrape + alert rules)
+# ===============================================================
+#
+# SAFE ARTIFACT: EXAMPLE ONLY. Nothing here is a configured/running service — it
+# is a starting point to copy into YOUR Prometheus/Alertmanager. Replace every
+# <PLACEHOLDER>, wire alerts to a real receiver, and review thresholds with ops.
+#
+# METRICS ARE PRIVATE + TOKEN-PROTECTED:
+#   - The app exposes Prometheus text at GET /api/v1/metrics ONLY when
+#     METRICS_ENABLED=true, and in production REQUIRES a Bearer METRICS_TOKEN.
+#   - Nginx blocks /api/v1/metrics on the PUBLIC vhost (deploy/nginx.example.conf).
+#   - Scrape it over the PRIVATE network only (localhost / a monitoring subnet),
+#     never the public origin.
+#
+# WHAT NEEDS EXTERNAL EXPORTERS (not app metrics — noted per rule):
+#   - Host disk / filesystem  → node_exporter (node_filesystem_avail_bytes).
+#   - MySQL backup success/age → the backup cron job's exit status piped to your
+#     alerting, and/or a node_exporter textfile-collector metric that the backup
+#     wrapper writes on success (pattern noted below). There is no built-in
+#     "backup" app metric — a backup is an external cron job.
+
+# ---------------------------------------------------------------------------
+# prometheus.yml (scrape) — PRIVATE target + bearer token
+scrape_configs:
+  - job_name: easygas-api
+    scheme: http                     # private network; TLS-terminate at the edge only
+    metrics_path: /api/v1/metrics
+    authorization:
+      type: Bearer
+      credentials: "<SET_IN_ENV_METRICS_TOKEN>"   # must equal the app's METRICS_TOKEN
+    static_configs:
+      - targets: ["127.0.0.1:4000"]  # env.PORT, PRIVATE — never the public origin
+
+# ---------------------------------------------------------------------------
+# alert.rules.yml — meaningful conditions (adjust thresholds to your SLOs)
+groups:
+  - name: easygas-availability
+    rules:
+      - alert: EasyGasNotReady
+        # Readiness gauge is 0 when a dependency (DB/Redis/storage) is down or the
+        # instance is draining. `absent(...)` also fires if scraping itself fails.
+        expr: easygas_readiness_up == 0 or absent(easygas_readiness_up)
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "EasyGas API not ready (draining or a dependency is down)"
+          runbook: "docs/OPERATIONS-RUNBOOK-10F.md#readiness"
+
+      - alert: EasyGasReadinessCheckFailing
+        # Per-dependency breakdown (db/redis/storage/riskPolicy). 1=ok, 0=failing.
+        expr: easygas_readiness_check == 0
+        for: 3m
+        labels: { severity: critical }
+        annotations:
+          summary: "EasyGas dependency check failing: {{ $labels.check }}"
+
+      - alert: EasyGasRedisDown
+        expr: easygas_redis_up == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Redis unreachable — fail-closed rate limits will reject traffic"
+
+  - name: easygas-integrity-and-storage
+    rules:
+      - alert: EasyGasAuditVerificationFailing
+        # ANY increase = a broken/inconsistent audit hash chain → investigate for
+        # tampering or corruption. (Consistency check — NOT a completeness proof.)
+        expr: increase(easygas_audit_verification_failures_total[1h]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "Audit hash-chain verification reported a failure"
+
+      - alert: EasyGasStorageFailures
+        # Object-storage (evidence) read/write failures.
+        expr: increase(easygas_storage_failures_total[15m]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Evidence object-storage failures observed"
+
+      - alert: EasyGasUnresolvedBlockingRisks
+        expr: easygas_unresolved_blocking_risks > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Jobs blocked by unresolved CRITICAL risks: {{ $value }}"
+
+  - name: easygas-host-and-backups   # require external exporters — see header
+    rules:
+      - alert: HostDiskLow
+        # node_exporter — alert before the backup volume / DB disk fills.
+        expr: node_filesystem_avail_bytes{mountpoint=~"/var/backups.*|/"} / node_filesystem_size_bytes < 0.15
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Low free disk on {{ $labels.mountpoint }} (<15%)"
+
+      - alert: EasyGasBackupStale
+        # No built-in backup metric — a backup is an external cron job. Have the
+        # backup wrapper write a node_exporter textfile metric on SUCCESS, e.g.:
+        #   echo "easygas_backup_last_success_timestamp $(date +%s)" \
+        #     > /var/lib/node_exporter/textfile/easygas_backup.prom
+        # Then alert if it is older than a day (tighten to your RPO decision).
+        expr: time() - easygas_backup_last_success_timestamp > 60 * 60 * 26
+        labels: { severity: critical }
+        annotations:
+          summary: "No successful MySQL backup in >26h (or the metric is missing)"
+        # ALSO: pipe the backup cron job's non-zero EXIT to your alerting directly
+        # (deploy/crontab.example) so a hard failure pages even if the metric never
+        # updates.

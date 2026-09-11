@@ -1,5 +1,13 @@
 {
-  "_comment": "Phase 10F release attestations. Copy to release-attestation.json (git-ignored) and fill in for a real release. Each item must be explicitly attested with WHO and WHEN. These are human/operational confirmations the release gate cannot verify by itself. They do NOT bypass the LIVE safety blockers (SMS provider, approved risk matrix) — those are checked against the running system and cannot be waived.",
+  "_comment": "Release attestations. Copy to release-attestation.json (git-ignored) and fill in for a real release. Each item must be explicitly attested with WHO and WHEN — never auto-filled. These are human/operational confirmations the release gate cannot verify by itself. They do NOT bypass the LIVE safety blockers (functional SMS provider only when SMS is enabled; approved risk matrix) — those are checked against the running system and cannot be waived.",
+  "_release_comment": "Traceability binding: the exact commits and run/drill references this release covers. The gate echoes these (it does not verify a CI/attestation service). Fill client_sha/server_sha with full commit SHAs and the run refs with GitHub Actions run URLs / the restore-drill reference.",
+  "release": {
+    "client_sha": "",
+    "server_sha": "",
+    "ci_run": "",
+    "e2e_run": "",
+    "restore_drill": ""
+  },
   "attestations": {
     "ci_all_green": { "attested": false, "by": "", "at": "" },
     "db_migrations_verified": { "attested": false, "by": "", "at": "" },
