@@ -273,13 +273,13 @@ jobs:
           sed -e 's#<PUBLIC_DOMAIN>#localhost#g' \
               -e 's#<PATH_TO_FULLCHAIN_PEM>#/etc/ngx/certs/fullchain.pem#g' \
               -e 's#<PATH_TO_PRIVKEY_PEM>#/etc/ngx/certs/privkey.pem#g' \
-              -e 's#<CLIENT_DIST_DIR>#/etc/ngx/dist#g' \
+              -e 's#<CLIENT_DIST_DIR>#/srv/dist#g' \
               -e 's#listen 443 ssl#listen 8443 ssl#; s#listen \[::\]:443 ssl#listen [::]:8443 ssl#' \
               -e 's#listen 80;#listen 8081;#; s#listen \[::\]:80;#listen [::]:8081;#' \
               deploy/nginx.example.conf > /tmp/ngx/site.conf
           printf 'pid /tmp/nginx.pid;\nevents{}\nhttp{\n  include /etc/nginx/mime.types;\n  default_type application/octet-stream;\n  include /etc/ngx/site.conf;\n}\n' > /tmp/ngx/nginx.conf
           docker run -d --name egngx --network host \
-            -v /tmp/ngx:/etc/ngx:ro -v "$PWD/client/dist:/etc/ngx/dist:ro" \
+            -v /tmp/ngx:/etc/ngx:ro -v "$PWD/client/dist:/srv/dist:ro" \
             nginx:1.27-alpine nginx -c /etc/ngx/nginx.conf -g 'daemon off;'
           for i in $(seq 1 30); do
             curl -sk https://localhost:8443/ >/dev/null 2>&1 && { echo "nginx ready after ${i}s"; break; }

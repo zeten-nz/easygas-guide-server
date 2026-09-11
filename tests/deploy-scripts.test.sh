@@ -61,17 +61,22 @@ rm -f "$STUB/gzip"
 res=0; { [ $rc -ne 0 ] && echo "$out" | grep -qi "gzip/output-write failed" && no_archive "$d" && no_partial "$d"; } && res=1
 assert "$res" "backup: compressor failure fails closed"
 
-# 3. REAL OUTPUT-WRITE failure (real gzip, file-size limit exceeded by incompressible
-#    bulk). Distinct from #2: gzip itself works; the WRITE to disk fails. Needs a
-#    settable `ulimit -f` (Linux CI); skipped where the shell cannot set it (e.g.
-#    Git Bash on Windows) rather than faked.
+# 3. REAL OUTPUT-WRITE failure via a genuinely FULL filesystem (ENOSPC): a tiny
+#    world-writable tmpfs as BACKUP_DIR; gzip compresses fine but the WRITE to disk
+#    fails. Distinct from #2 (the compressor itself never fails here). Needs
+#    `sudo mount -t tmpfs` (Linux CI); skipped where unavailable (e.g. Windows)
+#    rather than faked.
 d="$ROOT/b3"; mkdir -p "$d"
-if ( ulimit -f 200 2>/dev/null && [ "$(ulimit -f)" = "200" ] ) 2>/dev/null; then
-  out=$( ulimit -f 200; STUB_DUMP_MODE=big STUB_DUMP_BYTES=6000000 DB_USER=u DB_PASSWORD=p DB_NAME=demo BACKUP_DIR="$d" bash "$BK_SCRIPT" 2>&1 ); rc=$?
-  res=0; { [ $rc -ne 0 ] && echo "$out" | grep -qi "gzip/output-write failed" && no_archive "$d" && no_partial "$d"; } && res=1
-  assert "$res" "backup: real output-write failure (disk/size limit) fails closed"
+if command -v sudo >/dev/null 2>&1 && sudo mount -t tmpfs -o size=256k,mode=1777 tmpfs "$d" 2>/dev/null; then
+  out=$( STUB_DUMP_MODE=big STUB_DUMP_BYTES=4000000 DB_USER=u DB_PASSWORD=p DB_NAME=demo BACKUP_DIR="$d" bash "$BK_SCRIPT" 2>&1 ); rc=$?
+  # Core requirement: FAIL CLOSED on the write failure (non-zero, no published
+  # archive, no leftover temp). The specific message is a bonus.
+  res=0; { [ $rc -ne 0 ] && no_archive "$d" && no_partial "$d"; } && res=1
+  [ "$res" = 1 ] || echo "  [diag] rc=$rc last=[$(echo "$out" | tail -1)] files=[$(find "$d" -mindepth 1 -maxdepth 1 2>/dev/null | tr '\n' ' ')]"
+  assert "$res" "backup: real output-write failure (ENOSPC on a full tmpfs) fails closed"
+  sudo umount "$d" 2>/dev/null || true
 else
-  skip "backup: real output-write failure — 'ulimit -f' not settable here (runs for real in Linux CI)"
+  skip "backup: real output-write failure — cannot mount a tmpfs here (runs for real in Linux CI)"
 fi
 
 # 4. success -> valid archive + sidecars + integrity
