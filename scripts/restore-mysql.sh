@@ -86,16 +86,31 @@ trap cleanup EXIT INT TERM
 # --- (E.9) Snapshot the artifact so the bytes we VALIDATE are the bytes we USE
 cp -- "$DUMP_FILE" "$TMP_GZ" || die "Could not copy dump to the private workspace."
 
-# --- (E.8) Provenance: verify a sidecar checksum if present -----------------
+# --- (E.8) Integrity metadata + TRUST CONTRACT ------------------------------
+# TRUST CONTRACT (explicit): a matching adjacent ".sha256" proves the artifact is
+# INTACT relative to that checksum (not corrupt/truncated). It is NOT authenticated
+# provenance — anyone who can replace the dump can replace its sidecar too, so a
+# match does not prove the dump came from a trusted source. Authenticated provenance
+# would need a signature over a trusted channel (out of scope here). Only restore
+# artifacts you already trust — produced by scripts/backup-mysql.sh.
+#
+# NORMAL PATH: scripts/backup-mysql.sh ALWAYS writes a ".sha256" sidecar, so APPLY
+# REQUIRES it. A missing sidecar means this is not a standard artifact; to APPLY a
+# LEGACY/foreign dump you must opt in EXPLICITLY (and it is never reported as verified).
+ALLOW_UNVERIFIED_ARTIFACT="${ALLOW_UNVERIFIED_ARTIFACT:-}"
 if [ -f "${DUMP_FILE}.sha256" ]; then
   EXPECTED="$(awk '{print $1}' "${DUMP_FILE}.sha256")"
   ACTUAL="$(sha256sum "$TMP_GZ" | awk '{print $1}')"
   [ -n "$EXPECTED" ] || die "Sidecar ${DUMP_FILE}.sha256 is empty/unreadable — refusing."
   [ "$EXPECTED" = "$ACTUAL" ] \
-    || die "Checksum MISMATCH: sidecar says $EXPECTED, artifact is $ACTUAL. Refusing (corrupt or tampered)."
-  echo "Provenance: sha256 matches sidecar ($ACTUAL)."
+    || die "Checksum MISMATCH: sidecar says $EXPECTED, artifact is $ACTUAL. Refusing (corrupt or altered RELATIVE TO THE SIDECAR)."
+  echo "Integrity: sha256 matches the adjacent sidecar ($ACTUAL) — intact relative to that checksum (NOT authenticated provenance)."
+elif [ "$APPLY" = "1" ] && [ "$ALLOW_UNVERIFIED_ARTIFACT" != "yes" ]; then
+  die "No '${DUMP_FILE}.sha256' sidecar — refusing to APPLY an artifact without integrity metadata. Restore a scripts/backup-mysql.sh artifact (it writes the sidecar), or set ALLOW_UNVERIFIED_ARTIFACT=yes to APPLY a LEGACY/foreign artifact explicitly (it will NOT be treated as verified)."
 else
-  echo "NOTE: no '${DUMP_FILE}.sha256' sidecar — provenance is UNVERIFIED. Only restore artifacts produced by scripts/backup-mysql.sh."
+  MSG="WARNING: no '${DUMP_FILE}.sha256' sidecar — integrity is UNVERIFIED."
+  [ "$APPLY" = "1" ] && MSG="$MSG Proceeding under explicit ALLOW_UNVERIFIED_ARTIFACT=yes (legacy/foreign artifact; NOT verified)."
+  echo "$MSG"
 fi
 
 # --- (E.2/E.3) Validate integrity + decompress ONCE, before any DB mutation --
