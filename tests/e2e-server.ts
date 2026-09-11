@@ -31,7 +31,11 @@ import { setStorageProviderForTesting } from '../src/storage';
 import { MemoryStorageProvider } from './helpers/memory-storage';
 import { createTemplate, addStep, publishVersion, listAssignableTemplates } from '../src/modules/checklist/templates.service';
 import { ROLE_PERMISSIONS } from '../src/rbac/permissions';
-import type { AuthUser } from '../src/types/auth';
+import type { AuthUser, RoleCode } from '../src/types/auth';
+import * as jobsService from '../src/modules/jobs/jobs.service';
+import * as execution from '../src/modules/checklist/execution.service';
+import * as photosService from '../src/modules/photos/photos.service';
+import * as completionService from '../src/modules/jobs/completion.service';
 
 const PORT = Number(process.env.E2E_API_PORT ?? 4000);
 
@@ -143,6 +147,82 @@ async function ensureSeedJobs(): Promise<void> {
   }
 }
 
+// A tiny but valid 1x1 PNG for seeded photo evidence (memory storage; not a real image).
+const SEED_PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
+// Plates for Phase 11C evidence-review flows (per browser project). EVI = a
+// COMPLETED job with photo evidence; EVR = COMPLETED → REOPENED with cycle-1
+// historical evidence + a cycle-2 current photo.
+const EVIDENCE_PLATES = ['E2E-EVI-cr', 'E2E-EVI-mo', 'E2E-EVR-cr', 'E2E-EVR-mo'];
+
+function seedActor(row: Record<string, any>, role: RoleCode): AuthUser {
+  return { id: row.id, firstName: row.first_name, lastName: row.last_name, phone: row.phone, region: row.region, branchId: row.branch_id ?? null, role, status: 'ACTIVE', avatarUrl: null, mustChangePassword: false, permissions: ROLE_PERMISSIONS[role] };
+}
+
+/**
+ * Seeds COMPLETED (and one REOPENED) jobs WITH photo evidence, driven entirely
+ * through the real workflow services so the Phase 11C evidence gallery / photo
+ * viewer / completed-job list have truthful data on BOTH browser projects.
+ * Best-effort: never blocks API startup.
+ */
+async function ensureEvidenceJobs(): Promise<void> {
+  const meta = { ip: null, userAgent: null };
+  try {
+    const ustaRow = await db('users').where({ phone: '+998901000001' }).first(); // USTA (assigned)
+    const masterRow = await db('users').where({ phone: '+998901000002' }).first(); // MASTER (closes)
+    const sifatRow = await db('users').where({ phone: '+998901000004' }).first(); // SIFAT (reopens)
+    if (!ustaRow || !masterRow || !sifatRow) return;
+    const usta = seedActor(ustaRow, 'USTA');
+    const master = seedActor(masterRow, 'MASTER');
+    const sifat = seedActor(sifatRow, 'SIFAT');
+
+    // A dedicated PUBLISHED template with a required-photo step so the gallery is
+    // meaningful (steps ask for a photo).
+    let tpl = (await listAssignableTemplates()).find((t) => t.name === 'E2E Evidence Checklist');
+    if (!tpl) {
+      const created = await createTemplate(usta, { name: 'E2E Evidence Checklist', description: 'Photo evidence for 11C' }, meta);
+      await addStep(usta, created.id, created.versions[0].id, { name: 'Foto bosqich', isStop: false, riskWeight: 0, requiredPhotos: 1, measurements: [] }, meta);
+      await publishVersion(usta, created.id, created.versions[0].id, meta);
+      tpl = (await listAssignableTemplates()).find((t) => t.name === 'E2E Evidence Checklist')!;
+    }
+
+    let customer = await db('customers').where({ name: 'E2E Evidence Mijoz' }).first();
+    if (!customer) {
+      const [cid] = await db('customers').insert({ name: 'E2E Evidence Mijoz', phone: '+998900008888', created_by: ustaRow.id });
+      customer = await db('customers').where({ id: cid }).first();
+    }
+
+    const buildCompleted = async (plate: string): Promise<number | null> => {
+      if (await db('vehicles').where({ plate_number: plate }).first()) return null; // idempotent
+      const [vid] = await db('vehicles').insert({ customer_id: customer.id, plate_number: plate, make: 'Chevrolet', model: 'Nexia', created_by: ustaRow.id });
+      const [jobId] = await db('jobs').insert({ customer_id: customer.id, vehicle_id: vid, branch_id: ustaRow.branch_id, status: 'DRAFT', created_by: ustaRow.id, assigned_technician_id: ustaRow.id, assignment_status: 'ASSIGNED', cycle: 1 });
+      await db('job_assignments').insert({ job_id: jobId, cycle: 1, technician_id: ustaRow.id, assigned_by: ustaRow.id, provenance: 'SELF_AT_CREATION' });
+      await jobsService.startJob(usta, jobId, meta);
+      await execution.assignChecklist(usta, jobId, tpl!.id, meta);
+      const step = await db('job_steps').join('job_checklists', 'job_checklists.id', 'job_steps.job_checklist_id').where('job_checklists.job_id', jobId).select('job_steps.id').first();
+      await photosService.uploadStepPhoto(usta, jobId, step.id, { buffer: SEED_PNG, originalname: 'evidence.png' }, meta);
+      await execution.completeStep(usta, jobId, step.id, { measurements: [] }, meta);
+      const sum = await completionService.getSignableSummary(jobId);
+      await completionService.saveSignature(usta, jobId, { buffer: SEED_PNG }, meta, sum!.digest);
+      await completionService.closeJob(master, jobId, meta);
+      return jobId;
+    };
+
+    for (const plate of ['E2E-EVI-cr', 'E2E-EVI-mo']) await buildCompleted(plate);
+
+    for (const plate of ['E2E-EVR-cr', 'E2E-EVR-mo']) {
+      const jobId = await buildCompleted(plate);
+      if (jobId == null) continue; // already seeded
+      const step = await db('job_steps').join('job_checklists', 'job_checklists.id', 'job_steps.job_checklist_id').where('job_checklists.job_id', jobId).select('job_steps.id').first();
+      await completionService.reopenJob(sifat, jobId, 'Sifat nazorati — qayta tekshirish', meta);
+      await execution.redoStep(usta, jobId, step.id, meta);
+      await photosService.uploadStepPhoto(usta, jobId, step.id, { buffer: SEED_PNG, originalname: 'evidence-c2.png' }, meta);
+    }
+    console.log('[e2e-server] seeded Phase 11C evidence jobs (completed + reopened, with photos)');
+  } catch (err) {
+    console.warn('[e2e-server] evidence-job seed skipped:', err instanceof Error ? err.message : err);
+  }
+}
+
 /**
  * Non-sensitive fixture readiness for the browser E2E harness. Reports ONLY
  * booleans/counts and the SHORT plate codes (E2E-*) the specs claim — never PII,
@@ -157,6 +237,7 @@ async function fixtureReadiness(): Promise<{
   missingPlates: string[];
   publishedTemplate: boolean;
   activeRiskPolicy: boolean;
+  evidenceJobs: boolean;
 }> {
   const jobRows = await db('jobs')
     .join('vehicles', 'vehicles.id', 'jobs.vehicle_id')
@@ -166,8 +247,10 @@ async function fixtureReadiness(): Promise<{
   const missingPlates = E2E_PLATES.filter((p) => !seeded.has(p));
   const publishedTemplate = (await listAssignableTemplates()).some((t) => t.name === 'E2E Checklist');
   const activeRiskPolicy = (await db('risk_matrix_versions').where({ status: 'ACTIVE' }).first()) != null;
-  const ready = missingPlates.length === 0 && publishedTemplate && activeRiskPolicy;
-  return { ready, expectedPlates: E2E_PLATES.length, seededPlates: seeded.size, missingPlates, publishedTemplate, activeRiskPolicy };
+  const evidenceSeeded = await db('jobs').join('vehicles', 'vehicles.id', 'jobs.vehicle_id').whereIn('vehicles.plate_number', EVIDENCE_PLATES).distinct('vehicles.plate_number as plate');
+  const evidenceJobs = evidenceSeeded.length === EVIDENCE_PLATES.length;
+  const ready = missingPlates.length === 0 && publishedTemplate && activeRiskPolicy && evidenceJobs;
+  return { ready, expectedPlates: E2E_PLATES.length, seededPlates: seeded.size, missingPlates, publishedTemplate, activeRiskPolicy, evidenceJobs };
 }
 
 async function main(): Promise<void> {
@@ -183,6 +266,7 @@ async function main(): Promise<void> {
   await ensureActivePolicy();
   await ensurePublishedTemplate();
   await ensureSeedJobs();
+  await ensureEvidenceJobs();
 
   // Boot self-check: refuse to start if the fixtures the browser specs depend on
   // are incomplete — a clear, early error instead of 12 opaque "job not found"
@@ -193,7 +277,7 @@ async function main(): Promise<void> {
       `[e2e-server] FIXTURE PREFLIGHT FAILED — refusing to start. ` +
         `plates ${readiness.seededPlates}/${readiness.expectedPlates}` +
         (readiness.missingPlates.length ? ` missing=[${readiness.missingPlates.join(', ')}]` : '') +
-        ` publishedTemplate=${readiness.publishedTemplate} activeRiskPolicy=${readiness.activeRiskPolicy}. ` +
+        ` publishedTemplate=${readiness.publishedTemplate} activeRiskPolicy=${readiness.activeRiskPolicy} evidenceJobs=${readiness.evidenceJobs}. ` +
         `Is the server on the Phase 10F harness (reset-test-db + per-flow seeds)?`,
     );
     await db.destroy();

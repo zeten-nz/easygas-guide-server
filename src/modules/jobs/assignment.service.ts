@@ -135,6 +135,42 @@ export async function listCandidates(actor: AuthUser, jobId: number): Promise<Ar
 }
 
 /**
+ * Phase 11C — the distinct RESPONSIBLE technicians that actually have jobs in the
+ * caller's branch scope, for the completed-job list filter. This is HISTORICAL
+ * filtering access, deliberately NOT the job-scoped assignment-eligibility list
+ * (`listCandidates`): it is branch-scoped, name-searchable and bounded, and it
+ * includes a technician even if now inactive (they still own historical jobs) — the
+ * source is `jobs.assigned_technician_id`, never uploader/step-performer. `id`
+ * resolves a single technician (to show the selected name after reload).
+ */
+export async function listResponsibleTechnicians(
+  actor: AuthUser,
+  opts: { search?: string; id?: number; limit?: number } = {},
+): Promise<{ items: Array<{ id: number; name: string }>; total: number }> {
+  const scope = jobsBranchScope(actor);
+  const limit = Math.min(50, Math.max(1, opts.limit ?? 20));
+  const build = () => {
+    const q = db('jobs as j')
+      .join('users as u', 'u.id', 'j.assigned_technician_id')
+      .whereNotNull('j.assigned_technician_id');
+    if (scope !== null) q.where('j.branch_id', scope);
+    if (opts.id != null) q.where('u.id', opts.id);
+    else if (opts.search) {
+      const term = `%${opts.search.replace(/[%_]/g, '\\$&')}%`;
+      q.where((sub) => sub.where('u.first_name', 'like', term).orWhere('u.last_name', 'like', term).orWhereRaw("CONCAT(u.first_name, ' ', u.last_name) like ?", [term]));
+    }
+    return q;
+  };
+  const countRows = (await build().countDistinct({ c: 'u.id' })) as unknown as [{ c: number | string }];
+  const total = Number(countRows[0]?.c ?? 0);
+  const rows = await build()
+    .distinct('u.id', 'u.first_name', 'u.last_name')
+    .orderBy(['u.first_name', 'u.last_name'])
+    .limit(limit);
+  return { items: rows.map((r: Record<string, any>) => ({ id: r.id, name: `${r.first_name} ${r.last_name}` })), total };
+}
+
+/**
  * Execution guard (test 13): who may perform restricted checklist work on a job.
  * The assigned technician may; a supervisor (MASTER) may; when the job is
  * unassigned/legacy, any same-branch checklist.execute holder may (back-compat).

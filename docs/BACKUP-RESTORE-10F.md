@@ -140,6 +140,25 @@ Script: `scripts/restore-mysql.sh`. **Defaults to dry-run.** To apply it needs
 a dump argument, `RESTORE_TARGET_DB`, `CONFIRM_RESTORE=yes`, `APPLY=1`, and —
 for a non-`_test` (production-shaped) target — `FORCE_PROD_RESTORE=yes` as well.
 
+> **Dump-context hazard (guarded).** A dump made with `mysqldump --databases`
+> or `--all-databases` embeds `CREATE DATABASE` + `USE <db>;`. Piped into
+> `mysql <target>`, those `USE` lines silently redirect every statement to the
+> dump's *own* database, ignoring `RESTORE_TARGET_DB` — which would bypass the
+> `_test` and `FORCE_PROD_RESTORE` guards (a dump of `easygas` could overwrite
+> `easygas` even with `RESTORE_TARGET_DB=easygas_restore_test`). `backup-mysql.sh`
+> dumps a **single database positionally** and emits no such lines.
+>
+> The restore script now runs a **fail-closed heuristic scan** that refuses any
+> dump whose lines begin with `CREATE DATABASE`/`USE` — including the
+> `/*!NNNNN … */` executable-comment wrapper and leading-whitespace/case variants,
+> i.e. every form the mysqldump family emits — and additionally passes
+> `mysql --one-database`. **This scan is defense-in-depth, not a comprehensive SQL
+> parser or a security boundary** (`--one-database` is a rudimentary client filter;
+> a hand-crafted dump could still evade a text scan, e.g. a `USE` placed mid-line).
+> The real guarantee is: **only ever restore dumps produced by `backup-mysql.sh`**
+> (single-DB, positional). Never restore a `--databases` dump through this path;
+> re-dump single-DB or strip the `CREATE DATABASE`/`USE` lines first.
+
 ```bash
 # 1) DRY-RUN (prints the plan, changes nothing)
 RESTORE_TARGET_DB=easygas_restore_test CONFIRM_RESTORE=yes \

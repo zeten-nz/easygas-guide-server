@@ -28,6 +28,25 @@ riskPolicyRouter.get('/versions', async (req: Request, res: Response) => {
   res.json({ versions: await policy.listMatrices(req.user!) });
 });
 
+// Full detail for one version (definition + server-computed classified grid +
+// approver/provenance) — read-only, for the risk-policy explanation/visualization.
+const versionDetailParams = z.object({ version: z.string().trim().min(1).max(32) });
+riskPolicyRouter.get('/versions/:version', requirePermission('risk.matrix.approve'), validate({ params: versionDetailParams }), async (req: Request, res: Response) => {
+  res.json({ version: await policy.getMatrixVersionDetail(req.user!, String(req.params.version)) });
+});
+
+// Illustrative preview (read-only; creates nothing, activates nothing). GET is
+// safe-method (CSRF-exempt) and clearly a computation, not a mutation.
+const previewQuery = z.object({
+  severity: z.coerce.number().int().min(1).max(10),
+  likelihood: z.coerce.number().int().min(1).max(10),
+  source: z.enum(['MANUAL', 'STOP_REJECTED', 'MEASUREMENT_OUT_OF_RANGE', 'CHECKLIST_FLAG']).optional(),
+});
+riskPolicyRouter.get('/versions/:version/preview', requirePermission('risk.matrix.approve'), validate({ params: versionDetailParams, query: previewQuery }), async (req: Request, res: Response) => {
+  const q = req.query as unknown as { severity: number; likelihood: number; source?: string };
+  res.json({ preview: await policy.previewClassification(req.user!, String(req.params.version), q) });
+});
+
 const createSchema = z.object({ version: z.string().trim().min(1).max(32), definition: z.record(z.string(), z.unknown()) });
 riskPolicyRouter.post('/versions', requirePermission('risk.matrix.approve'), validate({ body: createSchema }), async (req: Request, res: Response) => {
   const r = await policy.createMatrixVersion(req.user!, req.body.version, req.body.definition, requestMeta(req));

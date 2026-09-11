@@ -4,7 +4,7 @@ import { ApiError } from '../../utils/errors';
 import { logAudit } from '../audit/audit.service';
 import { can } from '../../rbac/permissions';
 import type { AuthUser } from '../../types/auth';
-import { RISK_LEVELS, type RiskLevel, type RiskSource } from './risk-matrix';
+import { RISK_LEVELS, RISK_SOURCES, type RiskLevel, type RiskSource } from './risk-matrix';
 
 /**
  * Phase 10D risk-matrix GOVERNANCE. A matrix definition is immutable and moves
@@ -136,10 +136,135 @@ export async function assertRiskPolicyApproved(conn: Knex | Knex.Transaction = d
 // Governance operations
 // ---------------------------------------------------------------------------
 
-export async function listMatrices(actor: AuthUser): Promise<Array<{ version: string; status: string; approvedBy: number | null; approvedAt: Date | null; rationale: string | null; createdAt: Date; definition: MatrixDefinition }>> {
-  if (!can(actor.role, 'risk.matrix.approve') && !can(actor.role, 'services.view_all')) throw ApiError.forbidden();
-  const rows = await db('risk_matrix_versions').orderBy('created_at', 'desc');
-  return rows.map((r: Record<string, any>) => ({ version: r.version, status: r.status, approvedBy: r.approved_by, approvedAt: r.approved_at, rationale: r.rationale, createdAt: r.created_at, definition: JSON.parse(r.definition) }));
+/** May the actor read matrix internals (history/detail/preview)? SIFAT + ADMIN. */
+function canReadMatrices(actor: AuthUser): boolean {
+  return can(actor.role, 'risk.matrix.approve') || can(actor.role, 'services.view_all');
+}
+
+export async function listMatrices(actor: AuthUser): Promise<Array<{ version: string; status: string; approvedBy: number | null; approvedByName: string | null; approvedAt: Date | null; rationale: string | null; createdAt: Date; supersededBy: number | null; definition: MatrixDefinition }>> {
+  if (!canReadMatrices(actor)) throw ApiError.forbidden();
+  const rows = await db('risk_matrix_versions as m')
+    .leftJoin('users as u', 'u.id', 'm.approved_by')
+    .orderBy('m.created_at', 'desc')
+    .select('m.version', 'm.status', 'm.approved_by', 'm.approved_at', 'm.rationale', 'm.created_at', 'm.superseded_by', 'm.definition', 'u.first_name', 'u.last_name');
+  return rows.map((r: Record<string, any>) => ({
+    version: r.version,
+    status: r.status,
+    approvedBy: r.approved_by,
+    // Resolve the approver's display name where the user still exists (approved_by
+    // is SET NULL on user delete). Null → the client shows the id fallback.
+    approvedByName: r.approved_by != null && r.first_name != null ? `${r.first_name} ${r.last_name}` : null,
+    approvedAt: r.approved_at,
+    rationale: r.rationale,
+    createdAt: r.created_at,
+    supersededBy: r.superseded_by,
+    definition: JSON.parse(r.definition),
+  }));
+}
+
+export interface MatrixCell {
+  severity: number;
+  likelihood: number;
+  score: number;
+  level: RiskLevel;
+  blocking: boolean;
+}
+
+export interface MatrixVersionDetail {
+  version: string;
+  status: string;
+  isActive: boolean;
+  definition: MatrixDefinition;
+  /** The full severity×likelihood grid, each cell classified by the SHARED evaluator
+   *  (source=MANUAL, i.e. no source override) so the client never re-computes levels. */
+  cells: MatrixCell[];
+  approvedBy: number | null;
+  approvedByName: string | null;
+  approvedAt: Date | null;
+  rationale: string | null;
+  createdAt: Date;
+  supersededBy: number | null;
+  /** Operations an UNRESOLVED blocking-level risk of the current cycle prevents,
+   *  per the implemented §22 completion gate (server-provided; not hardcoded client-side). */
+  blockedOperations: string[];
+}
+
+/** Build the classified grid for a definition, using the SHARED `classify` (no duplication). */
+export function buildCells(def: MatrixDefinition): MatrixCell[] {
+  const cells: MatrixCell[] = [];
+  for (const severity of def.allowedSeverity) {
+    for (const likelihood of def.allowedLikelihood) {
+      const c = classify(def, severity, likelihood, 'MANUAL');
+      cells.push({ severity, likelihood, score: c.score, level: c.level, blocking: c.blocking });
+    }
+  }
+  return cells;
+}
+
+/** Full read-only detail for one version — definition + computed grid + provenance. */
+export async function getMatrixVersionDetail(actor: AuthUser, version: string): Promise<MatrixVersionDetail> {
+  if (!canReadMatrices(actor)) throw ApiError.forbidden();
+  const r = await db('risk_matrix_versions as m')
+    .leftJoin('users as u', 'u.id', 'm.approved_by')
+    .where('m.version', version)
+    .select('m.version', 'm.status', 'm.approved_by', 'm.approved_at', 'm.rationale', 'm.created_at', 'm.superseded_by', 'm.definition', 'u.first_name', 'u.last_name')
+    .first();
+  if (!r) throw ApiError.notFound('Matritsa versiyasi topilmadi');
+  const definition = JSON.parse(r.definition) as MatrixDefinition;
+  const blockedOperations = definition.blockingLevels.length > 0
+    ? ['Ishni yakunlash (§22 yakunlash darvozasi)', 'Sifatni tasdiqlash (§26)']
+    : [];
+  return {
+    version: r.version,
+    status: r.status,
+    isActive: r.status === 'ACTIVE',
+    definition,
+    cells: buildCells(definition),
+    approvedBy: r.approved_by,
+    approvedByName: r.approved_by != null && r.first_name != null ? `${r.first_name} ${r.last_name}` : null,
+    approvedAt: r.approved_at,
+    rationale: r.rationale,
+    createdAt: r.created_at,
+    supersededBy: r.superseded_by,
+    blockedOperations,
+  };
+}
+
+export interface PreviewResult {
+  version: string;
+  status: string;
+  severity: number;
+  likelihood: number;
+  source: RiskSource;
+  score: number;
+  level: RiskLevel;
+  blocking: boolean;
+  /** Always true — an illustrative classification, NOT a saved job assessment. */
+  example: true;
+}
+
+/**
+ * Read-only illustrative classification of a chosen version's definition. Reuses the
+ * SHARED `classify` evaluator — it creates NO risk event, NO approval, activates
+ * nothing, and works for DRAFT/ACTIVE/RETIRED alike. It is distinct from production
+ * `assessRisk`, which still requires an ACTIVE policy and fails closed otherwise — a
+ * DRAFT preview never makes a DRAFT usable for a real assessment.
+ */
+export async function previewClassification(
+  actor: AuthUser,
+  version: string,
+  input: { severity: number; likelihood: number; source?: string },
+): Promise<PreviewResult> {
+  if (!canReadMatrices(actor)) throw ApiError.forbidden();
+  const row = await db('risk_matrix_versions').where({ version }).select('version', 'status', 'definition').first();
+  if (!row) throw ApiError.notFound('Matritsa versiyasi topilmadi');
+  const def = JSON.parse(row.definition) as MatrixDefinition;
+  const source = (input.source ?? 'MANUAL') as RiskSource;
+  if (!RISK_SOURCES.includes(source)) throw ApiError.badRequest('Manba notogri', 'INVALID_SOURCE');
+  if (!def.allowedSeverity.includes(input.severity)) throw new ApiError(422, 'INVALID_SEVERITY', 'Ushbu matritsa uchun ruxsat etilmagan ogirlik darajasi');
+  if (!def.allowedLikelihood.includes(input.likelihood)) throw new ApiError(422, 'INVALID_LIKELIHOOD', 'Ushbu matritsa uchun ruxsat etilmagan ehtimollik darajasi');
+  const c = classify(def, input.severity, input.likelihood, source);
+  return { version: row.version, status: row.status, severity: input.severity, likelihood: input.likelihood, source, score: c.score, level: c.level, blocking: c.blocking, example: true };
 }
 
 export async function createMatrixVersion(actor: AuthUser, version: string, definition: unknown, meta: RequestMeta): Promise<{ version: string }> {
