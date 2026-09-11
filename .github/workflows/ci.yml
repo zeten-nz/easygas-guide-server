@@ -163,7 +163,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: ShellCheck the deploy scripts + tests
-        run: shellcheck scripts/backup-mysql.sh scripts/restore-mysql.sh scripts/backup-evidence.sh tests/deploy-scripts.test.sh
+        run: shellcheck scripts/backup-mysql.sh scripts/restore-mysql.sh scripts/backup-evidence.sh tests/deploy-scripts.test.sh tests/evidence-drill.sh tests/nginx-integration-checks.sh
+      - name: Syntax-check the Node env loader
+        run: node --check scripts/with-env.mjs
       - name: Backup/restore behaviour tests (stubbed — no real MySQL)
         run: bash tests/deploy-scripts.test.sh
       - name: Validate nginx example (nginx -t with throwaway certs)
@@ -180,3 +182,112 @@ jobs:
               deploy/nginx.example.conf > /tmp/ngx/site.conf
           printf 'events{}\nhttp{\n  include /etc/ngx/site.conf;\n}\n' > /tmp/ngx/nginx.conf
           docker run --rm -v /tmp/ngx:/etc/ngx:ro nginx:1.27-alpine nginx -t -c /etc/ngx/nginx.conf
+
+  evidence-drill:
+    name: evidence drill (rclone real object copy + verify)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install rclone (disposable local-remote object storage)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq rclone
+      - name: Real evidence backup -> restore -> verify (bytes + SHA-256, negatives)
+        run: bash tests/evidence-drill.sh
+
+  nginx-integration:
+    name: nginx integration (browser/HTTP through a running Nginx + API)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: ci_only_throwaway_root
+          MYSQL_DATABASE: easygas
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci_only_throwaway_root"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      NODE_ENV: test
+      DB_HOST: 127.0.0.1
+      DB_PORT: "3306"
+      DB_USER: root
+      DB_PASSWORD: ci_only_throwaway_root
+      DB_NAME: easygas
+      TEST_DB_NAME: easygas_test
+      REDIS_URL: redis://127.0.0.1:6379
+      CLIENT_ORIGIN: http://localhost:5173
+      TRUST_PROXY_HOPS: "1"
+      E2E_API_PORT: "4000"
+      SMS_PROVIDER: console
+    steps:
+      - name: Checkout server (this repo)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Clone client (public, tokenless, read-only)
+        run: git clone --depth 1 https://github.com/zeten-nz/easygas-guide.git client
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      - name: Throwaway APP_KEY
+        run: echo "APP_KEY=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+      - name: Build client (dist)
+        working-directory: client
+        run: |
+          npm ci
+          npm run build
+      - name: Build server
+        run: |
+          npm ci
+          npm run build
+      - name: Start API harness (resets + seeds easygas_test, serves on 4000)
+        run: |
+          nohup npm run test:e2e:serve > /tmp/api.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:4000/api/v1/health >/dev/null 2>&1 && { echo "API ready after ${i}s"; break; }
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:4000/api/v1/health || { echo "API did not start"; tail -40 /tmp/api.log; exit 1; }
+      - name: Start Nginx (docker, serving the built dist in front of the API)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ngx/certs
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \
+            -keyout /tmp/ngx/certs/privkey.pem -out /tmp/ngx/certs/fullchain.pem
+          sed -e 's#<PUBLIC_DOMAIN>#localhost#g' \
+              -e 's#<PATH_TO_FULLCHAIN_PEM>#/etc/ngx/certs/fullchain.pem#g' \
+              -e 's#<PATH_TO_PRIVKEY_PEM>#/etc/ngx/certs/privkey.pem#g' \
+              -e 's#<CLIENT_DIST_DIR>#/etc/ngx/dist#g' \
+              -e 's#listen 443 ssl#listen 8443 ssl#; s#listen \[::\]:443 ssl#listen [::]:8443 ssl#' \
+              -e 's#listen 80;#listen 8081;#; s#listen \[::\]:80;#listen [::]:8081;#' \
+              deploy/nginx.example.conf > /tmp/ngx/site.conf
+          printf 'pid /tmp/nginx.pid;\nevents{}\nhttp{\n  include /etc/nginx/mime.types;\n  default_type application/octet-stream;\n  include /etc/ngx/site.conf;\n}\n' > /tmp/ngx/nginx.conf
+          docker run -d --name egngx --network host \
+            -v /tmp/ngx:/etc/ngx:ro -v "$PWD/client/dist:/etc/ngx/dist:ro" \
+            nginx:1.27-alpine nginx -c /etc/ngx/nginx.conf -g 'daemon off;'
+          for i in $(seq 1 30); do
+            curl -sk https://localhost:8443/ >/dev/null 2>&1 && { echo "nginx ready after ${i}s"; break; }
+            sleep 1
+          done
+          curl -sk -o /dev/null -w 'nginx / -> %{http_code}\n' https://localhost:8443/ || { docker logs egngx; exit 1; }
+      - name: Run Nginx browser/HTTP integration checks
+        run: bash tests/nginx-integration-checks.sh https://localhost:8443
+      - name: Nginx logs on failure
+        if: failure()
+        run: docker logs egngx 2>&1 | tail -50; tail -50 /tmp/api.log
