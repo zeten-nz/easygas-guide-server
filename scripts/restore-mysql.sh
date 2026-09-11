@@ -1,37 +1,42 @@
 #!/usr/bin/env bash
 #
-# EASY GAS — MySQL restore (Phase 10F artifact)  ***DESTRUCTIVE***
-# ===============================================================
+# EASY GAS — MySQL restore  ***DESTRUCTIVE***
+# ===========================================
 #
-# This OVERWRITES the target database with the contents of a gzip dump produced
-# by scripts/backup-mysql.sh. It is guarded HARD and DEFAULTS TO DRY-RUN.
+# Overwrites a target database with a gzip dump produced by
+# scripts/backup-mysql.sh. It DEFAULTS TO DRY-RUN and validates the ENTIRE
+# artifact BEFORE touching any database.
 #
-# It NEVER targets production implicitly. To actually write, ALL of these must
-# hold:
+# To actually write, ALL of these must hold:
 #   * a dump file is passed as $1 and exists,
-#   * RESTORE_TARGET_DB is set (the DB to restore INTO — chosen explicitly),
-#   * CONFIRM_RESTORE=yes  (typed confirmation),
-#   * APPLY=1              (otherwise it only prints what it would do),
-#   * and, if RESTORE_TARGET_DB does NOT end in "_test" (i.e. it looks like a
-#     real/production database), FORCE_PROD_RESTORE=yes must ALSO be set.
+#   * RESTORE_TARGET_DB is set to a plain [A-Za-z0-9_] identifier,
+#   * CONFIRM_RESTORE=yes,
+#   * APPLY=1,
+#   * and, if RESTORE_TARGET_DB does NOT end in "_test", FORCE_PROD_RESTORE=yes.
+#
+# ISOLATION FOR DRILLS: the "_test" suffix is only a naming GUARD-RAIL against a
+# fat-finger — it is NOT an isolation boundary. A restore drill MUST run against a
+# SEPARATE, DISPOSABLE MySQL instance with its own restricted credentials and no
+# network path to development/production — never merely a differently-named schema
+# on a shared privileged server. See docs/BACKUP-RESTORE-10F.md.
+#
+# TRUST: only restore artifacts of KNOWN PROVENANCE (produced by
+# scripts/backup-mysql.sh). If the dump has a "<file>.sha256" sidecar it is
+# verified. There is deliberately NO flag that skips integrity validation.
 #
 # Reads DB connection config from the environment (never echoes the password;
-# uses a temp --defaults-extra-file with 0600 perms, removed by a trap):
+# uses a temp --defaults-extra-file with 0600 perms). For cron/non-interactive
+# use, load env via `node scripts/with-env.mjs` — never `source` a dotenv file.
 #     DB_HOST (default 127.0.0.1), DB_PORT (default 3306), DB_USER (required),
 #     DB_PASSWORD (may be empty)
 #
-# Usage (safe dry-run — DEFAULT):
-#     RESTORE_TARGET_DB=easygas_test CONFIRM_RESTORE=yes \
+# Usage (safe dry-run — DEFAULT; a *_test target needs no force flag):
+#     RESTORE_TARGET_DB=easygas_restore_drill_test CONFIRM_RESTORE=yes \
 #       DB_USER=... DB_PASSWORD=... bash scripts/restore-mysql.sh dump.sql.gz
-#
-# Usage (apply to a *_test DB):
-#     APPLY=1 RESTORE_TARGET_DB=easygas_test CONFIRM_RESTORE=yes \
+# Usage (apply to a disposable *_test drill DB):
+#     APPLY=1 RESTORE_TARGET_DB=easygas_restore_drill_test CONFIRM_RESTORE=yes \
 #       DB_USER=... DB_PASSWORD=... bash scripts/restore-mysql.sh dump.sql.gz
-#
-# Usage (apply to a real DB — requires the extra force flag):
-#     APPLY=1 FORCE_PROD_RESTORE=yes RESTORE_TARGET_DB=easygas \
-#       CONFIRM_RESTORE=yes DB_USER=... DB_PASSWORD=... \
-#       bash scripts/restore-mysql.sh dump.sql.gz
+# (A non-*_test target additionally requires FORCE_PROD_RESTORE=yes — see the guard below.)
 #
 set -euo pipefail
 
@@ -47,58 +52,83 @@ CONFIRM_RESTORE="${CONFIRM_RESTORE:-}"
 FORCE_PROD_RESTORE="${FORCE_PROD_RESTORE:-}"
 APPLY="${APPLY:-0}"
 
-command -v mysql >/dev/null 2>&1 || die "mysql client not found on PATH"
-command -v gzip  >/dev/null 2>&1 || die "gzip not found on PATH"
+command -v mysql     >/dev/null 2>&1 || die "mysql client not found on PATH"
+command -v gzip      >/dev/null 2>&1 || die "gzip not found on PATH"
+command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found on PATH"
 
 # --- Input guards (fail closed) ---------------------------------------------
-[ -n "$DUMP_FILE" ]         || die "No dump file given. Usage: restore-mysql.sh <dump.sql.gz>"
-[ -f "$DUMP_FILE" ]         || die "Dump file not found: $DUMP_FILE"
-[ -n "$DB_USER" ]           || die "DB_USER is empty — refusing."
-[ -n "$RESTORE_TARGET_DB" ] || die "RESTORE_TARGET_DB is empty — set the database to restore INTO."
+[ -n "$DUMP_FILE" ]            || die "No dump file given. Usage: restore-mysql.sh <dump.sql.gz>"
+[ -f "$DUMP_FILE" ]            || die "Dump file not found: $DUMP_FILE"
+[ -n "$DB_USER" ]             || die "DB_USER is empty — refusing."
+[ -n "$RESTORE_TARGET_DB" ]   || die "RESTORE_TARGET_DB is empty — set the database to restore INTO."
 [ "$CONFIRM_RESTORE" = "yes" ] || die "CONFIRM_RESTORE is not 'yes' — refusing (typed confirmation required)."
 
-# Production-shaped target requires the extra explicit force flag. Heuristic:
-# anything NOT ending in "_test" is treated as potentially production.
+# --- (E.5) Validate the target identifier BEFORE it is ever put into SQL -----
+[[ "$RESTORE_TARGET_DB" =~ ^[A-Za-z0-9_]+$ ]] \
+  || die "RESTORE_TARGET_DB '$RESTORE_TARGET_DB' is not a plain [A-Za-z0-9_] identifier — refusing (would be unsafe to interpolate into SQL)."
+
+# Production-shaped target requires the extra explicit force flag (guard-rail).
 if [[ "$RESTORE_TARGET_DB" != *_test ]]; then
-  if [ "$FORCE_PROD_RESTORE" != "yes" ]; then
-    die "Target '$RESTORE_TARGET_DB' does not end in '_test' (looks like production). Set FORCE_PROD_RESTORE=yes to allow. Refusing."
-  fi
+  [ "$FORCE_PROD_RESTORE" = "yes" ] \
+    || die "Target '$RESTORE_TARGET_DB' does not end in '_test' (looks like production). Set FORCE_PROD_RESTORE=yes to allow. Refusing."
   echo "WARNING: restoring into a NON-test database '$RESTORE_TARGET_DB' (FORCE_PROD_RESTORE=yes)."
 fi
 
-# --- HAZARD GUARD (fail closed, best-effort heuristic — NOT a comprehensive SQL ---
-# parser): reject a dump that carries its OWN database context. `mysqldump
-# --databases`/`--all-databases` embed `CREATE DATABASE …` and `USE <db>;` as
-# line-start statements; piped into `mysql <target>`, the `USE` lines SILENTLY
-# redirect every statement to the dump's database, ignoring RESTORE_TARGET_DB and
-# thereby bypassing BOTH the `_test` and FORCE_PROD_RESTORE guards above (a dump of
-# a production DB would overwrite production even with RESTORE_TARGET_DB=..._test).
-#
-# WHAT THIS RELIABLY CATCHES: every dump the mysqldump family actually produces —
-# plain `CREATE DATABASE`/`USE` at line start, leading whitespace/case variants, and
-# the `/*!NNNNN … */` executable-comment wrapper (executed by real mysql). It is
-# anchored at line start so quoted DATA values that merely contain the word "use"
-# do not trip it.
-# KNOWN LIMITS (this is a heuristic, not a proof of safety): a hand-crafted dump
-# could still evade it — e.g. a `USE` mid-line after another statement, or split
-# across lines. So this is DEFENSE-IN-DEPTH, not a security boundary. The actual
-# guarantee is: only restore dumps produced by scripts/backup-mysql.sh, which dumps
-# a SINGLE database positionally and emits no CREATE DATABASE/USE at all.
-#
-# grep -c (not -q): reads the WHOLE stream, so gzip never gets SIGPIPE — which under
-# `set -o pipefail` would otherwise make this pipeline exit non-zero on a match and
-# silently skip the guard. `|| true` absorbs grep's exit 1 on a zero count.
-HAZARD_HITS="$(gzip -dc "$DUMP_FILE" 2>/dev/null \
-  | grep -ciE '^[[:space:]]*(/\*![0-9]*[[:space:]]+)?(CREATE[[:space:]]+DATABASE\b|USE[[:space:]]+`?[A-Za-z0-9_$]+`?)' || true)"
-if [ "${HAZARD_HITS:-0}" != "0" ]; then
-  die "Dump appears to embed CREATE DATABASE / USE ($HAZARD_HITS line(s)) and would target its OWN database, ignoring RESTORE_TARGET_DB='$RESTORE_TARGET_DB' and bypassing the safety guards. Re-create it with scripts/backup-mysql.sh (single-DB, no USE) or strip those lines. Refusing."
+# --- Private temp workspace; everything cleaned on ANY exit ------------------
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/easygas-restore-XXXXXX")"
+chmod 700 "$WORK_DIR"
+DEFAULTS_FILE="${WORK_DIR}/client.cnf"
+TMP_GZ="${WORK_DIR}/input.sql.gz"
+TMP_SQL="${WORK_DIR}/input.sql"
+cleanup() { rm -rf "$WORK_DIR"; }
+trap cleanup EXIT INT TERM
+
+# --- (E.9) Snapshot the artifact so the bytes we VALIDATE are the bytes we USE
+cp -- "$DUMP_FILE" "$TMP_GZ" || die "Could not copy dump to the private workspace."
+
+# --- (E.8) Provenance: verify a sidecar checksum if present -----------------
+if [ -f "${DUMP_FILE}.sha256" ]; then
+  EXPECTED="$(awk '{print $1}' "${DUMP_FILE}.sha256")"
+  ACTUAL="$(sha256sum "$TMP_GZ" | awk '{print $1}')"
+  [ -n "$EXPECTED" ] || die "Sidecar ${DUMP_FILE}.sha256 is empty/unreadable — refusing."
+  [ "$EXPECTED" = "$ACTUAL" ] \
+    || die "Checksum MISMATCH: sidecar says $EXPECTED, artifact is $ACTUAL. Refusing (corrupt or tampered)."
+  echo "Provenance: sha256 matches sidecar ($ACTUAL)."
+else
+  echo "NOTE: no '${DUMP_FILE}.sha256' sidecar — provenance is UNVERIFIED. Only restore artifacts produced by scripts/backup-mysql.sh."
 fi
 
-# --- Secret handling: temp defaults-extra-file (0600), removed on exit -------
-DEFAULTS_FILE="$(mktemp "${TMPDIR:-/tmp}/easygas-restore-XXXXXX.cnf")"
-cleanup() { rm -f "$DEFAULTS_FILE"; }
-trap cleanup EXIT INT TERM
-chmod 600 "$DEFAULTS_FILE"
+# --- (E.2/E.3) Validate integrity + decompress ONCE, before any DB mutation --
+gzip -t "$TMP_GZ" || die "gzip integrity check FAILED — the archive is corrupt/truncated. Refusing (no DB was touched)."
+# Decompress the validated snapshot to a plain SQL file; gzip exit is checked
+# directly (no pipe → no swallowed status). This TMP_SQL is what mysql consumes.
+if ! gzip -dc "$TMP_GZ" > "$TMP_SQL"; then
+  die "Decompression FAILED — refusing (no DB was touched)."
+fi
+[ -s "$TMP_SQL" ] || die "Decompressed SQL is empty — refusing (no DB was touched)."
+
+# --- (E.6) Reject a dump that carries its OWN database context ---------------
+# `mysqldump --databases/--all-databases` embeds line-start `CREATE DATABASE …`
+# and `USE <db>;` (including the executable `/*!NNNNN … */` comment wrapper that
+# real mysql runs). Piped into `mysql`, a `USE` line SILENTLY redirects every
+# statement to the dump's own database, ignoring RESTORE_TARGET_DB.
+#
+# This is DEFENSE-IN-DEPTH, NOT a security boundary — a hand-crafted dump could
+# still evade a line-anchored scan (e.g. a `USE` after `;` mid-line). The real
+# guarantee is (a) restoring only trusted artifacts from scripts/backup-mysql.sh
+# (which dump a SINGLE database positionally and emit no CREATE DATABASE/USE),
+# and (b) an isolated disposable target. We do NOT claim that scrubbing lines
+# makes an arbitrary/untrusted dump safe — it does not.
+# shellcheck disable=SC2016  # the $ is a literal regex char; single quotes are intentional
+HAZARD_HITS="$(grep -ciE '^[[:space:]]*(/\*![0-9]*[[:space:]]+)?(CREATE[[:space:]]+DATABASE\b|USE[[:space:]]+`?[A-Za-z0-9_$]+`?)' "$TMP_SQL" || true)"
+if [ "${HAZARD_HITS:-0}" != "0" ]; then
+  die "Dump embeds CREATE DATABASE / USE ($HAZARD_HITS line(s)) and would target its OWN database, ignoring RESTORE_TARGET_DB='$RESTORE_TARGET_DB'. This is not a dump from scripts/backup-mysql.sh. Refusing (no DB was touched)."
+fi
+
+echo "Artifact validated: integrity OK, single-database (no embedded USE/CREATE DATABASE)."
+
+# --- Secret handling: temp defaults-extra-file (0600) -----------------------
+: > "$DEFAULTS_FILE"; chmod 600 "$DEFAULTS_FILE"
 {
   echo "[client]"
   echo "user=${DB_USER}"
@@ -107,7 +137,7 @@ chmod 600 "$DEFAULTS_FILE"
   echo "port=${DB_PORT}"
 } > "$DEFAULTS_FILE"
 
-# --- Dry-run vs apply -------------------------------------------------------
+# --- Plan ------------------------------------------------------------------
 echo "Restore plan:"
 echo "  dump file : $DUMP_FILE"
 echo "  target DB : $RESTORE_TARGET_DB  (host $DB_HOST:$DB_PORT)"
@@ -116,13 +146,10 @@ echo "  mode      : $( [ "$APPLY" = "1" ] && echo 'APPLY (DESTRUCTIVE overwrite)
 if [ "$APPLY" != "1" ]; then
   cat <<EOF
 
-DRY-RUN only. Nothing was changed. To actually restore, re-run with APPLY=1.
-It WOULD:
+DRY-RUN only — the artifact was fully validated above and NOTHING was changed.
+To actually restore, re-run with APPLY=1. It WOULD:
   1. CREATE DATABASE IF NOT EXISTS \`$RESTORE_TARGET_DB\`
-  2. Pipe: gzip -dc "$DUMP_FILE" | mysql --one-database \`$RESTORE_TARGET_DB\`
-     (this overwrites objects contained in the dump; --one-database is a
-      rudimentary mysql-client filter added as defense-in-depth — NOT a security
-      boundary — behind the fail-closed hazard scan above).
+  2. mysql \`$RESTORE_TARGET_DB\` < <validated-decompressed-sql>
 EOF
   exit 0
 fi
@@ -130,14 +157,15 @@ fi
 # --- APPLY: perform the destructive restore ---------------------------------
 echo "Ensuring target database exists..."
 mysql --defaults-extra-file="$DEFAULTS_FILE" \
-  -e "CREATE DATABASE IF NOT EXISTS \`$RESTORE_TARGET_DB\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+  -e "CREATE DATABASE IF NOT EXISTS \`$RESTORE_TARGET_DB\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" \
+  || die "Could not ensure target database exists (no data was imported)."
 
-echo "Restoring (this overwrites data)..."
-set +e
-gzip -dc "$DUMP_FILE" | mysql --defaults-extra-file="$DEFAULTS_FILE" --one-database "$RESTORE_TARGET_DB"
-STATUS=${PIPESTATUS[1]}
-set -e
-[ "$STATUS" -eq 0 ] || die "Restore failed (mysql exit $STATUS). The target DB may be in a partial state — investigate before use."
+echo "Restoring (this overwrites objects contained in the dump)..."
+# Feed the VALIDATED temp SQL file directly (no gzip in this pipe → the mysql
+# exit status is authoritative; nothing to swallow).
+if ! mysql --defaults-extra-file="$DEFAULTS_FILE" "$RESTORE_TARGET_DB" < "$TMP_SQL"; then
+  die "Restore FAILED (mysql error). The target '$RESTORE_TARGET_DB' may now be in a PARTIAL/INCONSISTENT state — investigate and do NOT use it until re-restored from a good artifact."
+fi
 
 echo "Restore into '$RESTORE_TARGET_DB' complete."
 
@@ -146,25 +174,18 @@ cat <<'EOF'
 
 ================ POST-RESTORE VERIFICATION CHECKLIST ================
 Run these against the RESTORED database (point DB_NAME/env at it first).
-DB and evidence must have been restored as a CONSISTENT PAIR.
+DB and evidence must have been restored as a reconciled recovery point
+(see docs/BACKUP-RESTORE-10F.md — nearby schedules are NOT a consistency proof).
 
-  1. Migrations up to date:
-        npm run migrate:status
-     (apply if needed:  npm run migrate)
-
-  2. Audit hash chain intact (tamper-evidence):
-        npm run audit:verify
-     (script added by another Phase 10F contributor; confirm exact name)
-
-  3. Evidence reconciliation — DRY-RUN first (no changes):
-        npm run reconcile
-     Investigate any dangling references before applying fixes.
-
-  4. Completion snapshots readable / active risk policy present:
-        npm run risk-policy
-
-  5. Application readiness (after starting the app against this DB):
+  1. Migrations recorded/pending:      npm run migrate:status
+     (bookkeeping only — NOT a full schema verification)
+  2. Audit hash chain consistency:     npm run audit:verify
+     (consistency of the chain — NOT proof that no history was lost)
+  3. Evidence reconciliation (DRY-RUN):  npm run reconcile
+     (investigate dangling references before applying any fix)
+  4. Active risk policy present:       npm run risk-policy
+  5. App readiness (after starting against this DB, on the PRIVATE port):
         curl -fsS http://127.0.0.1:4000/api/v1/ready
-     Expect HTTP 200 {"status":"ready"}; 503 means a dependency is down.
+     Expect 200 {"status":"ready"}; 503 means a dependency is down.
 ====================================================================
 EOF

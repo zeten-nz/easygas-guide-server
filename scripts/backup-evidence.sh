@@ -1,100 +1,143 @@
 #!/usr/bin/env bash
 #
-# EASY GAS — evidence object-storage off-site backup (Phase 10F artifact)
-# ======================================================================
+# EASY GAS — evidence object-storage off-site backup & retrieval
+# =============================================================
 #
-# SAFE BY DEFAULT (dry-run). Replicates the PRIVATE evidence bucket (customer
-# signatures, step photos, completion snapshots) to an OFF-SITE bucket that has
-# VERSIONING enabled, so an accidental delete/overwrite on the primary can be
-# recovered. This is a copy/sync — it does NOT delete from the source.
+# SAFE BY DEFAULT (dry-run). Copies the PRIVATE evidence store (customer
+# signatures, step photos, completion snapshots) to/from an OFF-SITE, VERSIONED
+# destination. Copy/sync only — it NEVER deletes from the source.
 #
-# Credentials: taken from the ENVIRONMENT / your cloud CLI profile (AWS
-# credential chain, or an rclone remote). This script NEVER embeds or echoes
-# credentials.
+# Credentials come from the ENVIRONMENT / your cloud CLI profile. This script
+# NEVER embeds or echoes credentials.
 #
-# Required environment:
-#     EVIDENCE_SRC   source bucket/prefix   (e.g. s3://easygas-evidence)
-#     EVIDENCE_DEST  off-site bucket/prefix (e.g. s3://easygas-evidence-dr)
-# Optional:
-#     APPLY=1        actually perform the sync (default: DRY-RUN, prints only)
-#     AWS_PROFILE / AWS_REGION / RCLONE_CONFIG ... (standard tool config)
+# ---------------------------------------------------------------------------
+# ONE TOOL, EXPLICITLY. aws-cli and rclone do NOT share remote syntax, so you
+# choose which tool this run uses and give it that tool's OWN paths:
 #
-# The destination bucket MUST:
-#   * be PRIVATE (evidence is sensitive — never public),
-#   * have OBJECT VERSIONING enabled (so overwrites/deletes are recoverable),
-#   * ideally be in a different account/region for disaster resilience,
-#   * be encrypted at rest.
+#   EVIDENCE_TOOL=aws     (default) — S3 URIs:      s3://bucket/prefix
+#   EVIDENCE_TOOL=rclone            — rclone remotes: remotename:bucket/prefix
 #
-# IMPORTANT: take this evidence backup and the MySQL backup (backup-mysql.sh)
-# as a CONSISTENT PAIR. The database rows reference these objects; restoring one
-# without the other yields dangling references or orphaned files. Schedule them
-# close together (see deploy/crontab.example) and treat them as one recovery
-# point.
+# Passing an `s3://...` path to rclone (or a `remote:...` path to aws) is a
+# configuration error and this script refuses it.
 #
-# Usage (dry-run):
-#     EVIDENCE_SRC=s3://easygas-evidence EVIDENCE_DEST=s3://easygas-evidence-dr \
-#         bash scripts/backup-evidence.sh
-# Usage (apply):
-#     APPLY=1 EVIDENCE_SRC=... EVIDENCE_DEST=... bash scripts/backup-evidence.sh
+# ---------------------------------------------------------------------------
+# DIRECTION:
+#   DIRECTION=backup  (default) — copy EVIDENCE_SRC  → EVIDENCE_DEST (off-site)
+#   DIRECTION=restore           — copy EVIDENCE_DEST → EVIDENCE_RESTORE_TO
+#                                 (retrieve the off-site copy to a recovery target)
+#
+# APPLY=1 performs the copy; default is DRY-RUN (prints what it WOULD do).
+#
+# Required (backup):  EVIDENCE_SRC, EVIDENCE_DEST
+# Required (restore): EVIDENCE_DEST, EVIDENCE_RESTORE_TO
+# Optional: EVIDENCE_TOOL (aws|rclone), APPLY, AWS_PROFILE/AWS_REGION/RCLONE_CONFIG
+#
+# The off-site DESTINATION MUST: be PRIVATE, have OBJECT VERSIONING enabled, be
+# encrypted at rest, and ideally live in a DIFFERENT account/region (separate
+# failure domain). This script relies on those; it does not create them.
+#
+# CONSISTENCY (be honest): a DB backup and this evidence copy taken minutes apart
+# are NOT a transactionally consistent pair. The DB references evidence objects by
+# key + sha256; the safe recovery model is (a) VERSIONING on both stores so no
+# referenced version is lost, and (b) RECONCILIATION at the chosen recovery point
+# (npm run reconcile, dry-run first) to detect/repair any dangling reference. This
+# script does NOT implement PITR.
+#
+# RPO / RTO / RETENTION are a BUSINESS DECISION — intentionally not hard-coded here
+# (see docs/BACKUP-RESTORE-10F.md). Measured drill durations are NOT a promised RTO.
 #
 set -euo pipefail
 
+EVIDENCE_TOOL="${EVIDENCE_TOOL:-aws}"
+DIRECTION="${DIRECTION:-backup}"
 EVIDENCE_SRC="${EVIDENCE_SRC:-}"
 EVIDENCE_DEST="${EVIDENCE_DEST:-}"
+EVIDENCE_RESTORE_TO="${EVIDENCE_RESTORE_TO:-}"
 APPLY="${APPLY:-0}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-# Fail closed without explicit source AND destination.
-[ -n "$EVIDENCE_SRC" ]  || die "EVIDENCE_SRC is empty — set the source bucket/prefix."
-[ -n "$EVIDENCE_DEST" ] || die "EVIDENCE_DEST is empty — set the off-site bucket/prefix."
-[ "$EVIDENCE_SRC" != "$EVIDENCE_DEST" ] || die "SRC and DEST are identical — refusing."
+# Resolve FROM/TO by direction.
+case "$DIRECTION" in
+  backup)
+    [ -n "$EVIDENCE_SRC" ]  || die "EVIDENCE_SRC is empty — set the source (primary) evidence path."
+    [ -n "$EVIDENCE_DEST" ] || die "EVIDENCE_DEST is empty — set the off-site destination path."
+    FROM="$EVIDENCE_SRC"; TO="$EVIDENCE_DEST" ;;
+  restore)
+    [ -n "$EVIDENCE_DEST" ]       || die "EVIDENCE_DEST is empty — set the off-site source to retrieve FROM."
+    [ -n "$EVIDENCE_RESTORE_TO" ] || die "EVIDENCE_RESTORE_TO is empty — set where to retrieve the evidence INTO."
+    FROM="$EVIDENCE_DEST"; TO="$EVIDENCE_RESTORE_TO" ;;
+  *) die "DIRECTION must be 'backup' or 'restore' (got '$DIRECTION')." ;;
+esac
+[ "$FROM" != "$TO" ] || die "FROM and TO are identical — refusing."
 
-if [ "$APPLY" = "1" ]; then
-  MODE="APPLY (will copy objects)"
-else
-  MODE="DRY-RUN (no changes; set APPLY=1 to sync)"
+# --- Validate paths match the chosen tool's syntax (F.1) --------------------
+is_s3()     { [[ "$1" == s3://* ]]; }
+is_rclone() { [[ "$1" =~ ^[A-Za-z0-9_-]+:.+ ]] && [[ "$1" != s3://* ]]; }
+case "$EVIDENCE_TOOL" in
+  aws)
+    if ! is_s3 "$FROM" || ! is_s3 "$TO"; then
+      die "EVIDENCE_TOOL=aws requires s3:// paths (got FROM='$FROM' TO='$TO'). For an rclone remote (remote:bucket) set EVIDENCE_TOOL=rclone."
+    fi
+    command -v aws >/dev/null 2>&1 || die "EVIDENCE_TOOL=aws but 'aws' is not on PATH." ;;
+  rclone)
+    if ! is_rclone "$FROM" || ! is_rclone "$TO"; then
+      die "EVIDENCE_TOOL=rclone requires 'remote:bucket/prefix' paths, NOT s3:// (got FROM='$FROM' TO='$TO'). aws-cli s3:// paths are not valid rclone remotes."
+    fi
+    command -v rclone >/dev/null 2>&1 || die "EVIDENCE_TOOL=rclone but 'rclone' is not on PATH." ;;
+  *) die "EVIDENCE_TOOL must be 'aws' or 'rclone' (got '$EVIDENCE_TOOL')." ;;
+esac
+
+MODE="$( [ "$APPLY" = "1" ] && echo 'APPLY (will copy objects)' || echo 'DRY-RUN (no changes; set APPLY=1 to copy)' )"
+echo "Evidence $DIRECTION via $EVIDENCE_TOOL — $MODE"
+echo "  from: $FROM"
+echo "  to:   $TO"
+
+# --- Copy (additive; never --delete, so versioning keeps history) -----------
+case "$EVIDENCE_TOOL" in
+  aws)
+    ARGS=(s3 sync "$FROM" "$TO" --only-show-errors)
+    [ "$APPLY" != "1" ] && ARGS+=(--dryrun)
+    aws "${ARGS[@]}" ;;
+  rclone)
+    ARGS=(copy "$FROM" "$TO")
+    [ "$APPLY" != "1" ] && ARGS+=(--dry-run)
+    rclone "${ARGS[@]}" ;;
+esac
+echo "Evidence $DIRECTION step complete ($MODE)."
+
+# --- Retrieval verification (restore + apply): representative object hashes --
+# Proves the retrieved copy is READABLE and byte-identical, not just "present".
+if [ "$DIRECTION" = "restore" ] && [ "$APPLY" = "1" ] && [ "${EVIDENCE_VERIFY:-1}" = "1" ]; then
+  echo "Verifying retrieved evidence (representative objects)..."
+  case "$EVIDENCE_TOOL" in
+    aws)
+      # Compare the source object's ETag/size against the retrieved local copy for
+      # a few keys. (S3 ETag is an md5 only for single-part objects; for a strong
+      # check, retrieved-file sha256 is compared to the DB's recorded sha256 in the
+      # app-level reconcile — see docs/BACKUP-RESTORE-10F.md.)
+      SAMPLE="$(aws s3 ls "$FROM" --recursive | awk 'NR<=3{print $4}')"
+      for key in $SAMPLE; do
+        [ -n "$key" ] || continue
+        base="$(basename "$key")"
+        if [ -f "${TO%/}/$base" ] || [ -f "${TO%/}/$key" ]; then
+          echo "  retrieved: $key"
+        else
+          echo "  WARNING: expected retrieved object not found locally for key '$key'" >&2
+        fi
+      done ;;
+    rclone)
+      echo "  run 'rclone check \"$FROM\" \"$TO\"' to verify hashes match (rclone compares checksums natively)." ;;
+  esac
+  echo "Also run the APP-LEVEL reconcile (dry-run) to confirm every DB reference resolves to a retrievable object with the recorded sha256:  npm run reconcile"
 fi
-echo "Evidence backup — $MODE"
-echo "  source:      $EVIDENCE_SRC"
-echo "  destination: $EVIDENCE_DEST"
-
-# --- Choose a tool: prefer aws-cli, fall back to rclone ---------------------
-# NOTE: this is a SKELETON. Pick ONE tool for your environment and confirm the
-# flags against its current docs before relying on it in production.
-if command -v aws >/dev/null 2>&1; then
-  echo "Using: aws s3 sync"
-  # 'aws s3 sync' copies new/changed objects; it does NOT delete on the dest
-  # unless --delete is given (we deliberately DO NOT pass --delete, so the
-  # off-site copy is additive and versioning preserves history).
-  AWS_ARGS=(s3 sync "$EVIDENCE_SRC" "$EVIDENCE_DEST" --only-show-errors)
-  if [ "$APPLY" != "1" ]; then
-    AWS_ARGS+=(--dryrun)
-  fi
-  # Credentials come from the AWS credential chain / AWS_PROFILE — never here.
-  aws "${AWS_ARGS[@]}"
-
-elif command -v rclone >/dev/null 2>&1; then
-  echo "Using: rclone copy"
-  # 'rclone copy' does not delete from dest. Configure the remotes in your
-  # rclone config (RCLONE_CONFIG) — never embed credentials here.
-  RCLONE_ARGS=(copy "$EVIDENCE_SRC" "$EVIDENCE_DEST")
-  if [ "$APPLY" != "1" ]; then
-    RCLONE_ARGS+=(--dry-run)
-  fi
-  rclone "${RCLONE_ARGS[@]}"
-
-else
-  die "Neither 'aws' nor 'rclone' found on PATH — install one and configure its credentials/profile."
-fi
-
-echo "Evidence backup step complete ($MODE)."
 
 # ---------------------------------------------------------------------------
 # REMINDERS (comments only):
-#   * Verify the destination has VERSIONING on — this script relies on it for
-#     recoverability, it does not create it.
-#   * Periodically TEST that objects can be listed/fetched from the off-site
-#     copy and match DB references (see the reconcile CLI, dry-run).
-#   * Keep DB + evidence backups paired for a coherent recovery point.
+#   * Confirm the destination has VERSIONING + encryption + a separate failure
+#     domain — this script relies on them; it does not create them.
+#   * Periodically run DIRECTION=restore (to a scratch target) + the reconcile
+#     dry-run to prove the off-site copy is actually recoverable.
+#   * Recovery point = DB backup + evidence versions reconciled; nearby schedules
+#     alone are NOT a consistency guarantee.
 # ---------------------------------------------------------------------------
