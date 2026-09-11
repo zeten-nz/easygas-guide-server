@@ -3,12 +3,57 @@
 > This is the **canonical, git-tracked** project status. The copy at the repo-root
 > (`../../PROJECT_STATUS.md`, outside both git repos) is now **non-authoritative**.
 
-**Current phase:** Phase 11B — Product & Service Catalogue + Reference Data — **implemented + tested
-locally** on branch `phase/11B-catalog-reference-data`. Server branched from `origin/main` (`04a888c`,
-after the Phase 11A merge). Client 11A **PR #9 is now merged** (client `main` = `2157185`); the client
-11B branch has been **integrated with `origin/main` via a normal merge** (it originally only lacked that
-merge commit — no substantive divergence). **Not pushed / not merged / not deployed.** Phase 11A retained
-below as prior-work reference.
+**Current phase:** Phase 11C — Evidence Review UX & Understandable Risk Policy — **implemented + tested
+locally** on branch `phase/11C-evidence-risk-ux` in both repos (server from `origin/main` `4df8c91`,
+client from `origin/main` `de0dc1f`, both post-11B-merge). Full detail: `PHASE-11C.md` (+ client
+`docs/PHASE-11C.md`). **Not pushed / not merged / not deployed.** Phase 11B merged (server main `4df8c91`,
+client main `de0dc1f`). Prior phases retained below as reference.
+
+## Phase 11C — Evidence Review UX & Understandable Risk Policy
+
+Read-only, additive; **no migration** (the existing model sufficed), no safety thresholds/approval
+authority/business rules changed, no policy activated on developer/production, no production data touched.
+
+- **Completed-job evidence** — new `GET /jobs/:id/photos` (jobs.view, branch-scoped 404): a truthful,
+  cross-step/cross-cycle listing where each photo's **cycle is derived only from the immutable
+  completion snapshot** (never from today's `jobs.cycle`), only `READY` is real/downloadable, the
+  uploader is the actual performer, and a server-computed `role`
+  (COMPLETED_CYCLE / CURRENT / SUPERSEDED_ATTEMPT / PENDING / UNVERIFIED / FAILED) labels provenance.
+  Downloads reuse the existing READY-only step file endpoint (no bypass; no signed URLs anywhere).
+  `GET /jobs` gained additive `technicianId`/`dateFrom`/`dateTo` filters.
+- **Risk policy** — new read-only `GET /risk-policy/versions/:version` (definition + server-computed
+  classified grid + approver/provenance + blocked operations) and
+  `GET /risk-policy/versions/:version/preview` (illustrative classification via the SHARED evaluator;
+  creates nothing, works for DRAFT/ACTIVE/RETIRED, and is **distinct from production `assessRisk`**,
+  which still fails closed without an ACTIVE policy). `listMatrices` now returns `approvedByName`/
+  `supersededBy`. Provisional (definition provenance) is kept distinct from lifecycle approval.
+- **Client** — completed-job filters (status/branch/date + a bounded searchable **responsible-technician**
+  combobox, URL-synced) + a "Fotolar" gallery embedded in JobDetail (grouped by cycle/step, lazy
+  thumbnails, honest role labels incl. multi-cycle + HISTORICAL_UNCLASSIFIED) + an accessible full-screen
+  photo viewer (top-bar/side controls, no bottom-anchored footer; keyboard/focus/zoom/retry), and a
+  redesigned `/app/admin/risk-policy` (plain-language explainer, real server matrix, illustrative preview,
+  history + compare, activation/retirement flow using the centered Modal).
+- **Provenance (verified):** photo cycle is derived only from the immutable snapshot; a photo can span
+  MULTIPLE snapshots (`cycles[]`); "Joriy" is reliable current-attempt evidence; insufficient provenance is
+  HISTORICAL_UNCLASSIFIED (never "current"); the uploader (`created_by`) is kept distinct from the step
+  performer (`completed_by`) and never guess-attributed. `GET /jobs/technicians` is historical filtering
+  access, not assignment eligibility.
+- **Acceptance review:** patched the two prod npm-audit advisories (morgan 1.11→1.12, multer 2.2→2.3 —
+  compatible minor bumps, no `--force`); **prod & full audit now 0** (client prod 0 / full 5 dev-only,
+  unchanged); upload workflows re-verified on multer 2.3.0.
+- **Verification (local, isolated `*_test`):** server `test:job-evidence` **11/11** + `test:riskpolicy-preview`
+  **7/7**, full `test:all` green, typecheck/build/`openapi:check` clean (**123 ops / 94 paths, no drift**).
+  Client **77 component tests**, lint + `tsc -b` + build clean, bundle budget OK; browser E2E
+  `evidence-policy.spec` (9 tests) on chromium + Pixel-5. The Playwright harness seeds `E2E-EVI-<proj>`
+  (completed) + `E2E-EVR-<proj>` (reopened) evidence jobs via the real workflow.
+- **Cross-repo:** client needs the new server endpoints → **merge server first, then client**.
+
+---
+
+## Phase 11B — Product & Service Catalogue + Reference Data — MERGED
+
+Phase 11B was **merged** (server `main` = `4df8c91`, client `main` = `de0dc1f`; PRs #9/#10). Original
+implementation notes retained below.
 
 **Repos:** two separate git repositories — `server/` and `client/`. Project-root files (like the old
 `PROJECT_STATUS.md`) live **outside** both repos.

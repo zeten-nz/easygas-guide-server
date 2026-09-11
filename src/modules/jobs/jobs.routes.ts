@@ -16,6 +16,7 @@ import { z } from 'zod';
 import * as service from './jobs.service';
 import * as completionService from './completion.service';
 import * as assignmentService from './assignment.service';
+import * as jobEvidence from '../photos/job-evidence.service';
 import { ApiError } from '../../utils/errors';
 import type { ListJobsQuery } from './jobs.validators';
 
@@ -47,6 +48,18 @@ jobsRouter.get('/mine', requirePermission('jobs.view'), async (req: Request, res
   const page = req.query.page ? Number(req.query.page) : undefined;
   const pageSize = req.query.pageSize ? Number(req.query.pageSize) : undefined;
   res.json(await assignmentService.listMyJobs(req.user!, { page, pageSize }));
+});
+
+// Phase 11C — responsible technicians (with jobs in scope) for the completed-job
+// list filter. Bounded + searchable; branch-scoped; declared before '/:id'.
+const techQuery = z.object({
+  search: z.string().trim().max(100).optional(),
+  id: z.coerce.number().int().positive().optional(),
+  limit: z.coerce.number().int().min(1).max(50).optional(),
+});
+jobsRouter.get('/technicians', requirePermission('jobs.view'), validate({ query: techQuery }), async (req: Request, res: Response) => {
+  const q = req.query as unknown as { search?: string; id?: number; limit?: number };
+  res.json(await assignmentService.listResponsibleTechnicians(req.user!, q));
 });
 
 jobsRouter.get(
@@ -174,6 +187,22 @@ jobsRouter.get('/:id/completion-snapshot', requirePermission('jobs.view'), valid
   const snapshot = await completionService.getCompletionSnapshotFor(jobId, cycle);
   if (!snapshot) throw new ApiError(404, 'NOT_FOUND', 'Snapshot topilmadi');
   res.json(snapshot);
+});
+
+// Phase 11C: job-level photo-evidence listing for completed-job review. Truthful
+// per-photo provenance (cycle derived only from snapshots, status, attempt,
+// uploader-vs-assigned), bounded pagination. Downloads still go through the
+// existing READY-only step file endpoint — this adds no bypass. (jobs.view;
+// branch-scoped 404 inside the service.)
+const jobPhotosQuery = z.object({
+  page: z.coerce.number().int().positive().default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+  cycle: z.coerce.number().int().positive().optional(),
+  jobStepId: z.coerce.number().int().positive().optional(),
+});
+jobsRouter.get('/:id/photos', requirePermission('jobs.view'), validate({ params: jobIdParamsSchema, query: jobPhotosQuery }), async (req: Request, res: Response) => {
+  const q = req.query as unknown as { page: number; limit: number; cycle?: number; jobStepId?: number };
+  res.json(await jobEvidence.listJobPhotos(req.user!, Number(req.params.id), q));
 });
 
 jobsRouter.get(

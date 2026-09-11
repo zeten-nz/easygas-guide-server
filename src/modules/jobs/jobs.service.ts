@@ -191,6 +191,11 @@ export async function listJobs(actor: AuthUser, query: ListJobsQuery): Promise<L
       q.where('jobs.branch_id', query.branchId);
     }
     if (query.status) q.where('jobs.status', query.status);
+    // Phase 11C: additive completed-job review filters (allowlisted; branch scope
+    // above still confines a scoped actor regardless of these).
+    if (query.technicianId) q.where('jobs.assigned_technician_id', query.technicianId);
+    if (query.dateFrom) q.where('jobs.created_at', '>=', `${query.dateFrom} 00:00:00`);
+    if (query.dateTo) q.where('jobs.created_at', '<=', `${query.dateTo} 23:59:59.999999`);
     if (query.search) {
       const term = `%${query.search.replace(/[%_]/g, '\\$&')}%`;
       const idTerm = `%${query.search.toUpperCase().replace(/[\s-]/g, '').replace(/[%_]/g, '\\$&')}%`;
