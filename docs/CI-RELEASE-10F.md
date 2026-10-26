@@ -36,7 +36,7 @@ never a real secret).
 | Build | `npm run build` |
 | OpenAPI contract check | `npm run openapi:check` — 3.1 structure, unique operationIds, all `$ref`s resolve, committed `docs/openapi.json` up to date, and **route drift** (see §D) |
 | Test DB setup | `npm run test:setup` (migrate + seed the isolated `*_test` DB) |
-| Migration down/up | rollback then re-migrate to verify reversibility, then re-seed |
+| Migration down/up | rollback then re-migrate, then re-seed — exercises down→up. Most migrations are reversible; a few have an intentional no-op `down()` (e.g. `cancel_pending_recovery_sms`), which the step still runs cleanly |
 | Audit smoke | `npm run audit:verify` on a clean chain |
 | Full suite | `npm run test:all` (all e2e **incl. audit-integrity + observability**) — **fake-backed**: in-memory RedisLike (see note), fake/console SMS, in-memory or local storage |
 | Focused concurrency | `npm run test:audit` + `npm run test:riskpolicy` |

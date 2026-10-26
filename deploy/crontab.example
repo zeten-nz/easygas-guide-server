@@ -1,65 +1,88 @@
-# EASY GAS — cron schedule EXAMPLE (Phase 10F artifact)
-# =====================================================
+# EASY GAS — cron schedule EXAMPLE
+# ================================
 #
 # SAFE ARTIFACT: template only. It runs nothing until an operator installs it.
-# Replace <DEPLOY_DIR>, <DEPLOY_USER> and the log/backup paths with real
-# absolute values. Prefer EXTERNAL cron over any in-process timer — an
-# in-process timer would run once per PM2 worker (docs/PRODUCTION-RUNTIME-10C.md).
+# Replace <DEPLOY_DIR>, <DEPLOY_USER> and the log/backup paths with real absolute
+# values. Prefer EXTERNAL cron over any in-process timer (an in-process timer would
+# run once per PM2 process).
 #
 # Install as a dedicated file so it runs as the deploy user, e.g.:
 #     sudo cp deploy/crontab.example /etc/cron.d/easygas
 #     sudo chown root:root /etc/cron.d/easygas && sudo chmod 644 /etc/cron.d/easygas
-# (In /etc/cron.d the 6th field is the USER to run as — shown below. If instead
-#  you use `crontab -e` as the deploy user, DELETE the <DEPLOY_USER> column.)
+# (In /etc/cron.d the 6th field is the USER. If you instead use `crontab -e` as the
+#  deploy user, DELETE the <DEPLOY_USER> column from each line.)
 #
-# NOTES that apply to every job:
-#   * All maintenance CLIs default to DRY-RUN; "--apply" is what actually acts.
-#   * Each job appends to its own log; rotate these with logrotate.
-#   * `cd <DEPLOY_DIR>` first so .env / knexfile / node_modules resolve.
-#   * Secrets come from the environment / the app's .env — never inline here.
-#   * Stagger the times so nightly jobs don't contend for DB/IO.
+# CONVENTIONS for every job below:
+#   * NON-INTERACTIVE: no TTY; jobs never prompt. Destructive DB restore is NOT
+#     scheduled here — it is operator-run only.
+#   * ENV LOADING (safe): the node CLIs (`npm run …`) load the server-root `.env`
+#     via dotenv themselves. The SHELL scripts (backup) need DB_* in the env, so
+#     they are launched through `node scripts/with-env.mjs` — which parses `.env`
+#     safely (never `source`; a secret with $(), backticks or spaces is passed
+#     literally, not executed).
+#   * NO OVERLAP: each job runs under `flock -n` on its own lock so a long run is
+#     never doubled up by the next tick.
+#   * DIRECTORY PERMISSIONS: create the backup/log dirs owned by <DEPLOY_USER>,
+#     mode 750, before enabling these:
+#       install -d -o <DEPLOY_USER> -g <DEPLOY_USER> -m 750 /var/backups/easygas/mysql /var/log/easygas
+#   * DRY-RUN vs APPLY: maintenance CLIs default to dry-run. A job that MUTATES data
+#     (evidence reconcile) is shipped as DRY-RUN here; turning it into an --apply is
+#     an INTENTIONAL operator decision made AFTER reviewing dry-run output.
+#   * LOG ROTATION: rotate every /var/log/easygas/*.log (example logrotate stanza at
+#     the bottom of this file). Alerts: pipe non-zero exits to your alerting (see the
+#     `|| ...` note in the monitoring runbook) — a silent cron failure is a blind spot.
 
-# Ensure a sane PATH for node/npm (adjust to your Node install; nvm users must
-# point at the concrete version dir, cron does not source your shell profile).
 PATH=/usr/local/bin:/usr/bin:/bin
 SHELL=/bin/bash
 
-# --- 1. Nightly retention cleanup (03:30) -----------------------------------
-# Deletes expired/revoked sessions, expired OTP rows and terminal SMS-outbox
-# rows past retention; recovers stale SMS PROCESSING leases. Bounded batches,
-# idempotent, guarded by a MySQL advisory lock (concurrent runs no-op).
-30 3 * * * <DEPLOY_USER> cd <DEPLOY_DIR> && npm run cleanup -- --apply >> /var/log/easygas/cleanup.log 2>&1
+# --- 1. Nightly retention cleanup (03:30) — ROUTINE, idempotent -------------
+# Deletes expired/revoked sessions, expired OTP rows and terminal SMS-outbox rows
+# past retention; recovers stale SMS PROCESSING leases. Bounded, idempotent, and
+# guarded by a MySQL advisory lock (concurrent runs no-op). --apply is the normal
+# retention action here.
+30 3 * * * <DEPLOY_USER> flock -n /var/lock/easygas-cleanup.lock -c 'cd <DEPLOY_DIR> && npm run cleanup -- --apply' >> /var/log/easygas/cleanup.log 2>&1
 
-# --- 2. Daily audit hash-chain verification (02:15) -------------------------
-# Verifies the tamper-evident audit log hash chain. Read-only; alert on
-# non-zero exit (a broken chain means tampering or corruption — investigate).
-# NOTE: `audit:verify` is being added by another Phase 10F contributor. Confirm
-# the exact npm script name once merged; adjust here if it differs.
-15 2 * * * <DEPLOY_USER> cd <DEPLOY_DIR> && npm run audit:verify >> /var/log/easygas/audit-verify.log 2>&1
+# --- 2. Daily audit hash-chain verification (02:15) — READ-ONLY -------------
+# Verifies the tamper-evident audit hash chain (CONSISTENCY, not historical
+# completeness). Alert on non-zero exit (a broken chain means tampering/corruption).
+15 2 * * * <DEPLOY_USER> flock -n /var/lock/easygas-audit.lock -c 'cd <DEPLOY_DIR> && npm run audit:verify' >> /var/log/easygas/audit-verify.log 2>&1
 
-# --- 3. Weekly deep evidence reconcile (Sun 04:10) --------------------------
-# Reconciles the evidence DB records against object storage. --deep does the
-# thorough (more expensive) pass; --apply performs the audited fixes. Run
-# weekly off-peak. Drop --apply first if you want to review a dry-run.
-10 4 * * 0 <DEPLOY_USER> cd <DEPLOY_DIR> && npm run reconcile -- --deep --apply >> /var/log/easygas/reconcile.log 2>&1
+# --- 3. Weekly evidence reconcile (Sun 04:10) — DRY-RUN by default ----------
+# Reconciles evidence DB records against object storage. Shipped WITHOUT --apply so
+# the schedule only REVIEWS (dry-run) and never silently mutates. After reviewing
+# the dry-run output and deciding the fixes are correct, an operator may INTENTIONALLY
+# append `-- --deep --apply` (that is a deliberate change to this line, not the default).
+10 4 * * 0 <DEPLOY_USER> flock -n /var/lock/easygas-reconcile.lock -c 'cd <DEPLOY_DIR> && npm run reconcile -- --deep' >> /var/log/easygas/reconcile.log 2>&1
 
 # --- 4. Nightly MySQL backup (01:00) ----------------------------------------
-# Calls the Phase 10F backup script (server/scripts/backup-mysql.sh). It reads
-# DB_* and BACKUP_DIR from the environment, never echoes the password, and
-# writes a timestamped gzip dump. IMPORTANT: take the DB backup and the
-# evidence backup (job 5) as a CONSISTENT PAIR — schedule them close together
-# and treat them as one recovery point.
-0 1 * * * <DEPLOY_USER> cd <DEPLOY_DIR> && BACKUP_DIR=/var/backups/easygas/mysql bash scripts/backup-mysql.sh >> /var/log/easygas/backup-mysql.log 2>&1
+# backup-mysql.sh needs DB_* + BACKUP_DIR. DB_* come from `.env` via the safe
+# with-env loader (NEVER `source`); BACKUP_DIR is set inline. The script self-locks,
+# integrity-checks and checksums the dump (see scripts/backup-mysql.sh). RPO/retention
+# are a business decision — prune old dumps with a separate reviewed policy.
+0 1 * * * <DEPLOY_USER> flock -n /var/lock/easygas-backup.lock -c 'cd <DEPLOY_DIR> && BACKUP_DIR=/var/backups/easygas/mysql node scripts/with-env.mjs bash scripts/backup-mysql.sh' >> /var/log/easygas/backup-mysql.log 2>&1
 
-# --- 5. Nightly evidence backup / off-site sync (01:20) ---------------------
-# Replicates the PRIVATE evidence bucket to an off-site, versioned bucket.
-# APPLY=1 makes it actually sync (default is dry-run). Uses the AWS profile /
-# environment for credentials — never embeds them. Runs shortly after the DB
-# backup so the pair stays close in time.
-20 1 * * * <DEPLOY_USER> cd <DEPLOY_DIR> && APPLY=1 EVIDENCE_SRC=s3://<SET_IN_ENV_src_bucket> EVIDENCE_DEST=s3://<SET_IN_ENV_offsite_bucket> bash scripts/backup-evidence.sh >> /var/log/easygas/backup-evidence.log 2>&1
+# --- 5. Nightly evidence off-site copy (01:20) ------------------------------
+# Copies the PRIVATE evidence store to the off-site VERSIONED destination (additive;
+# never deletes). APPLY=1 makes it actually copy. Credentials come from the AWS
+# credential chain / profile — never inline. NOTE: this copy and the DB backup (job 4)
+# are NOT a transactionally consistent pair just because they run minutes apart —
+# recovery relies on VERSIONING + a reconcile at the chosen recovery point (see
+# docs/BACKUP-RESTORE-10F.md).
+20 1 * * * <DEPLOY_USER> flock -n /var/lock/easygas-evidence.lock -c 'cd <DEPLOY_DIR> && EVIDENCE_TOOL=aws DIRECTION=backup APPLY=1 EVIDENCE_SRC=s3://<SET_IN_ENV_src_bucket> EVIDENCE_DEST=s3://<SET_IN_ENV_offsite_bucket> bash scripts/backup-evidence.sh' >> /var/log/easygas/backup-evidence.log 2>&1
 
 # --- (optional) Active risk-policy sanity check (06:00) ---------------------
-# Prints/validates the active risk policy. Uncomment to alert if none is active.
-# 0 6 * * * <DEPLOY_USER> cd <DEPLOY_DIR> && npm run risk-policy >> /var/log/easygas/risk-policy.log 2>&1
+# 0 6 * * * <DEPLOY_USER> flock -n /var/lock/easygas-risk.lock -c 'cd <DEPLOY_DIR> && npm run risk-policy' >> /var/log/easygas/risk-policy.log 2>&1
 
+# ===========================================================================
+# LOG ROTATION — install as /etc/logrotate.d/easygas (adjust user/paths):
+#   /var/log/easygas/*.log {
+#       daily
+#       rotate 14
+#       compress
+#       delaycompress
+#       missingok
+#       notifempty
+#       create 0640 <DEPLOY_USER> <DEPLOY_USER>
+#   }
+# ===========================================================================
 # A trailing newline is required by cron:
