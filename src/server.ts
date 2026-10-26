@@ -35,8 +35,10 @@ async function main(): Promise<void> {
   );
 
   const app = createApp();
-  const server: Server = app.listen(env.PORT, () => {
-    logger.info(`EASY GAS API listening on http://localhost:${env.PORT} (${isProduction ? 'production' : env.NODE_ENV})`);
+  // Loopback only: Nginx is the single public entry point and proxies to this
+  // private port, so the Node listener must never be reachable from the network.
+  const server: Server = app.listen(env.PORT, '127.0.0.1', () => {
+    logger.info(`EASY GAS API listening on http://127.0.0.1:${env.PORT} (${isProduction ? 'production' : env.NODE_ENV})`);
   });
 
   // The SMS worker only runs when SMS is enabled. In a multi-process PM2
