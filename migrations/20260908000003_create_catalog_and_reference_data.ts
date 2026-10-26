@@ -29,8 +29,21 @@ import type { Knex } from 'knex';
  * `catalog_price_history` atomically with the row update.
  */
 export async function up(knex: Knex): Promise<void> {
+  // Idempotent creates: a partially-applied state (tables present but this
+  // migration unrecorded — e.g. after a bookkeeping-only restore) must re-run
+  // safely. Each table is created only when absent; existing tables are left
+  // untouched (their schema is verified to match this definition out-of-band).
+  const createIfMissing = async (
+    name: string,
+    build: (t: Knex.CreateTableBuilder) => void,
+  ): Promise<void> => {
+    if (!(await knex.schema.hasTable(name))) {
+      await knex.schema.createTable(name, build);
+    }
+  };
+
   // --- Reference: companies / catalogue groups (e.g. EASY GAS, EAST ENERGE) ---
-  await knex.schema.createTable('catalog_companies', (t) => {
+  await createIfMissing('catalog_companies', (t) => {
     t.increments('id').primary();
     t.string('name', 150).notNullable().unique('uq_catalog_companies_name');
     t.string('status', 20).notNullable().defaultTo('ACTIVE'); // ACTIVE | ARCHIVED
@@ -40,7 +53,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   // --- Reference: manufacturer / equipment brands (distinct from company) ---
-  await knex.schema.createTable('catalog_brands', (t) => {
+  await createIfMissing('catalog_brands', (t) => {
     t.increments('id').primary();
     t.string('name', 150).notNullable().unique('uq_catalog_brands_name');
     t.string('status', 20).notNullable().defaultTo('ACTIVE');
@@ -50,7 +63,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   // --- Reference: product categories ---
-  await knex.schema.createTable('product_categories', (t) => {
+  await createIfMissing('product_categories', (t) => {
     t.increments('id').primary();
     t.string('name', 150).notNullable().unique('uq_product_categories_name');
     t.string('status', 20).notNullable().defaultTo('ACTIVE');
@@ -60,7 +73,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   // --- Reference: service categories ---
-  await knex.schema.createTable('service_categories', (t) => {
+  await createIfMissing('service_categories', (t) => {
     t.increments('id').primary();
     t.string('name', 150).notNullable().unique('uq_service_categories_name');
     t.string('status', 20).notNullable().defaultTo('ACTIVE');
@@ -70,7 +83,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   // --- Reference: units of measure (code + human name) ---
-  await knex.schema.createTable('catalog_units', (t) => {
+  await createIfMissing('catalog_units', (t) => {
     t.increments('id').primary();
     t.string('code', 30).notNullable().unique('uq_catalog_units_code');
     t.string('name', 60).notNullable();
@@ -81,7 +94,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   // --- Reference: engine injection values (technology ⟂ forced induction) ---
-  await knex.schema.createTable('injection_reference', (t) => {
+  await createIfMissing('injection_reference', (t) => {
     t.increments('id').primary();
     // Manufacturer designation label, e.g. MPI / GDI / FSI / TSI. Unique.
     t.string('designation', 60).notNullable().unique('uq_injection_reference_designation');
@@ -100,7 +113,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   // --- Products ---
-  await knex.schema.createTable('products', (t) => {
+  await createIfMissing('products', (t) => {
     t.increments('id').primary();
     // SKU/code. Uniqueness scope: PER COMPANY (catalogue group) — two groups may
     // legitimately reuse a code. Enforced by uq_products_company_code below.
@@ -134,7 +147,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   // --- Services ---
-  await knex.schema.createTable('services', (t) => {
+  await createIfMissing('services', (t) => {
     t.increments('id').primary();
     t.string('code', 60).notNullable().unique('uq_services_code');
     t.string('name', 200).notNullable();
@@ -166,7 +179,7 @@ export async function up(knex: Knex): Promise<void> {
   });
 
   // --- Price-change history (products & services) — actor, time, prev → new ---
-  await knex.schema.createTable('catalog_price_history', (t) => {
+  await createIfMissing('catalog_price_history', (t) => {
     t.increments('id').primary();
     t.string('entity_type', 20).notNullable(); // 'product' | 'service'
     t.integer('entity_id').unsigned().notNullable();
