@@ -196,11 +196,34 @@ async function run(): Promise<void> {
     });
 
     // -- 6b. Readiness-probe connect (ensureConnected): cold client, single-flight, no-op when ready --
-    await test('ensureConnected(): a COLD client is connected and the next ping/command succeeds', async () => {
+    await test('ensureConnected(): from a pristine "wait" client it starts the connection; the next ping succeeds', async () => {
       const b = buildRedisBackend(URL);
       backends.push(b);
-      await assert.rejects(b.ping(), /Stream isn't writeable|Connection is closed|enableOfflineQueue/i);
+      // NB: no bare command first — on a lazyConnect client even a rejected first
+      // command kicks off ioredis' own connect (wait -> connecting), which would
+      // destroy the "wait" precondition this test exists to exercise.
+      const client = (b as unknown as { client: { status: string } }).client;
+      assert.equal(client.status, 'wait', 'precondition: never connected');
       await b.ensureConnected!();
+      assert.equal(client.status, 'ready');
+      assert.equal(await b.ping(), 'PONG');
+    });
+
+    await test('ensureConnected(): while "connecting" it is a no-op (starts no second connect); the client then becomes ready', async () => {
+      const b = buildRedisBackend(URL);
+      backends.push(b);
+      const client = (b as unknown as { client: { status: string; connect: () => Promise<void> } }).client;
+      let connects = 0;
+      const originalConnect = client.connect.bind(client);
+      client.connect = () => {
+        connects += 1;
+        return originalConnect();
+      };
+      void b.ping().catch(() => undefined); // rejected, but ioredis' own lazy connect starts: wait -> connecting
+      assert.equal(client.status, 'connecting');
+      await b.ensureConnected!(); // must resolve at once and start nothing
+      assert.equal(connects, 1, "only ioredis' own lazy connect; the probe added none");
+      await b.connect(); // deterministic wait for 'ready' (no polling)
       assert.equal(await b.ping(), 'PONG');
     });
 
