@@ -47,7 +47,17 @@ async function checkDb(): Promise<boolean> {
 
 async function checkRedis(): Promise<boolean> {
   try {
-    const pong = await withTimeout(getRedis().ping(), PER_CHECK_MS);
+    const redis = getRedis();
+    // A process that never ran connectRedis() (e.g. the release gate) has a
+    // lazy, never-connected client; ensureConnected() opens it once (single-flight)
+    // and is a no-op everywhere else. The whole probe stays under one timeout.
+    const pong = await withTimeout(
+      (async () => {
+        await redis.ensureConnected?.();
+        return redis.ping();
+      })(),
+      PER_CHECK_MS,
+    );
     return pong === 'PONG';
   } catch {
     return false;

@@ -21,6 +21,16 @@ export interface RedisLike {
    * rate-limited request in a cold process fail closed.
    */
   connect?(): Promise<void>;
+  /**
+   * Readiness-probe helper: opens a connection ONLY if this client has never been
+   * connected (lazyConnect 'wait' state) — e.g. a short-lived process such as the
+   * release gate that never ran connectRedis(). Concurrent callers share one
+   * in-flight attempt. It never reconnects an established, reconnecting or closed
+   * client (ioredis' own bounded retryStrategy owns that), so a probe can neither
+   * resurrect a client during shutdown nor stack up listeners. Optional (the
+   * in-memory impl is always ready).
+   */
+  ensureConnected?(): Promise<void>;
   /** Liveness probe. Resolves 'PONG' (or throws/rejects on failure/timeout). */
   ping(): Promise<string>;
   /**
@@ -51,9 +61,37 @@ end
 return {c, ttl}
 `;
 
-class RedisBackend implements RedisLike {
+/** The subset of an ioredis client RedisBackend relies on (lets tests inject a fake). */
+export type RedisClientLike = Pick<
+  Redis,
+  'status' | 'connect' | 'ping' | 'eval' | 'get' | 'set' | 'del' | 'quit' | 'disconnect' | 'once' | 'removeListener'
+>;
+
+export class RedisBackend implements RedisLike {
   readonly kind = 'redis' as const;
-  constructor(private readonly client: Redis) {}
+  /** Single in-flight initial connect shared by concurrent ensureConnected() callers. */
+  private initialConnect: Promise<void> | null = null;
+  constructor(private readonly client: RedisClientLike) {}
+
+  /**
+   * Starts the connection only from the never-connected 'wait' state and shares
+   * ONE promise between concurrent callers. The promise is cleared as soon as the
+   * attempt settles, so a failed attempt never poisons later probes; any further
+   * recovery after a failure is ioredis' own retryStrategy (status is then
+   * 'reconnecting', for which this is a no-op). Adds no event listeners.
+   */
+  ensureConnected(): Promise<void> {
+    if (this.initialConnect) return this.initialConnect;
+    if (this.client.status !== 'wait') return Promise.resolve();
+    const attempt: Promise<void> = this.client.connect().finally(() => {
+      if (this.initialConnect === attempt) this.initialConnect = null;
+    });
+    // Callers await/race the returned promise; this only guarantees that an attempt
+    // nobody is awaiting any more (probe timed out) cannot surface as unhandled.
+    attempt.catch(() => undefined);
+    this.initialConnect = attempt;
+    return attempt;
+  }
 
   /**
    * Explicitly connects and resolves on the 'ready' status. lazyConnect means the

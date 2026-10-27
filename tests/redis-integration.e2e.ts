@@ -195,6 +195,36 @@ async function run(): Promise<void> {
       assert.equal((await b1.incrWindow('shared', 5000)).count, 3);
     });
 
+    // -- 6b. Readiness-probe connect (ensureConnected): cold client, single-flight, no-op when ready --
+    await test('ensureConnected(): a COLD client is connected and the next ping/command succeeds', async () => {
+      const b = buildRedisBackend(URL);
+      backends.push(b);
+      await assert.rejects(b.ping(), /Stream isn't writeable|Connection is closed|enableOfflineQueue/i);
+      await b.ensureConnected!();
+      assert.equal(await b.ping(), 'PONG');
+    });
+
+    await test('ensureConnected(): 20 parallel cold probes share one connection attempt and all see PONG', async () => {
+      const b = buildRedisBackend(URL);
+      backends.push(b);
+      const pongs = await Promise.all(
+        Array.from({ length: 20 }, async () => {
+          await b.ensureConnected!();
+          return b.ping();
+        }),
+      );
+      assert.deepEqual(new Set(pongs), new Set(['PONG']));
+    });
+
+    await test('ensureConnected(): on a READY client it is a no-op (does not disturb the connection)', async () => {
+      const b = buildRedisBackend(URL);
+      backends.push(b);
+      await b.connect();
+      await b.incrWindow('ensure-noop', 5000);
+      await Promise.all(Array.from({ length: 20 }, () => b.ensureConnected!()));
+      assert.equal((await b.incrWindow('ensure-noop', 5000)).count, 2, 'same live connection/state');
+    });
+
     // -- 7. Redis unavailable → BOUNDED failure (req 3) --
     await test('an unavailable Redis fails within a bounded time (does not hang)', async () => {
       const dead = buildRedisBackend(DEAD_URL);

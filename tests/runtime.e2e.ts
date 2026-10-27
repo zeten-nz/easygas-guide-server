@@ -15,7 +15,8 @@ import pino from 'pino';
 import { createApp } from '../src/app';
 import { env, validateProductionConfig } from '../src/config/env';
 import { redactPaths } from '../src/utils/logger';
-import { setRedisForTesting, MemoryRedis, type RedisLike } from '../src/redis/redis';
+import { setRedisForTesting, MemoryRedis, buildRedisBackend, type RedisLike } from '../src/redis/redis';
+import { startFakeRespServer } from './helpers/fake-resp-server';
 import { setShuttingDown } from '../src/modules/health/health.service';
 import { setSmsProviderForTesting, smsCapability, smsStartupProblem, type SmsCapability } from '../src/sms';
 
@@ -99,6 +100,87 @@ async function run(): Promise<void> {
     assert.equal(r.status, 503);
     assert.equal(r.body.checks.redis, false);
     setRedisForTesting(new MemoryRedis()); // restore
+  });
+
+  // ---- Readiness in a process that never ran connectRedis() (e.g. the release gate) ----
+  await test('readiness: a cold (never-connected) real Redis client is connected by the probe → redis=true', async () => {
+    const srv = await startFakeRespServer();
+    const cold = buildRedisBackend(srv.url);
+    setRedisForTesting(cold);
+    try {
+      const r = await get('/api/v1/ready');
+      assert.equal(r.body.checks.redis, true, JSON.stringify(r.body));
+      assert.equal(srv.connections(), 1);
+    } finally {
+      setRedisForTesting(new MemoryRedis());
+      await cold.quit();
+      await srv.close();
+    }
+  });
+
+  await test('readiness: concurrent probes against a cold real client open ONE connection', async () => {
+    const srv = await startFakeRespServer();
+    const cold = buildRedisBackend(srv.url);
+    setRedisForTesting(cold);
+    try {
+      const rs = await Promise.all(Array.from({ length: 20 }, () => get('/api/v1/ready')));
+      assert.ok(rs.every((r) => r.body.checks.redis === true), 'every probe reports redis=true');
+      assert.equal(srv.connections(), 1);
+    } finally {
+      setRedisForTesting(new MemoryRedis());
+      await cold.quit();
+      await srv.close();
+    }
+  });
+
+  await test('readiness: an unreachable real Redis still fails closed (redis=false, 503) and does not hang', async () => {
+    const dead = buildRedisBackend('redis://127.0.0.1:6399'); // nothing listens here
+    setRedisForTesting(dead);
+    try {
+      const t0 = Date.now();
+      const r = await get('/api/v1/ready');
+      assert.equal(r.status, 503);
+      assert.equal(r.body.checks.redis, false);
+      assert.ok(Date.now() - t0 < 5_000, 'bounded by the per-check/overall timeout');
+    } finally {
+      setRedisForTesting(new MemoryRedis());
+      await dead.quit();
+    }
+  });
+
+  await test('readiness: a Redis that accepts the socket but never answers fails within the 2s per-check timeout', async () => {
+    const slow = await startFakeRespServer({ acceptDelayMs: 60_000 }); // replies far too late
+    const b = buildRedisBackend(slow.url);
+    setRedisForTesting(b);
+    try {
+      const t0 = Date.now();
+      const r = await get('/api/v1/ready');
+      const took = Date.now() - t0;
+      assert.equal(r.body.checks.redis, false);
+      assert.ok(took < 4_000, `probe must be bounded by PER_CHECK_MS (took ${took}ms)`);
+    } finally {
+      setRedisForTesting(new MemoryRedis());
+      await b.quit();
+      await slow.close();
+    }
+  });
+
+  await test('readiness: shutdown short-circuits before touching Redis (no connect on a cold client)', async () => {
+    const srv = await startFakeRespServer();
+    const cold = buildRedisBackend(srv.url);
+    setRedisForTesting(cold);
+    try {
+      setShuttingDown(true);
+      const r = await get('/api/v1/ready');
+      assert.equal(r.status, 503);
+      assert.equal(r.body.checks.shuttingDown, true);
+      assert.equal(srv.connections(), 0, 'a draining instance must not open Redis connections');
+    } finally {
+      setShuttingDown(false);
+      setRedisForTesting(new MemoryRedis());
+      await cold.quit().catch(() => undefined);
+      await srv.close();
+    }
   });
 
   // ---- Readiness: flips to not-ready during graceful shutdown ----
